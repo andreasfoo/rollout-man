@@ -306,25 +306,52 @@ digest they return, and some do not return SHA-256 at all.
 
 ## Running the MVP
 
+Orchestration is Temporal workflows, so a worker has to be running. There is no
+in-process fallback: two orchestrators would be two behaviours to keep in sync.
+
 ```bash
 go build -o rollout-man ./cmd/rollout-man
 
-# resolve the cases a file refers to: fetch, hash, store, parse task.toml
-./rollout-man case resolve test/smoke/smoke.yaml
-
-# expand the matrix without running anything
-./rollout-man experiment create test/smoke/smoke.yaml --dry-run
-
-# run it
+temporal server start-dev --namespace rollout-man --port 7233 &
 export ROLLOUT_MAN_DSN='postgres:///rollout_man?sslmode=disable'
-./rollout-man experiment create test/smoke/smoke.yaml --executor local
+
+# one process serving both queues; split them across machines when you have more
+./rollout-man worker start --config deploy.yaml --executor local &
+
+./rollout-man case resolve test/smoke/smoke.yaml          # fetch, hash, store, parse
+./rollout-man experiment create test/smoke/smoke.yaml --dry-run
+./rollout-man experiment create test/smoke/smoke.yaml     # starts ExperimentWorkflow
 ./rollout-man experiment results <experiment-id> --pass-at 0.8
 ```
 
-`test/smoke/run.sh` is the end-to-end smoke test — 23 assertions covering
+`test/smoke/run.sh` is the end-to-end smoke test — 25 assertions covering
 resolve determinism, both admission verdicts, matrix expansion, the redaction
-tiers, staged batch upload, and the read model. It needs Go, a reachable
-PostgreSQL, and `CAP_SYS_ADMIN`; it does **not** need a Docker daemon.
+tiers, staged batch upload, and the read model. `test/smoke/durability.sh` is a
+separate 6-assertion test that `kill -9`s the worker mid-agent and checks the
+workflow resumes instead of restarting. Neither needs a Docker daemon.
+
+### How the pieces map onto Temporal
+
+| design | implementation |
+|---|---|
+| ExperimentWorkflow | `per_case` (resolve + admission), matrix expansion, one child workflow per trial, `per_experiment` |
+| TrialWorkflow | attempt loop around prepare → agent → verify → collect → post-process, with `defer` compensation on a disconnected context |
+| task queues | `orchestrator` for workflows and server activities, `runner.<id>` for everything that touches a machine |
+
+Three details are load-bearing rather than incidental:
+
+- **`ScheduleToStartTimeout` on every runner activity.** It is what replaces the
+  hand-written assignment lease. Without it, work aimed at a dead worker sits in
+  Scheduled forever and never fails over.
+- **`RunAgent` gets more than one in-place attempt.** A heartbeat timeout has to
+  be able to re-deliver to the *same* queue, because that is the only path that
+  reaches the container-takeover branch. Real agent failures are listed in
+  `NonRetryableErrorTypes` and still fall straight through.
+- **Timeout type decides the failure code.** `RunAgent`'s start-to-close *is* the
+  agent timeout, so it means the agent ran out its own clock. A heartbeat
+  timeout on the same activity means the runner vanished. Collapsing the two
+  blames the agent for infrastructure trouble — a data-quality bug that leaves
+  every dashboard green.
 
 ### Executors
 
@@ -340,18 +367,11 @@ becomes an artifact.
 
 ### What is not built yet
 
-- **Temporal.** The orchestration currently runs in-process: sequential steps,
-  a semaphore for concurrency, and an attempt loop for retries. The durability
-  the design leans on — surviving a crash mid-trial, resuming from the last
-  completed step — is not there yet.
-- **Placement.** One runner, no resource accounting, no queue. `--runner` is a
-  label on the read model.
-- **Multi-runner staging.** `per_experiment: upload` flushes this process's
+- **Placement.** One runner, no resource accounting, no queue, no affinity.
+  `--runner` picks the task queue and labels the read model; that is all.
+- **Multi-runner staging.** `per_experiment: upload` flushes one runner's
   staging directory; with several runners it has to fan out per queue.
-
-Everything else in the pipeline — resolve, CAS, admission, matrix, the main
-chain, redaction, bundling, staging, upload, report, deploy, and the Postgres
-read model — is implemented and exercised by the smoke test.
+- **pause/resume, shard-ing, the visibility reconciler.** All P1 in the design.
 
 ## Scope
 

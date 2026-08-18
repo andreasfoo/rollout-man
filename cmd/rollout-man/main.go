@@ -9,15 +9,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/andreasfoo/rollout-man/internal/cas"
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
-	rexec "github.com/andreasfoo/rollout-man/internal/exec"
-	"github.com/andreasfoo/rollout-man/internal/pipeline"
 	"github.com/andreasfoo/rollout-man/internal/resolve"
 	"github.com/andreasfoo/rollout-man/internal/spec"
 	"github.com/andreasfoo/rollout-man/internal/store"
@@ -31,12 +28,14 @@ func main() {
 	args := os.Args[3:]
 
 	switch group + " " + verb {
-	case "experiment create":
-		os.Exit(cmdExperimentCreate(args))
+	case "experiment create", "experiment submit":
+		os.Exit(cmdSubmit(args))
 	case "experiment results":
 		os.Exit(cmdResults(args))
 	case "case resolve":
 		os.Exit(cmdCaseResolve(args))
+	case "worker start":
+		os.Exit(cmdWorker(args))
 	default:
 		usage()
 	}
@@ -45,9 +44,13 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `rollout-man (MVP)
 
-  rollout-man experiment create <file.yaml> [--work DIR] [--dsn DSN] [--executor docker|local|auto] [--dry-run]
+  rollout-man worker start   [--config FILE] [--work DIR] [--dsn DSN] [--executor docker|local|auto]
+  rollout-man experiment create <file.yaml> [--temporal ADDR] [--dsn DSN] [--runner ID] [--dry-run]
   rollout-man experiment results <experiment-id> [--dsn DSN] [--pass-at F]
   rollout-man case resolve <file.yaml> [--work DIR]
+
+The worker must be running: orchestration is Temporal workflows, not an
+in-process loop.
 `)
 	os.Exit(2)
 }
@@ -76,87 +79,6 @@ func signalCtx() (context.Context, func()) {
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() { <-ch; cancel() }()
 	return ctx, cancel
-}
-
-func cmdExperimentCreate(args []string) int {
-	fs := flag.NewFlagSet("create", flag.ExitOnError)
-	work := fs.String("work", defaultWork(), "working directory")
-	dsn := fs.String("dsn", defaultDSN(), "PostgreSQL DSN for the read model")
-	executor := fs.String("executor", "auto", "docker | local | auto")
-	runnerID := fs.String("runner", "runner-01", "runner id")
-	dry := fs.Bool("dry-run", false, "resolve + preview only")
-	if len(args) == 0 {
-		usage()
-	}
-	file := args[0]
-	fs.Parse(args[1:])
-
-	f, err := spec.Load(file)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "load:", err)
-		return 1
-	}
-	ctx, cancel := signalCtx()
-	defer cancel()
-
-	casStore, err := cas.New(filepath.Join(*work, "objects"))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "cas:", err)
-		return 1
-	}
-	runner := cmdrun.New(f.Commands)
-	runner.Log = logf
-	res := &resolve.Resolver{Runner: runner, Store: casStore, WorkRoot: *work, Log: logf}
-
-	ex, err := rexec.Pick(*executor)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-
-	expID := "exp-" + strconv.FormatInt(time.Now().Unix(), 36)
-	fmt.Printf("\nExperiment %s\n", f.Experiment.Name)
-	fmt.Printf("  id:        %s\n", expID)
-	fmt.Printf("  executor:  %s\n", ex.Name())
-	fmt.Printf("  cases:     %d\n", len(f.Experiment.Cases))
-	fmt.Printf("  agents:    %s\n", agentNames(f.Experiment.Matrix.Agents))
-	fmt.Printf("  llm_specs: %s\n", strings.Join(f.Experiment.Matrix.LLMSpecs, ", "))
-	fmt.Printf("  trials:    %d each     concurrency: %d\n\n",
-		f.Experiment.Matrix.Trials, f.Experiment.Concurrency)
-
-	if *dry {
-		for _, c := range f.Experiment.Cases {
-			ref := c.Merge(f.Experiment.CaseDefaults)
-			cv, err := res.Resolve(ctx, ref)
-			if err != nil {
-				fmt.Printf("  %-40s INVALID: %v\n", ref.Label(), err)
-				continue
-			}
-			fmt.Printf("  %-40s %s  cpus=%d mem=%dMB agent_timeout=%s\n",
-				cv.Label, cv.SHA256[:12], cv.Cfg.Resources.CPUs, cv.Cfg.Resources.MemoryMB, cv.Cfg.AgentTimeout)
-		}
-		return 0
-	}
-
-	db, err := store.Open(ctx, *dsn)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "postgres:", err)
-		return 1
-	}
-	defer db.Close()
-
-	eng := &pipeline.Engine{
-		File: f, Runner: runner, Res: res, Exec: ex, Store: db,
-		WorkRoot: *work, RunnerID: *runnerID, ExpID: expID, Log: logf,
-	}
-	if err := eng.Run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "\nexperiment failed:", err)
-		return 1
-	}
-	fmt.Println()
-	printResults(ctx, db, expID, -1)
-	fmt.Printf("\nexperiment id: %s\n", expID)
-	return 0
 }
 
 func cmdResults(args []string) int {

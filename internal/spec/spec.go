@@ -242,6 +242,36 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 
 func (d Duration) D() time.Duration { return time.Duration(d) }
 
+// LoadCommandsOnly reads just the kind: Commands document, for a worker whose
+// deployment config carries the command templates but no experiment.
+func LoadCommandsOnly(path string) (Commands, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Commands{}, err
+	}
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	for {
+		var node yaml.Node
+		if err := dec.Decode(&node); err != nil {
+			break
+		}
+		var probe struct {
+			Kind string `yaml:"kind"`
+		}
+		if err := node.Decode(&probe); err != nil {
+			continue
+		}
+		if probe.Kind == "Commands" {
+			var c Commands
+			if err := node.Decode(&c); err != nil {
+				return Commands{}, err
+			}
+			return c, nil
+		}
+	}
+	return Commands{}, fmt.Errorf("no kind: Commands document in %s", path)
+}
+
 func Load(path string) (*File, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
