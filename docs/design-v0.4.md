@@ -1072,7 +1072,7 @@ case_versions   id, case_id, version, source(jsonb), sha256, size, artifact_key,
                 task_config(jsonb)          -- 注册时解析 task.toml：resources / timeouts
 agents          id, name, type(llm|builtin), requires_llm, version, runtime, command, parameters
 llm_specs       id, name, provider, base_url, model, api_key_ref, max_concurrent, parameters
-experiments     id, name, config(jsonb), state, reward_threshold,
+experiments     id, name, config(jsonb), state,
                 created_by, created_at, confirmed_at
 tasks           id, experiment_id, case_version_id, agent_id, llm_spec_id,   -- builtin 为 NULL
                 state(PENDING|RUNNING|COMPLETED|CANCELLED),                  -- 无成败
@@ -1286,8 +1286,6 @@ matrix:
 concurrency: 8                         # 在途上限（排队 + 执行），见 §4.2
 priority: normal                       # critical|high|normal|low
 queue_timeout: 24h                     # 排队超时 → UNPLACED，见 §5.6
-reward_threshold: 0.8                  # 结果表"达标"的判定线，见 §12
-
 admission:                             # 前置准入，见 §3.5
   allow_unadmitted: false              # true 仅用于调试：结果打 ⚠ UNADMITTED 且不进跨 experiment 聚合
 
@@ -1320,7 +1318,7 @@ Experiment Preview
   Agents:   claude-code, codex        LLM Specs: opus-prod, gpt5-prod
   Trials:   5 each → Total 20         在途上限: 8    Priority: NORMAL
   能力要求: docker, arch=amd64        GPU: 0
-  排队超时: 24h                        达标线: reward ≥ 0.8
+  排队超时: 24h                        准入: 全部 ADMITTED ✓
 
 Confirm? [y/N] y
 → experiment exp_182 queued (4 tasks, 20 trials)
@@ -1338,12 +1336,16 @@ Confirm? [y/N] y
 
 `GET /experiments/{id}/results` / `rollout-man experiment results`：
 
-```text
-Experiment #182                                        达标线 reward ≥ 0.8
+**本系统不定义"什么算成功"。** 它负责把 rollout 跑完、把每个 trial 的原始 reward 和失败归因如实记下来；至于 reward 到多少算通过，是分析阶段的判断，随分析目的而变，不该被冻结进 experiment 配置——同一批 rollout 换个问题就该换个切法。因此结果表默认呈现**分布**，不呈现"达标率"。
 
-Agent / Model      完成  达标  reward中位  Agent-Fail  Agent-TO  Env-TO  Infra  Verifier  Unplaced  Cancel   达标率
-Claude / Opus        88    62      0.83         14         4        3      12       6         0        0     62/88 = 70%
-Codex   / GPT-5      92    71      0.86         12         3        2       8       5         0        2     71/92 = 77%
+```text
+Experiment #182
+
+Agent / Model      完成  reward: 均值 中位  P25   P75   Agent-Fail  Agent-TO  Env-TO  Infra  Verifier  Unplaced  Cancel
+Claude / Opus        88          0.71  0.83  0.42  0.95      14         4        3      12       6         0        0
+Codex   / GPT-5      92          0.76  0.86  0.51  0.97      12         3        2       8       5         0        2
+
+  reward 直方图（Claude / Opus）  0.0 ████▏12   0.2 ██▎7   0.4 ███▍10  0.6 █████▏15  0.8 ████████████▏44
 ```
 
 **列的定义**：
@@ -1351,24 +1353,33 @@ Codex   / GPT-5      92    71      0.86         12         3        2       8   
 | 列 | 含义 |
 |---|---|
 | 完成 | `COMPLETED` 数（verifier 正常跑完并产出 reward，**无论高低**） |
-| 达标 | `COMPLETED 且 reward ≥ reward_threshold` |
+| reward 分布 | 均值 / 中位 / P25 / P75 + 直方图，仅统计 `COMPLETED` |
 | Agent-Fail | 崩溃 / 非零退出 / OOM / 输出超限 |
 | **Agent-TO** | `AGENT_TIMEOUT` —— agent 自己磨蹭到超时 |
 | **Env-TO** | `ENVIRONMENT_TIMEOUT` —— 环境/构建超时 |
 | Infra / Verifier / Cancel / Unplaced | 见 §7.1 |
 
-**达标率的分母口径**：
+**要看通过率时，阈值是查询参数，不是配置**：
+
+```text
+rollout-man experiment results exp_182 --pass-at 0.8
+  → 额外输出一列 "通过率 (reward≥0.8)"，同一批数据可以换任意阈值反复看
+```
+
+对应 `GET /experiments/{id}/results?pass_at=0.8`。不传就不显示这一列。
+
+**通过率的分母口径**（传了 `--pass-at` 时）：
 
 ```text
 分母 = 完成 + Agent-Fail + Agent-TO
 排除 = Env-TO / Infra / Verifier / Cancelled / Unplaced
 ```
 
-> Timeout 不能混成一列再整列排除，那会**系统性地高估所有 agent 的达标率**：`AGENT_TIMEOUT`（agent 自己磨蹭到超时）是实打实的能力问题，必须计入分母；只有 `ENVIRONMENT_TIMEOUT` 才该排除。能拆开的前提是 §7.2 的映射表存在。
+> Timeout 不能混成一列再整列排除，那会**系统性地高估所有 agent 的通过率**：`AGENT_TIMEOUT`（agent 自己磨蹭到超时）是实打实的能力问题，必须计入分母；只有 `ENVIRONMENT_TIMEOUT` 才该排除。能拆开的前提是 §7.2 的映射表存在。
 >
-> `reward_threshold` 必须**显式写进 experiment 配置**。没有它，"成功率"在每个人心里都是不同的数。
+> 注意这里和 §3.5 准入判据的区别：准入的 `oracle >= 1.0` / `nop <= 0.0` 是**必须写死**的门限，因为那两个 builtin 的正确答案是已知的（参考解必然满分、空操作必然零分），判据是二值的、与分析目的无关。被测 agent 的 reward 没有这种性质。
 
-附带指标：reward 分布（均值 / 中位 / P25–P75）、平均时长、资源峰值分布、retry 率、queue wait P95。`result.json` 保留每 trial 原始 reward 供离线分析。
+附带指标：平均时长、资源峰值分布、retry 率、queue wait P95。`result.json` 保留每 trial 原始 reward 供离线分析。
 
 **准入状态在结果表里必须可见**：引用了 `allow_unadmitted` case 的行前缀 `⚠`，并在表尾注明 —— 未准入 case 的分数不具备可比性，混进聚合会污染所有对比结论。
 
@@ -1478,7 +1489,7 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 | **Case Registry** | CAS（sha256）；`--git` / `--s3+sha256` 注册；CLI 直传 + 服务端校验；`task.toml` 解析 + 状态机 | 完整分块上传协议（断点续传、并发分片） | Case 预热（dispatch 前预下发 artifact / 预拉 image） |
 | **前置准入** | oracle≥1 / nop≤0 判据；`case admit` 走正式执行链；正式 experiment 强制 `ADMITTED`；`allow_unadmitted` 逃生口 + 结果打标 | 定期复检（`revalidate_after`）与批量复检；`CASE_SUSPECT` / `VERIFIER_SUSPECT` 归因 | 准入判据按 series 差异化；准入结果趋势看板 |
 | **后置清理** | 独立 `PostProcess` activity；key 强制脱敏 + IP 分档；`bundle.tar.zst` 打包；清洗失败阻断上传 | 清洗命中 metrics 进结果分析；`extra_patterns`；bundle 增量/分卷 | 产物二次加工流水线（脱敏后再抽样标注等） |
-| **Experiment** | matrix 展开；preview + confirm（幂等）；cancel；**上限 500 trials**；`queue_timeout` / `reward_threshold` | pause / resume；`overrides` 三级优先级；**shard 化** + 上限 2000 | 上限 10000；Experiment 模板 / 复用 |
+| **Experiment** | matrix 展开；preview + confirm（幂等）；cancel；**上限 500 trials**；`queue_timeout` | pause / resume；`overrides` 三级优先级；**shard 化** + 上限 2000 | 上限 10000；Experiment 模板 / 复用 |
 | **LLM Spec** | Registry CRUD；`api_key_ref` + 加密文件/KMS；Runner 侧凭证获取端点 | `max_concurrent` 限流；key 轮换 | 按 spec 的配额与计费归集 |
 | **Agent Registry** | `type/requires_llm` + 展开规则；oracle / nop 两个 builtin | `case validate` 快捷命令；`CASE_SUSPECT` 标记 | 自定义 agent 打包分发 |
 | **执行链** | fetch → prepare → run → verify → collect → **postprocess** → cleanup 全链路；每步幂等 + 重入对账；**全部配 `ScheduleToStart`**；`RunAgent` 同机重投 | 步骤级 metrics 细化 | — |
@@ -1489,7 +1500,7 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 | **Housekeeper** | 磁盘阈值监控 + `degraded` 上报停派；**NEVER DELETE 清单 + in-use registry + label 限定**；dangling image / stopped container / workdir retention（本地 manifest 驱动）；**Docker context 校验** | 四档分级；CAS 本地缓存 LRU + 容量上限；清理审计上报 | 跨 Runner 缓存协同 / 全局 GC |
 | **Sanitizer** | 精确匹配层（含 base64/URL-encoded 变体）+ 模式匹配层（**含 presigned 签名参数**）；流式按行 + 跨行窗口；**IP 分档脱敏**（§6.4） | 命中 metrics；泄漏信号进结果分析；`extra_patterns` | 语义级脱敏（人名/路径/主机名） |
 | **安全** | key 不作为 activity 入参（Runner 用 runner token 取）；对象访问不用 presigned URL；`created_by` + 删除类操作限制；信任边界文档化 | **一次性 trial token + 吊销**；加密 Data Converter；runner token 轮换；角色细化 | Vault / 外部 secret manager |
-| **读模型 / API** | Task/Trial/Queue/Experiment 读接口；artifact presigned 下载；events 表（业务语义） | visibility reconciler（5min）；结果聚合完整指标 | 导出 CSV/JSONL 批量作业；跨 experiment 对比 |
+| **读模型 / API** | Task/Trial/Queue/Experiment 读接口；artifact presigned 下载；events 表（业务语义）；结果表 reward 分布 | visibility reconciler（5min）；`--pass-at` 查询式阈值；结果聚合完整指标 | 导出 CSV/JSONL 批量作业；跨 experiment 对比 |
 | **CLI** | case / experiment / task / trial / queue / llm-spec / runner 基本子命令；`logs`（拉已上传日志） | `-o json` 全覆盖；`results` 聚合表；时间预估（带样本量） | `logs -f` 实时跟随 |
 | **UI** | 无（用 Temporal Web UI 看 timeline） | 无 | Web UI：Queue / Runner / Experiment dashboard、结果对比 |
 | **存储治理** | 对象存储 **bucket lifecycle 策略写进部署清单** | experiment 删除级联；CAS 引用计数 | — |
@@ -1561,7 +1572,6 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 | 1 | LLM Spec 的 secret 后端：加密环境文件 vs KMS vs Vault | MVP 用加密文件 + KMS 解密；Vault 进 P2。下发链路已定（§8.2），待定的只是 Server 侧静态存储 |
 | 1b | 准入判据是否需要按 series 差异化（有些 Case 天然拿不到满分） | 先全局 `oracle_min = 1.0`；出现反例再按 series 覆盖，**不要一上来就放松到 0.9**——放松后准入就失去意义 |
 | 1c | `bundle` 的格式与是否分卷（超大 traj） | 先 `tar + zstd` 单卷；单 attempt 产物超过 2GB 时再议 |
-| 2 | `reward_threshold` 的默认值 | 建议 0.8，但需要跑过一批真实 case 后再定；先做成必填 + 文档给建议值 |
 | 3 | shard 化的 shard 粒度（按 task 还是固定条数） | 倾向固定条数（如每 shard 200 trials），与 matrix 结构解耦 |
 | 4 | `queue_timeout` 默认 24h 是否合适 | 需要观察真实排队分布；MVP 先给 24h 并在超过 50% 时告警 |
 | 5 | Runner 机器的准入与加固标准 | §8.1 定了信任边界，具体加固清单待运维补 |
