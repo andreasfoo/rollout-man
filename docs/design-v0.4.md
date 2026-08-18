@@ -212,32 +212,58 @@ Experiment ────────────────────┘ (引�
 - **Trial = execution**，一个 TrialWorkflow；workflow 内部的 attempt 循环负责换机重试，**不产生新的 trial 行**
 - **Series** 是 affinity 的主要依据 [P1]：同 Series 的 Case 常共享 base image 与 build cache
 
-### 3.1 Case Artifact 与 CAS
+### 3.1 Case 的来源、解析与 CAS
 
-- 来源：`git`（repo+commit+path）、`artifact`（对象键 + sha256）、CLI 上传、已有 artifact 引用
-- CAS：`objects/{sha[:2]}/{sha[2:4]}/{sha}`，相同内容只存一次；`case_versions` 只保存 metadata → sha256 映射
-- **[MVP]** CLI 用同一套 `storage.upload` 命令直传，再调 `POST /cases/{id}/versions` 提交对象键 + sha256 注册
-- **sha256 一律本地计算与校验**，不依赖后端返回的摘要（§9.4）。Server 不复算——第一次 fetch 该 case 的 Runner 本来就要验 sha256，不匹配则把该 version 标 `INVALID`，字节流因此始终不经过 Server
+**Experiment 里直接写 Case 在哪，不写注册表 ID。** 没有"先跑一遍注册命令拿到一个不透明 ID、再把 ID 填进 YAML"这一步——那既让 experiment 文件读不懂，又要求人维护一层 ID 到位置的心智映射。
 
-**CaseVersion 状态机**（`task.toml` 是异步解析的，而 Experiment 创建时就需要它，因此必须有显式状态，不能靠"上传完就能用"）：
+来源有三种，都通过 §9.4 的命令取：
+
+| source | 定位方式 | 取的命令 |
+|---|---|---|
+| `git` | `repo` + `ref` + `path` | `source_git` |
+| `object` | 对象键（+ 可选 `sha256`） | `storage_download` |
+| `local` | Runner 本地路径 | `source_local` |
+
+**内容哈希才是版本。** 取到之后本地算 sha256，那个哈希就是 CaseVersion 的标识；CAS 按 `objects/{sha[:2]}/{sha[2:4]}/{sha}` 存，相同内容只存一次。人读的标识是 `path`（如 `spring/CVE-2026-1234`），结果表按它分组；机器认的是 sha256。
+
+**resolve：把"位置"变成"内容"。** confirm 时对每个 case 执行一次：
 
 ```text
-PARSING → READY       解析成功，可用于准入（validation experiment）
-        → INVALID     解析失败，附错误详情，不可引用
-READY   → ADMITTED    通过准入判据（§3.5），可用于正式 experiment
-        → REJECTED    未通过准入，附判据明细
+resolve = 按 source 跑对应命令取内容 → 算 sha256 → 命中 CAS 则复用
+                                    → 未命中则入 CAS → 解析 task.toml → 落 case_versions
 ```
 
-- **正式 Experiment 只能引用 `ADMITTED`**，否则 422 `CASE_NOT_ADMITTED`（除非显式 `admission.allow_unadmitted`）
-- validation experiment 只要求 `READY`
+resolve 作为 `pipeline.pre` 的第一步在 **Runner 上**执行（和 trial 用同一条命令、同一套归因），因此**字节流不经过 Server**，几 GB 的 clone 也不会把 API Server 拖垮。同一个 sha256 第二次遇到直接命中缓存，跳过整步。
+
+**可变 ref 在 confirm 时钉死**：写 `ref: main` 是允许的，但 confirm 会把它解析成具体 commit 并**记进 experiment 记录**，preview 里显示钉死后的值。否则今天和下周跑的"同一个 experiment"根本不是同一个东西，而这种偏差事后无法从结果里看出来。`local` 每次 confirm 都重新算哈希——本地目录随时在变，这是它作为调试来源的代价。
+
+给了 `sha256` 的 case 直接查 CAS，命中就完全跳过 resolve——这是 CI 或重跑历史 experiment 的快路径。
+
+**CaseVersion 状态机**：
+
+```text
+RESOLVING → READY       内容已入 CAS、task.toml 解析成功，可用于准入
+          → INVALID     取不到 / 解压失败 / task.toml 解析失败，附错误详情
+READY     → ADMITTED    通过准入判据（§3.5），可用于正式 experiment
+          → REJECTED    未通过准入，附判据明细
+```
+
+- **正式 Experiment 只能用 `ADMITTED`**，否则 422 `CASE_NOT_ADMITTED`（除非 `admission.require: any`）
+- 准入结果绑定在 **sha256** 上，不绑在路径或 ref 上。同一份内容在别的仓库、别的路径出现，准入照样有效——准入验的是内容，不是标签
+- `task.toml` 在 resolve 时解析进 `task_config`，placement 因此在 dispatch 前就知道资源需求（§5.2 硬约束需要它）
 
 ### 3.2 Experiment Matrix
 
 ```yaml
 experiment:
   name: spring-cve-comparison
+  case_defaults:                        # 省下每个 case 重复写来源
+    source: git
+    repo: github.com/org/eval-cases
+    ref: main                           # confirm 时钉死为 commit（§3.1）
   cases:
-    - {id: case_123, version: v17}
+    - path: spring/CVE-2026-1234
+    - path: apache/CVE-2026-5678
   matrix:
     agents: [claude-code, codex]
     llm_specs: [opus-prod, gpt5-prod]
@@ -246,13 +272,13 @@ experiment:
   priority: normal
 ```
 
-展开规则：`cases × agents × llm_specs → Tasks`，每个 Task 携带 `requested_trials`。上例 = 1 × 2 × 2 = 4 Tasks / 20 Trials。**`requires_llm: false` 的 agent 不与 llm_specs 做笛卡尔积**，每 case 只产生 1 个 Task。
+展开规则：`cases × agents × llm_specs → Tasks`，每个 Task 携带 `requested_trials`。上例 = 2 × 2 × 2 = 8 Tasks / 40 Trials。**`requires_llm: false` 的 agent 不与 llm_specs 做笛卡尔积**，每 case 只产生 1 个 Task。
 
 规模上限（`MATRIX_TOO_LARGE`）：**[MVP] 500** / **[P1] 2000（配合 shard 化）** / **[P2] 10000**。
 
 > 上限的作用是防呆，要防在有意义的位置：10000 × 30min ÷ concurrency 8 ≈ 26 天，没有用户会提交这样一个 experiment 然后等下去。
 
-每个 Trial 的 resources / timeouts **来源于 Case 的 `task.toml`**，在 CaseVersion 注册时解析进 `task_config`；Experiment 可选择性覆盖（§11.2）。
+每个 Trial 的 resources / timeouts **来源于 Case 的 `task.toml`**，在 resolve 时解析进 `task_config`（§3.1）；Experiment 可选择性覆盖（§11.2）。
 
 优先级：**Experiment overrides > CaseVersion task.toml > 系统默认 profile**（`cpu: 4, memory: 16Gi, disk: 50Gi, gpu: 0`）。
 
@@ -260,21 +286,25 @@ experiment:
 
 Model 不是裸字符串，Agent 访问 LLM 需要三要素 **base_url + model + api_key**：
 
+**Spec 和 experiment 写在同一个文件里**（YAML 多文档，§11.2），提交时 upsert 进注册表——不需要先跑一遍 `llm-spec create` 再回来引用一个名字。
+
 ```yaml
-llm_spec:
-  name: opus-prod
-  provider: anthropic
-  base_url: https://api.anthropic.com
-  model: claude-opus-4-7
-  api_key_ref: secret://anthropic-prod    # 只存引用，不落明文
-  max_concurrent: 16                      # [P1] per-spec 在途上限
-  parameters:
-    max_tokens: 65536
+---
+kind: LLMSpec
+name: opus-prod
+provider: anthropic                     # 可选，用于统计
+base_url: https://api.anthropic.com
+model: claude-opus-4-7
+api_key_env: ANTHROPIC_API_KEY          # 从 Runner 环境取；与下面二选一
+# api_key_cmd: ["pass", "show", "eval/anthropic"]    # 或跑一条命令，stdout 即 key
+max_concurrent: 16                      # [P1] per-spec 在途上限
+parameters:
+  max_tokens: 65536
 ```
 
-- **api_key 不入库明文**，也**绝不进 Temporal history**，链路见 §8.2
-- 同一 model 可有多个 spec（不同 proxy / region / 计费账号），matrix 引用 spec name
-- 结果聚合按 spec 维度展示，也可按 `model` 折叠
+- **key 不写在文件里，也不由本系统保管**：`api_key_env` 指一个 Runner 侧环境变量，`api_key_cmd` 是一条在 Runner 上执行、stdout 即 key 的命令（与 §9.4 同一套契约）。系统只传递*名字*，从不接触值——key 因此天然不进 Temporal history，也就不需要注册表加密后端、一次性 token 和吊销机制
+- 注册表仍然存在，但**只由文件驱动**：submit 时按 `name` upsert。它服务于 placement 的 `max_concurrent` 记账（[P1]）与结果表的 spec 维度，不是给人手工 CRUD 的
+- 同一 model 可有多个 spec（不同 proxy / region / 计费账号）；结果聚合按 spec 展示，也可按 `model` 折叠
 
 ### 3.4 Agent 类型
 
@@ -387,7 +417,7 @@ func ExperimentWorkflow(ctx workflow.Context, in ExperimentInput) error {
         }
     }
     _ = workflow.Await(ctx, func() bool { return inFlight == 0 })
-    return workflow.ExecuteActivity(serverCtx(ctx), a.FinalizeExperiment, in.ExperimentID).Get(ctx, nil)
+    return runFinalize(ctx, in)      // flush_uploads / report / deploy，见 §6.5 与 §11.2
 }
 ```
 
@@ -609,6 +639,7 @@ safety_margin: disk 取 max(30GB, 10%)；cpu/mem 取 5%
 
 - 第一项防"实际已经满了"——含失败 workdir 保留、CAS 缓存、非本系统占用等 Server 不知道的部分
 - 第二项防"这一轮刚授予但还没体现在心跳里"
+- **batch 上传的 staging 占用计入 `reported_free`**（它就实实在在占着盘），因此第一项自动覆盖它；但 Housekeeper 必须钉住 staging 不回收，否则 placement 看到的空闲是假的（§6.5）
 
 **为什么记账必须进 MVP**（而不是当成后期的利用率优化）：matcher 每 2s 一轮、心跳每 15s 一次，**没有记账就意味着最多连续 7 轮基于同一份陈旧快照对同一台机器重复授予**。这在 3 台 Runner 的 MVP 规模下照样会打爆一台机器。记账解决的是超卖，不是利用率。
 
@@ -696,7 +727,7 @@ Runner Agent（Go 单二进制，systemd 托管）
 │     └── FetchCase / PrepareEnv / RunAgent / RunVerifier / CollectArtifacts / CleanupTrial
 ├── in-use registry   trial 级资源登记（Housekeeper 与 drain 共用）
 ├── CacheScanner      5min 扫描 image / build cache → REST 上报 [P1]
-├── Housekeeper       磁盘监控与分级清理（§6.7）
+├── Housekeeper       磁盘监控与分级清理（§6.8）
 └── Sanitizer         库形式被 PostProcess 与各 activity 调用（§6.4 / §8.5）
 ```
 
@@ -709,7 +740,7 @@ runner:
   token: ${RUNNER_TOKEN}
   heartbeat_interval: 15s            # 唯一的间隔配置（没有独立的 poll 间隔）
   max_concurrent_trials: 4
-  docker_host: unix:///var/run/docker.sock   # 必须显式绑定，见 §6.7
+  docker_host: unix:///var/run/docker.sock   # 必须显式绑定，见 §6.8
   workdir: /data/rollout-man
   resources: {cpu: 32, memory: 128Gi, disk: 1.8Ti, gpu: 0}
   capabilities: {docker: true, rootless: false, arch: amd64}
@@ -717,7 +748,7 @@ runner:
     redact_ips: false                # 默认关闭，见 §8.5
     ip_allowlist: ["127.0.0.1", "::1"]
     extra_patterns: []
-housekeeping: {...}                  # 见 §6.7
+housekeeping: {...}                  # 见 §6.8
 ```
 
 真正的 trial 并发由 placement 记账限制；worker 的 `MaxConcurrentActivityExecutionSize = max_concurrent_trials × 3` 只是防御性上限（一个 trial 同时只有一个 activity 在跑，系数 3 已宽裕，且要给 disconnected 的 cleanup 留槽位）。
@@ -759,7 +790,7 @@ housekeeping: {...}                  # 见 §6.7
 4. RunVerifier     → reward（无论高低）             失败 → VERIFIER_*
 5. CollectArtifacts 收集 stdout/stderr/agent/verifier log + traj.jsonl + result.json
                     → 落 workdir/{trial}/out/
-6. PostProcess     清洗（key 强制 / IP 分档）→ 打包 → 上传 → 注册 artifact（§6.4）
+6. PostProcess     清洗（key 强制 / IP 分档）→ 打包 → 上传或暂存 → 注册 artifact（§6.4 / §6.5）
                                                 失败 → POSTPROCESS_FAILED
 7. RecordTrialCompleted（server activity）
 8. CleanupTrial（defer）停容器、按 outcome 保留 workdir → 注销 in-use registry
@@ -807,7 +838,29 @@ Trial 的产物**不是跑完就能直接用**：agent 的 trajectory 里几乎�
 
 **幂等**：以 `(trial_id, attempt)` 为键，产物路径确定（§9.3），覆盖写。重入时从 `workdir/{trial}/out/` 重新执行全部子步骤，不复用上一次的中间态 —— 这也意味着 `CollectArtifacts` 必须把原始产物完整留在 workdir 里，直到 `CleanupTrial` 才清除。
 
-### 6.5 心跳与健康
+### 6.5 批量上传与 experiment finalize
+
+`post` 的 `upload` 步骤有两种模式，差别只在**什么时候真的把字节传走**：
+
+| mode | 行为 | 外部命令调用次数 |
+|---|---|---|
+| `per_trial`（默认） | PostProcess 里直接传走；传完本地即可按 retention 回收 | O(trials × objects) |
+| `batch` | 只把产物移进 Runner 的 staging 目录并登记；实际上传推迟到 `finalize.flush_uploads`，**每台 Runner 把自己 staging 里的全部产物打成一个包传一次** | O(runners) |
+
+500 trials × 2 个对象 = 1000 次命令调用，batch 之后是 3 次。对按次限流的后端（§9.4）这是数量级的差别。
+
+**但 batch 不是免费的**，下面四条必须一起实现，缺一条就会在某个场景下丢产物：
+
+1. **staging 目录进 in-use registry**（§6.8）。它不属于任何还在跑的 trial，Housekeeper 会按 `workdir_success: 1h` 把它当过期 workdir 回收——**产物在等待上传的过程中被自己的清理逻辑删掉**，而且删得完全合理。必须显式钉住。
+2. **staging 占用进 placement 的磁盘记账**（§5.3）。一个 500 trials 的 experiment 会在每台 Runner 上堆几十 GB 直到结束；placement 若不知道，会继续往这台机器上派活直到盘满。
+3. **`batch.max_pending` 是硬约束**（默认 20Gi/Runner），超过就立即强制 flush 一次。"批量"不能变成"无上限堆积"——上限存在的意义是让最坏情况可算。
+4. **drain 与 cancel 都要先 flush**。§6.7 的 drain 收敛条件加一条「staging 已清空」；experiment cancel 按 `batch.on_cancel` 决定 flush 还是 discard，默认 flush——用户取消之后产物既没传上去又被清理掉，是最糟的结果。
+
+**固有代价，写清楚不藏着**：Runner 非正常下线（掉电、磁盘故障）时，其 staging 里未上传的产物**就是丢了**。trial 的 reward 和归因在 PG 里还在（那些是 trial 结束时就写的），丢的是日志与 traj。这类 experiment 在结果表上标 `ARTIFACTS_INCOMPLETE` 并列出受影响的 trial —— 不能让人以为产物齐全。要绝对不丢就用 `per_trial`，这是这两个模式真正的取舍点。
+
+**finalize 是 ExperimentWorkflow 的一部分**，不是外部脚本：`flush_uploads` 是投到每台参与过的 `runner.<id>` 队列的 activity，因此和 trial 一样有超时、重试、失败归因；`report` / `deploy` 是 server 侧 activity。整个 finalize 走完 experiment 才算 `COMPLETED`。
+
+### 6.6 心跳与健康
 
 REST 心跳（15s）仍然保留，但**只服务 placement**，不再承担派发：
 
@@ -826,14 +879,14 @@ REST 心跳（15s）仍然保留，但**只服务 placement**，不再承担派�
 
 健康判定取两个信号的并：placement 用 REST 心跳；Temporal `DescribeTaskQueue` 的 poller 存在性作为运维观测。**不再有全局 orphan 扫描** —— 失联的表现就是其上 `RunAgent` 的 heartbeat timeout。
 
-### 6.6 drain 与 EMERGENCY 自保
+### 6.7 drain 与 EMERGENCY 自保
 
 **drain 必须按 trial 收敛，不能按 activity 收敛。**
 
 ```text
 1. Server 标记 runner = DRAINING → placement 立即停止向该机授予
 2. Runner 收到（心跳响应）→ 停止接受新 trial，但 worker 保持运行
-3. 等待 in-use registry 清空（本机没有任何 trial 还在编排链上）
+3. 等待 in-use registry 清空（本机没有任何 trial 还在编排链上），**且 staging 已 flush**（§6.5）
 4. worker.Stop() → 安全下线
 ```
 
@@ -844,7 +897,7 @@ REST 心跳（15s）仍然保留，但**只服务 placement**，不再承担派�
 **[MVP]** 基础 drain（停止授予 + 等 trial 收敛 + 停 worker）。这在 in-use registry（Housekeeper 的 MVP 项）之上只差一个条件判断，而 MVP 期间一定会有 Runner 升级需求 —— 没有它，每次升级都在赌当时有没有 trial 在跑。
 **[P1]** EMERGENCY 自动 drain、DRAINING 状态机细化、`pinned_images` 下发。
 
-### 6.7 Housekeeper
+### 6.8 Housekeeper
 
 **纯本地 ticker，不经 Temporal。** Housekeeper 是自保机制，必须在 Temporal / Server 都不可用时照常工作（磁盘不会因为控制面停机就停止增长）。清理动作单机、可重入、无跨机事务，不需要 durable execution。
 
@@ -1048,13 +1101,13 @@ Temporal 会把 workflow / activity 的输入输出、heartbeat、error message 
 **MVP 的取舍**：单团队内网、Runner 等同生产主机（§8.1），因此 MVP **不做一次性 token、不做吊销、不做加密 Data Converter**。但保留一条几乎零成本的底线 —— **key 不作为 workflow / activity 的入参**：
 
 ```text
-[MVP]  1. TrialWorkflow 只携带 llm_spec_name
-       2. RunAgent 在 Runner 内用 runner token 调
-          GET /internal/llm-specs/{name}/credentials 取三要素
-          → 只注入容器 env，不落盘、不写 artifact
+1. TrialWorkflow 只携带 llm_spec_name
+2. RunAgent 从 Server 取该 spec 的 base_url / model / api_key_env|api_key_cmd
+   ——注意取到的是**取 key 的方式**，不是 key
+3. Runner 按该方式在本机解析出 key（读环境变量或跑命令）→ 只注入容器 env
 ```
 
-比"把三要素直接放进 activity 入参"只多一个 REST 端点（Runner 本来就在和 Server 通心跳），却避开了一个**不可逆**的坑：一旦某个版本误把 key 写进入参，那批 history 里的明文要等 30 天 retention 过期才消失，期间任何能打开 Temporal Web UI 的人都看得到。
+**系统从头到尾没有持有过这个 key**（§3.3）：它存在于 Runner 主机的环境或密码管理器里，Server 只知道该去哪里找。这比"Server 保管 key 再下发"少一整套东西——加密后端、一次性 token、TTL、吊销——同时避开了一个**不可逆**的坑：一旦某个版本误把 key 写进 activity 入参，那批 history 里的明文要等 30 天 retention 过期才消失，期间任何能打开 Temporal Web UI 的人都看得到。
 
 **输出侧的 key 清洗不在此列，MVP 就要做全**（§6.4 / §8.5）—— 被测 agent 会把 key 写进 traj 和日志，而那些产物是要对外分发的。
 
@@ -1074,9 +1127,10 @@ Temporal 会把 workflow / activity 的输入输出、heartbeat、error message 
 |---|---|---|---|---|
 | user token | 管理员 | 长期 | 手动 | 手动 |
 | runner token | 注册 Runner 时由管理员签发，写入 systemd 环境文件 | 长期 | [P1] `runner rotate-token` | `runner disable` 立即失效 |
-| trial token **[P1]** | `IssueTrialToken`（每 attempt 一个） | total timeout + 10min | 不适用 | **新 attempt 签发时吊销旧 attempt 的 token** |
+| LLM api_key | **不由本系统签发或保管**（§3.3） | — | 由持有它的一方负责 | — |
+| 外部存储 / VCS 凭证 | 同上，属于 Runner 主机 | — | — | — |
 
-最后一条是双跑窗口的止血手段（§14.3）：旧容器即使还在跑，它的 LLM 调用也会被 Server 拒绝，不会继续烧钱。MVP 没有这个能力，双跑窗口只能靠同机重投接管来收窄（§6.2）。
+系统实际管理的凭证只有两类：user token 与 runner token。LLM key 与外部存储凭证都只有"去哪里取"的描述留在系统里，值本身从不经过它——因此也没有轮换与吊销的设计负担。代价是双跑窗口（§14.3）无法靠吊销 token 止血，只能靠同机重投接管来收窄（§6.2）。
 
 ### 8.4 鉴权 [MVP]
 
@@ -1134,7 +1188,9 @@ case_versions   id, case_id, version, source(jsonb), sha256, size, artifact_key,
                 admission_result(jsonb), admitted_at, admission_experiment_id,
                 task_config(jsonb)          -- 注册时解析 task.toml：resources / timeouts
 agents          id, name, type(llm|builtin), requires_llm, version, runtime, command, parameters
-llm_specs       id, name, provider, base_url, model, api_key_ref, max_concurrent, parameters
+llm_specs       name PRIMARY KEY, provider, base_url, model,
+                api_key_env, api_key_cmd(jsonb),   -- 取 key 的方式，不是 key 本身
+                max_concurrent, parameters(jsonb), updated_at
 experiments     id, name, config(jsonb), state,
                 created_by, created_at, confirmed_at
 tasks           id, experiment_id, case_version_id, agent_id, llm_spec_id,   -- builtin 为 NULL
@@ -1282,24 +1338,18 @@ commands:
 ### 10.2 Case
 
 ```text
-POST   /cases                              创建 case
-POST   /cases/{id}/versions                注册版本（source: git|artifact）→ state=PARSING
-POST   /cases/{id}/versions/upload-init    [P1] 需要服务端协调的上传方式；MVP 由 CLI 直接跑 storage.upload
-POST   /cases/{id}/versions/upload-commit  完成上传：服务端校验 sha256 后注册
-POST   /cases/{id}/versions/{v}/admit      准入校验（§3.5）→ 创建 validation experiment
-GET    /cases/{id}/versions/{v}/admission  准入结果明细（判据、各 trial reward、结论）
-GET    /cases?project=&series=  /cases/{id}
+POST   /cases/resolve            取内容 → sha256 → 入 CAS → 解析 task.toml（§3.1）
+                                 body 即 experiment 里的一个 case 条目；按 sha256 幂等
+POST   /cases/{sha256}/admit     准入校验（§3.5）→ 创建 validation experiment
+GET    /cases/{sha256}           详情：来源、钉死后的 ref、task_config、准入结果
+GET    /cases?path=&state=       列表（按人读路径 / 状态过滤）
 ```
-
-MVP 的 CLI 上传走单段 / SDK multipart 直传 + 服务端校验注册，不实现自定义分块协议。
 
 ### 10.3 LLM Spec
 
 ```text
-POST   /llm-specs           创建（api_key 明文只出现在请求体，落库前换成 ref）
-GET    /llm-specs  /{name}  列表/详情（永不回显 key）
-PUT    /llm-specs/{name}    更新（轮换 key / 换 base_url）
-DELETE /llm-specs/{name}    有引用的拒绝删除（409）
+GET    /llm-specs  /{name}       列表 / 详情。**没有写接口**——spec 由提交的
+                                 YAML 文档 upsert（§3.3），注册表不接受手工 CRUD
 ```
 
 ### 10.4 Experiment
@@ -1367,11 +1417,11 @@ POST   /internal/llm-credentials/exchange   trial token → LLM 三要素（§8.
 ```text
 rollout-man
 ├── case
-│   ├── upload <path> --project --series --name [--version]
-│   ├── register --git repo#commit:path | --object key --sha256
-│   ├── admit <case_id> [--version] [--trials 2]   准入：oracle≥1 / nop≤0（§3.5）
-│   │       --all --stale                          [P1] 批量复检过期准入
-│   └── list / get
+│   ├── resolve <file.yaml> | --git ... | --object ... | --local ...
+│   │                                       取内容、算 sha256、入 CAS、解析 task.toml
+│   ├── admit <sha256|path> [--trials 2]    准入：oracle≥1 / nop≤0（§3.5）
+│   │       --all --stale                   [P1] 批量复检过期准入
+│   └── list [--path] / get <sha256>
 ├── experiment
 │   ├── create <experiment.yaml> [--yes] [--dry-run]
 │   ├── get / list / cancel
@@ -1383,75 +1433,163 @@ rollout-man
 │   ├── logs <trial_id> [--type agent|stdout|stderr|verifier]
 │   └── logs -f                               [P2] 需 Runner 增量分段上传
 ├── queue [--project --series]
-├── llm-spec create / list / get / update / delete
+├── llm-spec list / get <name>          只读；spec 由提交的 YAML 定义（§3.3）
 └── runner   list / get / drain / disable
 ```
 
-### 11.2 Experiment YAML
+### 11.2 提交文件（完整示例）
+
+一个文件由多个 YAML 文档组成（`---` 分隔），`rollout-man experiment create rollout.yaml` 一起处理：
+
+| kind | 作用 | 通常放哪 |
+|---|---|---|
+| `Commands` | 外部动作怎么执行（§9.4） | 部署配置（server/runner.yaml）；写在这里是为了自包含 |
+| `LLMSpec` | 模型三要素（§3.3），可多个 | 与 experiment 同文件，提交时 upsert |
+| `Experiment` | 实验本体，一个文件一个 | — |
 
 ```yaml
-apiVersion: v1
+# ===================== rollout.yaml =====================
+---
+kind: Commands                          # 通常在部署配置里，此处内联便于自包含
+timeout: 30m
+max_attempts: 3
+
+source_git:
+  script: |
+    set -euo pipefail
+    git clone --depth 1 --branch "${GIT_REF}" "${GIT_REPO}" "${LOCAL_PATH}"
+
+storage_upload:
+  run: ["rclone", "copyto", "--", "{{.LocalPath}}", "onedrive:{{.Key}}"]
+storage_download:
+  run: ["rclone", "copyto", "--", "onedrive:{{.Key}}", "{{.LocalPath}}"]
+storage_link:
+  run: ["rclone", "link", "--expire", "24h", "--", "onedrive:{{.Key}}"]
+
+---
+kind: LLMSpec
+name: opus-prod
+base_url: https://api.anthropic.com
+model: claude-opus-4-7
+api_key_env: ANTHROPIC_API_KEY          # 系统只知道去哪儿找，不持有 key（§3.3）
+parameters: {max_tokens: 65536}
+
+---
+kind: LLMSpec
+name: gpt5-prod
+base_url: https://api.openai.com/v1
+model: gpt-5
+api_key_cmd: ["pass", "show", "eval/openai"]
+
+---
 kind: Experiment
 name: spring-cve-comparison
 
-cases:
-  - {id: case_123, version: v17}
+# ── Case：直接写在哪，不写注册表 ID（§3.1）────────────────────────────
+case_defaults:                          # 每个 case 未指定的字段从这里继承
+  source: git                           # git | object | local
+  repo: https://github.com/org/eval-cases
+  ref: main                             # confirm 时钉死为 commit，preview 显示钉死值
+  fetch: source_git                     # 用哪条命令取；省略则按 source 取默认
 
+cases:
+  - path: spring/CVE-2026-1234
+  - path: apache/CVE-2026-5678
+    ref: v2.1                           # 单个覆盖
+  - source: object                      # 已打包好的 artifact
+    key: cases/legacy/cve-2025-0001.tar.zst
+    sha256: 3f9a1c...                   # 给了就跳过 resolve，直接命中 CAS
+  - source: local                       # 调试用；每次 confirm 重算哈希
+    path: /data/wip/my-case
+
+# ── 矩阵 ──────────────────────────────────────────────────────────
 matrix:
   agents:
     - name: claude-code
-      llm_spec: opus-prod              # agent 级覆盖 matrix.llm_specs
+      llm_spec: opus-prod               # agent 级覆盖 matrix.llm_specs
       parameters: {max_tokens: 65536}
     - name: codex
-    - name: oracle                     # builtin：不参与 llm_specs 笛卡尔积
-  llm_specs: [opus-prod, gpt5-prod]
+    - name: oracle                      # builtin：不需要 LLM，不参与笛卡尔积
+  llm_specs: [opus-prod, gpt5-prod]     # 引用上面 kind: LLMSpec 的 name
   trials: 10
 
-concurrency: 8                         # 在途上限（排队 + 执行），见 §4.2
-priority: normal                       # critical|high|normal|low
-queue_timeout: 24h                     # 排队超时 → UNPLACED，见 §5.6
+concurrency: 8                          # 在途上限（排队 + 执行），见 §4.2
+priority: normal                        # critical | high | normal | low
+queue_timeout: 24h                      # 排队超时 → UNPLACED，见 §5.6
 
-# ── pipeline：显式声明 trial 主链之外的前后置步骤 ─────────────────────
-#   pipeline.pre    confirm 时按 case version 执行一次        （§3.5）
-#   ── 主链（每 trial）：fetch → prepare → run → verify → collect（§6.3）
-#   pipeline.post   每个 trial 产物离开 Runner 前顺序执行      （§6.4）
+# ── pipeline：主链之外的三个阶段 ────────────────────────────────────
+#   pre       confirm 时按 case 执行一次
+#   ── 主链（每 trial）：fetch → prepare → run → verify → collect
+#   post      每个 trial 产物离开 Runner 前顺序执行
 #   ── cleanup
-# ────────────────────────────────────────────────────────────────────
+#   finalize  全部 trial 到终态后执行一次
+# ──────────────────────────────────────────────────────────────────
 pipeline:
   pre:
-    - step: admission                  # 前置准入闸门
-      require: admitted                # admitted（默认）| any（调试：结果打 ⚠ UNADMITTED
-                                       #                     且不进跨 experiment 聚合）
-      auto_admit: false                # true：遇到 READY 但未准入的 version 先自动跑一次准入
-      criteria:                        # 省略则用系统默认
+    - step: resolve                     # 取内容 → sha256 → 入 CAS → 解析 task.toml（§3.1）
+      on_unchanged: skip                # sha256 已在 CAS 中则跳过（默认）
+
+    - step: admission                   # 准入闸门（§3.5）
+      require: admitted                 # admitted（默认）| any（调试，结果打 ⚠ UNADMITTED）
+      auto_admit: false                 # true：遇到 READY 但未准入的先自动跑一次准入
+      criteria:
         oracle: {min_reward: 1.0}
         nop:    {max_reward: 0.0}
         trials: 2
 
-  post:                                # 顺序执行；任一步失败的处置见 §6.4
-    - step: redact                     # 6a 清洗
-      keys: required                   # 强制项，只接受 required
-      ips: {traj: true, logs: false}   # 分发件脱、排查件不脱
+  post:
+    - step: redact                      # 清洗（§6.4）；key 强制，IP 分档
+      keys: required
+      ips: {traj: true, logs: false}
       extra_patterns: []
-    - step: bundle                     # 6b 打包
+
+    - step: bundle
       format: tar.zst
       include: [traj, logs, result]
-    - step: upload                     # 6c 上传 + 注册
-      objects: [bundle, result]        # 用 storage.upload 命令，见 §9.4
 
-# resources / timeouts 默认来自各 Case 的 task.toml，仅在需要统一覆盖时填写：
-overrides:                             # [P1] 三级优先级：Experiment > task.toml > 默认
+    - step: upload
+      mode: batch                       # per_trial（默认）| batch，见 §6.5
+      using: storage_upload
+      dest: "evals/{{.ExperimentName}}/{{.CasePath}}/{{.TrialID}}/"
+      objects: [bundle, result]
+      batch:                            # mode: batch 时生效
+        max_pending: 20Gi               # 每 Runner 暂存上限，超了强制 flush
+        on_cancel: flush                # flush（默认）| discard
+
+  finalize:                             # 全部 trial 到终态后执行一次
+    - step: flush_uploads               # batch 模式必需：各 Runner 成批传走暂存产物
+
+    - step: report                      # [P1] 聚合结果文件
+      formats: [json, csv]
+      dest: "evals/{{.ExperimentName}}/report/"
+
+    - step: deploy                      # [P1] 任意外部投递：发布、通知、进下游流水线
+      run: ["./scripts/publish.sh", "{{.ExperimentID}}", "{{.ReportURL}}"]
+      on_failure: warn                  # warn（默认，只记 event）| fail（experiment 标失败）
+
+# ── 其余 ──────────────────────────────────────────────────────────
+retry_policy:
+  max_total_attempts: 3                 # 含首次
+  retry_on: [DOCKER_ERROR, NETWORK_ERROR, AGENT_OOM]
+
+overrides:                              # [P1] Experiment > task.toml > 默认
   resources: {cpu: 8, memory: 32Gi, disk: 100Gi, gpu: 0}
   timeouts: {agent: 30m, verifier: 10m, build: 20m, total: 45m}
 
-retry_policy:
-  max_total_attempts: 3                # 含首次
-  retry_on: [DOCKER_ERROR, NETWORK_ERROR, AGENT_OOM]
-
-scheduling:                            # [P1]
-  group_by: [project, series, environment]
+scheduling:                             # [P1]
+  group_by: [project, series]
   affinity: {enabled: false, max_wait: 10m}
 ```
+
+**三个阶段的区别**（这是 pipeline 的全部语义）：
+
+| 阶段 | 执行次数 | 执行位置 | 失败后果 |
+|---|---|---|---|
+| `pre` | 每个 case 一次，confirm 时 | Runner（resolve 要取几 GB，不能走 Server） | 阻断 confirm，experiment 不入队 |
+| `post` | 每个 trial 一次 | 产物所在的那台 Runner | 按步骤不同：`redact` 阻断、`bundle` 降级、`upload` 重试（§6.4） |
+| `finalize` | 每个 experiment 一次，全部 trial 到终态后 | `flush_uploads` 在各 Runner；`report` / `deploy` 在 Server | `flush_uploads` 失败 → experiment 标 `ARTIFACTS_INCOMPLETE`；其余按 `on_failure` |
+
+**模板变量**：`{{.ExperimentID}}` `{{.ExperimentName}}` `{{.CasePath}}` `{{.TrialID}}` `{{.Attempt}}` `{{.Key}}` `{{.LocalPath}}`；finalize 另有 `{{.ReportURL}}` `{{.ReportPath}}`。script 形式用同名大写下划线环境变量（`EXPERIMENT_ID` 等）。
 
 ### 11.3 Preview
 
@@ -1459,7 +1597,7 @@ scheduling:                            # [P1]
 $ rollout-man experiment create experiment.yaml
 
 Experiment Preview
-  Cases:    CVE-2026-1234:v17
+  Cases:    spring/CVE-2026-1234@a1b2c3d   apache/CVE-2026-5678@v2.1
   Agents:   claude-code, codex        LLM Specs: opus-prod, gpt5-prod
   Trials:   5 each → Total 20         在途上限: 8    Priority: NORMAL
   能力要求: docker, arch=amd64        GPU: 0
@@ -1574,7 +1712,7 @@ rollout-man/
 │   │   ├── server/       placement.go  readmodel.go  token.go  finalize.go
 │   │   └── runner/       fetch.go  prepare.go  run.go  verify.go  collect.go  cleanup.go
 │   ├── runner/
-│   │   ├── inuse/        in-use registry（§6.7）
+│   │   ├── inuse/        in-use registry（§6.8）
 │   │   ├── housekeeper/  分级清理
 │   │   └── cachescan/    [P1]
 │   ├── placement/        matcher.go  scoring.go  reservations.go
@@ -1645,9 +1783,9 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 |---|---|---|---|
 | **Case Registry** | CAS（sha256）；`--git` / `--s3+sha256` 注册；CLI 直传 + 服务端校验；`task.toml` 解析 + 状态机 | 完整分块上传协议（断点续传、并发分片） | Case 预热（dispatch 前预下发 artifact / 预拉 image） |
 | **前置准入** | oracle≥1 / nop≤0 判据；`case admit` 走正式执行链；正式 experiment 强制 `ADMITTED`；`allow_unadmitted` 逃生口 + 结果打标 | 定期复检（`revalidate_after`）与批量复检；`CASE_SUSPECT` / `VERIFIER_SUSPECT` 归因 | 准入判据按 series 差异化；准入结果趋势看板 |
-| **后置清理** | 独立 `PostProcess` activity；key 强制脱敏 + IP 分档；`bundle.tar.zst` 打包；清洗失败阻断上传 | 清洗命中 metrics 进结果分析；`extra_patterns`；bundle 增量/分卷 | 产物二次加工流水线（脱敏后再抽样标注等） |
-| **Experiment** | matrix 展开；preview + confirm（幂等）；cancel；**上限 500 trials**；`queue_timeout` | pause / resume；`overrides` 三级优先级；**shard 化** + 上限 2000 | 上限 10000；Experiment 模板 / 复用 |
-| **LLM Spec** | Registry CRUD；`api_key_ref` + 加密文件/KMS；Runner 侧凭证获取端点 | `max_concurrent` 限流；key 轮换 | 按 spec 的配额与计费归集 |
+| **后置清理** | 独立 `PostProcess` activity；key 强制脱敏 + IP 分档；`bundle.tar.zst` 打包；清洗失败阻断上传；`per_trial` / `batch` 两种上传模式 + `flush_uploads` | 清洗命中 metrics 进结果分析；`extra_patterns`；bundle 分卷 | 产物二次加工流水线 |
+| **Experiment** | 多文档 YAML（Commands / LLMSpec / Experiment）；matrix 展开；preview + confirm（幂等）；cancel；**上限 500 trials**；`queue_timeout`；`pipeline.finalize` 的 `flush_uploads` | pause / resume；`overrides` 三级优先级；**shard 化** + 上限 2000 | 上限 10000；Experiment 模板 / 复用 |
+| **LLM Spec** | 由提交的 YAML 文档 upsert；`api_key_env` / `api_key_cmd`（系统不持有 key） | `max_concurrent` 限流 | 按 spec 的配额与计费归集 |
 | **Agent Registry** | `type/requires_llm` + 展开规则；oracle / nop 两个 builtin | `case validate` 快捷命令；`CASE_SUSPECT` 标记 | 自定义 agent 打包分发 |
 | **执行链** | fetch → prepare → run → verify → collect → **postprocess** → cleanup 全链路；每步幂等 + 重入对账；**全部配 `ScheduleToStart`**；`RunAgent` 同机重投 | 步骤级 metrics 细化 | — |
 | **Failure** | Taxonomy 固化；**Temporal 错误 → code 映射（含超时类型）**；`TEST_FAILED` 不进 taxonomy | 精细 code 归因；归因准确率回归用例 | 失败聚类 / 自动根因提示 |
