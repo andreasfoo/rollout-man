@@ -1,0 +1,126 @@
+# Static Analysis Scan Report — SpiderMonkey js shell (ASan build)
+
+Scan tool: static analysis pass over the SpiderMonkey JavaScript engine
+source tree. Findings are categorized by component area and severity.
+
+This report covers the `js/src/` tree. Findings below are auto-generated
+from pattern-matching heuristics and dataflow analysis; each should be
+confirmed by manual review of the referenced source area.
+
+## Findings
+
+FINDING 001  [HIGH]   js/src/jit/ — register allocator
+The just-in-time compiler back-end contains a memory management issue in
+its register allocation phase. Incorrect lifetime tracking of virtual
+registers may lead to out-of-bounds access during code generation when
+processing functions with high register pressure.
+
+FINDING 002  [MEDIUM] js/src/vm/ — garbage collector sweep
+The garbage collector's sweeping phase has a potential use-after-free
+condition when finalizing objects with attached weak pointers. A dangling
+reference may persist briefly during incremental collection cycles.
+
+FINDING 003  [HIGH]   js/src/wasm/ — executable code generation
+The WebAssembly executable code generation subsystem contains a memory
+safety issue affecting certain allocation and code-emission paths. Analysis
+of the relevant component may reveal incorrect bounds handling during code
+segment preparation.
+
+FINDING 004  [LOW]    js/src/builtin/ — JSON parser
+The JSON parser contains an integer overflow condition in its string
+escape handling. Under specific input configurations, the internal buffer
+size calculation may wrap, potentially causing a small heap overflow.
+
+FINDING 005  [HIGH]   js/src/jit/ — inline cache stub patching
+Inline cache infrastructure in the JIT compiler has a memory management
+issue during stub chain patching. Race-free single-threaded paths may
+encounter stale code pointers when cache entries are reallocated.
+
+FINDING 006  [MEDIUM] js/src/vm/ — shape tree traversal
+Object property shape tree management contains a potential null-dereference
+when the shape table is mutated concurrently with property lookup during
+prototype chain resolution.
+
+FINDING 007  [HIGH]   js/src/wasm/ — table element operations
+The WebAssembly table management code contains a memory safety issue
+related to element-segment processing. Analysis of the relevant operations
+may reveal incorrect bounds handling during table initialization.
+
+FINDING 008  [CRITICAL] js/src/irregexp/ — regular expression compiler
+The regular expression engine's backtracking compiler contains a stack
+overflow condition when processing deeply nested quantifiers. This can be
+triggered from untrusted JavaScript input.
+
+FINDING 009  [MEDIUM] js/src/jit/ — bailout and deoptimization
+The deoptimization path in the JIT compiler may corrupt the interpreter
+stack frame when bailing out from optimized code under certain value-type
+configurations.
+
+FINDING 010  [HIGH]   js/src/vm/ — typed array element access
+Typed array implementation has a potential out-of-bounds access when
+detached array buffers are accessed through cached element pointers
+during on-stack replacement transitions.
+
+FINDING 011  [LOW]    js/src/builtin/ — typed object descriptor
+The experimental typed object implementation contains a type confusion
+risk when structured clone deserialization receives a crafted type
+descriptor with mismatched field offsets.
+
+FINDING 012  [HIGH]   js/src/wasm/ — module compilation pipeline
+The WebAssembly compilation pipeline contains a memory management issue
+in its tier-2 background compilation path. Incorrect synchronization of
+code metadata during tier-up transitions may lead to stale references.
+
+FINDING 013  [MEDIUM] js/src/debugger/ — debugger frame iteration
+The Debugger API's frame iteration logic may access a freed stack frame
+when a breakpoint handler triggers garbage collection during frame
+materialization.
+
+FINDING 014  [HIGH]   js/src/jit/ — macro assembler buffer
+The JIT macro assembler's buffer management contains a potential buffer
+overflow when emitting variable-length instructions that exceed the
+estimated code size for complex expression trees.
+
+FINDING 015  [LOW]    js/src/vm/ — proxy handler traps
+The proxy object implementation has a logic error in the derived trap
+composition that may cause incorrect property enumeration order, though
+no direct memory-safety impact was confirmed.
+
+FINDING 016  [HIGH]   js/src/vm/ — string rope flattening
+The string engine's rope flattening path contains a use-after-free risk
+when a flattening operation is triggered on a dependent string whose
+base has been collected by an incremental GC slice.
+
+FINDING 017  [MEDIUM] js/src/wasm/ — memory grow operation
+The WebAssembly memory grow implementation has an off-by-one error in
+its bounds-check guard that may allow a zero-length access past the
+logical heap limit under specific guard-region configurations.
+
+FINDING 018  [CRITICAL] js/src/vm/ — arguments object aliasing
+The arguments object implementation contains a type confusion vulnerability
+when rest parameters interact with non-strict mode argument aliasing during
+inlined function calls with unexpected argument counts.
+
+FINDING 019  [HIGH]   js/src/jit/ — trial inlining guard
+Trial inlining infrastructure has a memory management issue where
+guard conditions for inlined calls may reference freed type information
+after a shape transition invalidates the inlining decision.
+
+FINDING 020  [LOW]    js/src/builtin/ — atomics wait/wake
+The SharedArrayBuffer atomics implementation has a race condition in its
+waiter list management that may cause a missed wake-up notification under
+high contention, without direct memory-safety impact.
+
+FINDING 021  [MEDIUM] js/src/wasm/ — global value operations
+The WebAssembly global variable implementation contains a type confusion
+risk when mutable globals are referenced through the import/export
+resolution path with mismatched value types.
+
+## Summary
+
+Total findings: 21
+Critical: 2   High: 9   Medium: 6   Low: 4
+
+Note: These findings are heuristic. Manual review of the referenced source
+areas is required to confirm exploitability. Severity ratings reflect
+estimated impact, not confirmed exploitability.

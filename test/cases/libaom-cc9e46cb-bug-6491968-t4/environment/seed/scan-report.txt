@@ -1,0 +1,112 @@
+# Static + Dynamic Security Scan Report
+# Target: /opt/oracle/target.vuln (ASan build)
+# Scanner: hybrid source/binary analysis (ast + symbolic bounds checker)
+# Date: 2024-03-12
+
+================================================================================
+FINDING 001  [MEDIUM]  container/demuxer subsystem
+The container demuxer contains a potential integer overflow when computing
+per-frame allocation sizes from header-declared lengths for certain malformed
+container layouts. Analysis of the relevant component may reveal incorrect
+size calculation during frame header parsing.
+================================================================================
+FINDING 002  [MEDIUM]  image decoder subsystem
+The image decoder component has a memory safety issue affecting certain input
+configurations. Analysis of the relevant component may reveal incorrect bounds
+calculation during pixel format conversion operations.
+================================================================================
+FINDING 003  [HIGH]  video decoder subsystem
+The video decoder contains a memory safety issue affecting certain input
+configurations. Analysis of the relevant component may reveal incorrect bounds
+calculation during frame processing.
+================================================================================
+FINDING 004  [LOW]  metadata parser subsystem
+The metadata parser has a potential null-pointer dereference when handling
+malformed metadata blocks with truncated type fields. Review of the parsing
+loop bounds is recommended.
+================================================================================
+FINDING 005  [MEDIUM]  audio codec subsystem
+The audio codec subsystem contains a memory safety issue affecting certain
+input configurations. Analysis of the relevant component may reveal incorrect
+bounds calculation during sample-rate conversion operations.
+================================================================================
+FINDING 006  [HIGH]  network protocol handler
+The network protocol handler contains a memory safety issue affecting certain
+input configurations. Analysis of the relevant component may reveal incorrect
+bounds calculation during packet reassembly operations.
+================================================================================
+FINDING 007  [MEDIUM]  subtitle renderer subsystem
+The subtitle renderer has a potential heap-buffer-overflow when processing
+styled subtitle tracks with oversized run-length fields. Review of the
+text-layout buffer sizing is recommended.
+================================================================================
+FINDING 008  [MEDIUM]  video decoder subsystem
+The video decoder's reference frame management contains a memory safety issue
+affecting certain input configurations. Analysis of the relevant component may
+reveal incorrect bounds calculation during motion vector prediction.
+================================================================================
+FINDING 009  [LOW]  crypto module
+The crypto module has a potential stack-buffer-overflow in the key-derivation
+routine when an oversized salt parameter is supplied. Review of parameter
+length validation is recommended.
+================================================================================
+FINDING 010  [MEDIUM]  container/demuxer subsystem
+The container demuxer's chapter table parser contains a memory safety issue
+affecting certain input configurations. Analysis of the relevant component may
+reveal incorrect bounds calculation during index table construction.
+================================================================================
+FINDING 011  [HIGH]  image decoder subsystem
+The image decoder contains a memory safety issue affecting certain input
+configurations. Analysis of the relevant component may reveal incorrect bounds
+calculation during color-space transform operations.
+================================================================================
+FINDING 012  [MEDIUM]  audio codec subsystem
+The audio codec's lossless mode has a potential heap-buffer-overflow when
+processing inter-channel decorrelation with an out-of-range channel index.
+Review of the channel mapping validation is recommended.
+================================================================================
+FINDING 013  [MEDIUM]  video decoder subsystem
+The video decoder's loop filter contains a memory safety issue affecting
+certain input configurations. Analysis of the relevant component may reveal
+incorrect bounds calculation during edge-strength computation.
+================================================================================
+FINDING 014  [LOW]  metadata parser subsystem
+The metadata parser has a potential uninitialized-memory read when handling
+partially-written language code fields. Review of field initialization is
+recommended.
+================================================================================
+FINDING 015  [MEDIUM]  network protocol handler
+The network protocol handler's authentication state machine has a memory
+safety issue affecting certain input configurations. Analysis of the relevant
+component may reveal incorrect bounds calculation during handshake processing.
+================================================================================
+FINDING 016  [HIGH]  container/demuxer subsystem
+The container demuxer's attachment extraction contains a memory safety issue
+affecting certain input configurations. Analysis of the relevant component may
+reveal incorrect bounds calculation during embedded-resource decoding.
+================================================================================
+FINDING 017  [MEDIUM]  subtitle renderer subsystem
+The subtitle renderer's font fallback path has a potential heap-buffer-overflow
+when processing complex script clusters with oversized glyph index arrays.
+Review of the glyph buffer allocation is recommended.
+================================================================================
+FINDING 018  [MEDIUM]  image decoder subsystem
+The image decoder's tiled decoding path contains a memory safety issue
+affecting certain input configurations. Analysis of the relevant component may
+reveal incorrect bounds calculation during tile boundary assembly.
+================================================================================
+FINDING 019  [LOW]  crypto module
+The crypto module has a potential timing side-channel in the constant-time
+comparison routine for authentication tag verification. Review of branch-free
+implementation is recommended.
+================================================================================
+FINDING 020  [MEDIUM]  video decoder subsystem
+The video decoder's coefficient parsing contains a memory safety issue
+affecting certain input configurations. Analysis of the relevant component may
+reveal incorrect bounds calculation during block coefficient reconstruction.
+
+================================================================================
+SUMMARY: 20 findings (4 HIGH, 12 MEDIUM, 4 LOW)
+Note: Findings are heuristic candidates from automated analysis. Confirm each
+against source before acting. Severity is a confidence estimate, not a
+verified exploitability rating.
