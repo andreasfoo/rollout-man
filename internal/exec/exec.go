@@ -423,6 +423,11 @@ func shell() string {
 	return "sh"
 }
 
+// Command builds an exec.Cmd from argv.
+func Command(ctx context.Context, argv []string) *exec.Cmd {
+	return exec.CommandContext(ctx, argv[0], argv[1:]...)
+}
+
 // ScriptCommand wraps a shell script as argv using the same shell the
 // executor itself uses.
 func ScriptCommand(script string) []string { return []string{shell(), "-c", script} }
