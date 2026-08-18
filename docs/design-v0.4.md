@@ -36,6 +36,7 @@
 | **Placement** | 决定 trial 何时、在哪台机器执行的自研服务 |
 | **准入 / Admission** | Case 版本在被正式使用前必须通过的 oracle/nop 校验（§3.5） |
 | **后置清理 / PostProcess** | Trial 产物离开 Runner 前的清洗与打包（§6.4） |
+| **pipeline** | 主链之外的可配置钩子，分 `per_case` / `per_trial` / `per_experiment` 三个块，**键名即执行单位**（§11.2） |
 | **Harbor** | 上游执行系统（Agent runtime / Docker runtime / Verifier / Case format），本系统的依赖 |
 
 ## 怎么读这份文档
@@ -189,7 +190,7 @@ Temporal 回答：**怎么保证每一步按顺序做完且不丢**。
 
 | Queue | Worker 所在进程 | 内容 |
 |---|---|---|
-| `orchestrator` | API Server | 所有 Workflow Task + server 侧 activity（读模型写入、token 签发、finalize） |
+| `orchestrator` | API Server | 所有 Workflow Task + server 侧 activity（读模型写入、report / deploy 等） |
 | `placement` | API Server | `AcquirePlacement` / `ReleasePlacement` |
 | `runner.<id>` | 对应 Runner Agent | 该机器上的全部执行类 activity |
 
@@ -233,7 +234,7 @@ resolve = 按 source 跑对应命令取内容 → 算 sha256 → 命中 CAS 则�
                                     → 未命中则入 CAS → 解析 task.toml → 落 case_versions
 ```
 
-resolve 作为 `pipeline.pre` 的第一步在 **Runner 上**执行（和 trial 用同一条命令、同一套归因），因此**字节流不经过 Server**，几 GB 的 clone 也不会把 API Server 拖垮。同一个 sha256 第二次遇到直接命中缓存，跳过整步。
+resolve 作为 `pipeline.per_case` 的第一步在 **Runner 上**执行（和 trial 用同一条命令、同一套归因），因此**字节流不经过 Server**，几 GB 的 clone 也不会把 API Server 拖垮。同一个 sha256 第二次遇到直接命中缓存，跳过整步。
 
 **可变 ref 在 confirm 时钉死**：写 `ref: main` 是允许的，但 confirm 会把它解析成具体 commit 并**记进 experiment 记录**，preview 里显示钉死后的值。否则今天和下周跑的"同一个 experiment"根本不是同一个东西，而这种偏差事后无法从结果里看出来。`local` 每次 confirm 都重新算哈希——本地目录随时在变，这是它作为调试来源的代价。
 
@@ -417,7 +418,7 @@ func ExperimentWorkflow(ctx workflow.Context, in ExperimentInput) error {
         }
     }
     _ = workflow.Await(ctx, func() bool { return inFlight == 0 })
-    return runFinalize(ctx, in)      // flush_uploads / report / deploy，见 §6.5 与 §11.2
+    return runPerExperiment(ctx, in) // upload / report / deploy，见 §6.5 与 §11.2
 }
 ```
 
@@ -838,27 +839,27 @@ Trial 的产物**不是跑完就能直接用**：agent 的 trajectory 里几乎�
 
 **幂等**：以 `(trial_id, attempt)` 为键，产物路径确定（§9.3），覆盖写。重入时从 `workdir/{trial}/out/` 重新执行全部子步骤，不复用上一次的中间态 —— 这也意味着 `CollectArtifacts` 必须把原始产物完整留在 workdir 里，直到 `CleanupTrial` 才清除。
 
-### 6.5 批量上传与 experiment finalize
+### 6.5 上传时机：逐 trial 还是成批
 
-`post` 的 `upload` 步骤有两种模式，差别只在**什么时候真的把字节传走**：
+上传逐 trial 还是成批，**由 `upload` 步骤写在哪个块决定**（§11.2），不需要额外的开关：
 
-| mode | 行为 | 外部命令调用次数 |
+| 写法 | 行为 | 外部命令调用次数 |
 |---|---|---|
-| `per_trial`（默认） | PostProcess 里直接传走；传完本地即可按 retention 回收 | O(trials × objects) |
-| `batch` | 只把产物移进 Runner 的 staging 目录并登记；实际上传推迟到 `finalize.flush_uploads`，**每台 Runner 把自己 staging 里的全部产物打成一个包传一次** | O(runners) |
+| `per_trial: [..., upload]` | 每个 trial 结束就传走；传完本地即可按 retention 回收 | O(trials × objects) |
+| `per_trial: [..., stage]` + `per_experiment: [upload, ...]` | `stage` 只把产物移进本机 staging 目录并登记；`per_experiment` 的 `upload` 让**每台 Runner 把自己 staging 里的全部产物打成一个包传一次** | O(runners) |
 
-500 trials × 2 个对象 = 1000 次命令调用，batch 之后是 3 次。对按次限流的后端（§9.4）这是数量级的差别。
+500 trials × 2 个对象 = 1000 次命令调用，成批之后是 3 次。对按次限流的后端（§9.4）这是数量级的差别。
 
-**但 batch 不是免费的**，下面四条必须一起实现，缺一条就会在某个场景下丢产物：
+**但成批不是免费的**，下面四条必须一起实现，缺一条就会在某个场景下丢产物：
 
 1. **staging 目录进 in-use registry**（§6.8）。它不属于任何还在跑的 trial，Housekeeper 会按 `workdir_success: 1h` 把它当过期 workdir 回收——**产物在等待上传的过程中被自己的清理逻辑删掉**，而且删得完全合理。必须显式钉住。
 2. **staging 占用进 placement 的磁盘记账**（§5.3）。一个 500 trials 的 experiment 会在每台 Runner 上堆几十 GB 直到结束；placement 若不知道，会继续往这台机器上派活直到盘满。
-3. **`batch.max_pending` 是硬约束**（默认 20Gi/Runner），超过就立即强制 flush 一次。"批量"不能变成"无上限堆积"——上限存在的意义是让最坏情况可算。
-4. **drain 与 cancel 都要先 flush**。§6.7 的 drain 收敛条件加一条「staging 已清空」；experiment cancel 按 `batch.on_cancel` 决定 flush 还是 discard，默认 flush——用户取消之后产物既没传上去又被清理掉，是最糟的结果。
+3. **`stage.max_pending` 是硬约束**（默认 20Gi/Runner），超过就地提前传一次。"成批"不能变成"无上限堆积"——上限存在的意义是让最坏情况可算。
+4. **drain 与 cancel 都要先把 staging 传走**。§6.7 的 drain 收敛条件加一条「staging 已清空」；experiment cancel 按 `stage.on_cancel` 决定传还是丢，默认传——用户取消之后产物既没上传又被清理掉，是最糟的结果。
 
-**固有代价，写清楚不藏着**：Runner 非正常下线（掉电、磁盘故障）时，其 staging 里未上传的产物**就是丢了**。trial 的 reward 和归因在 PG 里还在（那些是 trial 结束时就写的），丢的是日志与 traj。这类 experiment 在结果表上标 `ARTIFACTS_INCOMPLETE` 并列出受影响的 trial —— 不能让人以为产物齐全。要绝对不丢就用 `per_trial`，这是这两个模式真正的取舍点。
+**固有代价，写清楚不藏着**：Runner 非正常下线（掉电、磁盘故障）时，其 staging 里未上传的产物**就是丢了**。trial 的 reward 和归因在 PG 里还在（那些是 trial 结束时就写的），丢的是日志与 traj。这类 experiment 在结果表上标 `ARTIFACTS_INCOMPLETE` 并列出受影响的 trial —— 不能让人以为产物齐全。要绝对不丢就把 `upload` 放回 `per_trial`，这是两种写法真正的取舍点。
 
-**finalize 是 ExperimentWorkflow 的一部分**，不是外部脚本：`flush_uploads` 是投到每台参与过的 `runner.<id>` 队列的 activity，因此和 trial 一样有超时、重试、失败归因；`report` / `deploy` 是 server 侧 activity。整个 finalize 走完 experiment 才算 `COMPLETED`。
+**`per_experiment` 是 ExperimentWorkflow 的一部分**，不是外部脚本：其中的 `upload` 是投到每台参与过的 `runner.<id>` 队列的 activity（因此和 trial 一样有超时、重试、失败归因），`report` / `deploy` 是 server 侧 activity。整块走完 experiment 才算 `COMPLETED`。
 
 ### 6.6 心跳与健康
 
@@ -1307,7 +1308,7 @@ commands:
 
 **放弃了什么**：拿不到后端的配额、限流细节和服务端校验和。换来的是零 SDK 代码与换后端零改动——MVP 规模下这笔交易划算。真需要配额监控时再加一条可选的 `stat` 命令即可。
 
-**[P1] 任意 exec 步骤**：`pipeline.post` 支持 `- step: exec, run: [...]`，用同一套契约执行自定义动作（通知、二次归档、投递到别的系统）。MVP 只有内置的 redact / bundle / upload 三步。
+**[P1] 任意 exec 步骤**：三个块都支持 `- step: exec, run: [...]`，用同一套契约执行自定义动作（通知、二次归档、投递到别的系统）；写在哪个块就在哪个量级上执行。MVP 只有内置的 resolve / admission / redact / bundle / stage / upload 六步。
 
 **用 OneDrive 时的运维清单** —— 这些是后端本身的坑，不是本系统的代码问题，但踩到一样疼：
 
@@ -1517,27 +1518,28 @@ concurrency: 8                          # 在途上限（排队 + 执行），�
 priority: normal                        # critical | high | normal | low
 queue_timeout: 24h                      # 排队超时 → UNPLACED，见 §5.6
 
-# ── pipeline：主链之外的三个阶段 ────────────────────────────────────
-#   pre       confirm 时按 case 执行一次
-#   ── 主链（每 trial）：fetch → prepare → run → verify → collect
-#   post      每个 trial 产物离开 Runner 前顺序执行
-#   ── cleanup
-#   finalize  全部 trial 到终态后执行一次
-# ──────────────────────────────────────────────────────────────────
+# ── pipeline：三个不同单位的钩子，键名即单位 ─────────────────────────
 pipeline:
-  pre:
+
+  per_case:                             # ← 每个 case 跑一次，confirm 时，在 Runner 上
     - step: resolve                     # 取内容 → sha256 → 入 CAS → 解析 task.toml（§3.1）
       on_unchanged: skip                # sha256 已在 CAS 中则跳过（默认）
 
     - step: admission                   # 准入闸门（§3.5）
       require: admitted                 # admitted（默认）| any（调试，结果打 ⚠ UNADMITTED）
-      auto_admit: false                 # true：遇到 READY 但未准入的先自动跑一次准入
+      auto_admit: false
       criteria:
         oracle: {min_reward: 1.0}
         nop:    {max_reward: 0.0}
         trials: 2
 
-  post:
+  # ─────────────────────────────────────────────────────────────────
+  #  per_case 全部通过后，matrix 展开成 N 个 trial。每个 trial 的主链
+  #  fetch → prepare → run → verify → collect 是系统内置的，不可配置；
+  #  下面 per_trial 的步骤紧接主链，在同一台 Runner 上执行。
+  # ─────────────────────────────────────────────────────────────────
+
+  per_trial:                            # ← 每个 trial 跑一次，在该 trial 所在的 Runner 上
     - step: redact                      # 清洗（§6.4）；key 强制，IP 分档
       keys: required
       ips: {traj: true, logs: false}
@@ -1547,17 +1549,20 @@ pipeline:
       format: tar.zst
       include: [traj, logs, result]
 
-    - step: upload
-      mode: batch                       # per_trial（默认）| batch，见 §6.5
-      using: storage_upload
-      dest: "evals/{{.ExperimentName}}/{{.CasePath}}/{{.TrialID}}/"
-      objects: [bundle, result]
-      batch:                            # mode: batch 时生效
-        max_pending: 20Gi               # 每 Runner 暂存上限，超了强制 flush
-        on_cancel: flush                # flush（默认）| discard
+    - step: stage                       # 暂存本机，等 per_experiment 成批传（§6.5）
+      max_pending: 20Gi                 # 每 Runner 暂存上限，超了就地提前传一次
+      on_cancel: upload                 # upload（默认）| discard
+    # 想逐 trial 就传的话，把上面这步换成 upload 即可：
+    #   - step: upload
+    #     using: storage_upload
+    #     dest: "evals/{{.ExperimentName}}/{{.CasePath}}/{{.TrialID}}/"
+    #     objects: [bundle, result]
 
-  finalize:                             # 全部 trial 到终态后执行一次
-    - step: flush_uploads               # batch 模式必需：各 Runner 成批传走暂存产物
+  per_experiment:                       # ← 整个 experiment 跑一次，全部 trial 到终态后
+    - step: upload                      # 各 Runner 把自己暂存的产物成批传走
+      using: storage_upload
+      dest: "evals/{{.ExperimentName}}/"
+      objects: [bundle, result]
 
     - step: report                      # [P1] 聚合结果文件
       formats: [json, csv]
@@ -1581,13 +1586,38 @@ scheduling:                             # [P1]
   affinity: {enabled: false, max_wait: 10m}
 ```
 
-**三个阶段的区别**（这是 pipeline 的全部语义）：
+**pipeline 的单位就是键名**，三个块跑在三个不同的量级上：
 
-| 阶段 | 执行次数 | 执行位置 | 失败后果 |
+```text
+experiment                                              ← 提交一次
+│
+├── per_case          × N_cases        confirm 时，在 Runner 上
+│     resolve → admission                               全部通过才入队
+│
+├── trial             × N_trials       主链，系统内置不可配置
+│     fetch → prepare → run → verify → collect
+│   └── per_trial     × N_trials       紧接主链，同一台 Runner
+│         redact → bundle → (stage | upload)
+│   └── cleanup
+│
+└── per_experiment    × 1              全部 trial 到终态后
+      upload(暂存的) → report → deploy
+```
+
+| 块 | 跑几次 | 在哪跑 | 失败后果 |
 |---|---|---|---|
-| `pre` | 每个 case 一次，confirm 时 | Runner（resolve 要取几 GB，不能走 Server） | 阻断 confirm，experiment 不入队 |
-| `post` | 每个 trial 一次 | 产物所在的那台 Runner | 按步骤不同：`redact` 阻断、`bundle` 降级、`upload` 重试（§6.4） |
-| `finalize` | 每个 experiment 一次，全部 trial 到终态后 | `flush_uploads` 在各 Runner；`report` / `deploy` 在 Server | `flush_uploads` 失败 → experiment 标 `ARTIFACTS_INCOMPLETE`；其余按 `on_failure` |
+| `per_case` | 每个 case 一次 | Runner（resolve 要取几 GB，不能走 Server） | 阻断 confirm，experiment 不入队 |
+| `per_trial` | 每个 trial 一次 | 该 trial 所在的 Runner | 按步骤不同：`redact` 阻断、`bundle` 降级、`upload`/`stage` 重试（§6.4） |
+| `per_experiment` | 一次 | `upload` 在各 Runner；`report` / `deploy` 在 Server | `upload` 失败 → experiment 标 `ARTIFACTS_INCOMPLETE`；其余按 `on_failure` |
+
+**上传逐 trial 还是成批，由 `upload` 写在哪个块决定**，不需要额外的开关：
+
+| 想要 | `per_trial` 写 | `per_experiment` 写 | 外部命令调用次数 |
+|---|---|---|---|
+| 逐 trial 传 | `upload` | — | O(trials × objects) |
+| 成批传 | `stage` | `upload` | O(runners) |
+
+语义完全由位置表达——一个步骤在哪个块里，就在那个量级上执行，没有"写在这里但其实在那里跑"的情况（§6.5）。
 
 **模板变量**：`{{.ExperimentID}}` `{{.ExperimentName}}` `{{.CasePath}}` `{{.TrialID}}` `{{.Attempt}}` `{{.Key}}` `{{.LocalPath}}`；finalize 另有 `{{.ReportURL}}` `{{.ReportPath}}`。script 形式用同名大写下划线环境变量（`EXPERIMENT_ID` 等）。
 
@@ -1602,8 +1632,11 @@ Experiment Preview
   Trials:   5 each → Total 20         在途上限: 8    Priority: NORMAL
   能力要求: docker, arch=amd64        GPU: 0
   排队超时: 24h
-  pre:      admission — 1/1 case version 已 ADMITTED ✓
-  post:     redact(keys=required, ips: traj✓ logs✗) → bundle(tar.zst) → upload(bundle, result)
+  per_case:       resolve   — 2 个 case，1 个命中 CAS，1 个需取
+                              ref main → 钉死 a1b2c3d
+                  admission — 2/2 已 ADMITTED ✓
+  per_trial:      redact(keys=required, ips: traj✓ logs✗) → bundle(tar.zst) → stage
+  per_experiment: upload(evals/spring-cve-comparison/) → report → deploy
 
 Confirm? [y/N] y
 → experiment exp_182 queued (4 tasks, 20 trials)
@@ -1709,7 +1742,7 @@ rollout-man/
 ├── internal/
 │   ├── workflows/        experiment.go  trial.go        （纯确定性，禁 I/O）
 │   ├── activities/
-│   │   ├── server/       placement.go  readmodel.go  token.go  finalize.go
+│   │   ├── server/       placement.go  readmodel.go  llmspec.go  perexperiment.go
 │   │   └── runner/       fetch.go  prepare.go  run.go  verify.go  collect.go  cleanup.go
 │   ├── runner/
 │   │   ├── inuse/        in-use registry（§6.8）
@@ -1783,8 +1816,8 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 |---|---|---|---|
 | **Case Registry** | CAS（sha256）；`--git` / `--s3+sha256` 注册；CLI 直传 + 服务端校验；`task.toml` 解析 + 状态机 | 完整分块上传协议（断点续传、并发分片） | Case 预热（dispatch 前预下发 artifact / 预拉 image） |
 | **前置准入** | oracle≥1 / nop≤0 判据；`case admit` 走正式执行链；正式 experiment 强制 `ADMITTED`；`allow_unadmitted` 逃生口 + 结果打标 | 定期复检（`revalidate_after`）与批量复检；`CASE_SUSPECT` / `VERIFIER_SUSPECT` 归因 | 准入判据按 series 差异化；准入结果趋势看板 |
-| **后置清理** | 独立 `PostProcess` activity；key 强制脱敏 + IP 分档；`bundle.tar.zst` 打包；清洗失败阻断上传；`per_trial` / `batch` 两种上传模式 + `flush_uploads` | 清洗命中 metrics 进结果分析；`extra_patterns`；bundle 分卷 | 产物二次加工流水线 |
-| **Experiment** | 多文档 YAML（Commands / LLMSpec / Experiment）；matrix 展开；preview + confirm（幂等）；cancel；**上限 500 trials**；`queue_timeout`；`pipeline.finalize` 的 `flush_uploads` | pause / resume；`overrides` 三级优先级；**shard 化** + 上限 2000 | 上限 10000；Experiment 模板 / 复用 |
+| **后置清理** | 独立 `PostProcess` activity；key 强制脱敏 + IP 分档；`bundle.tar.zst` 打包；清洗失败阻断上传；`stage` + `per_experiment.upload` 支持成批上传 | 清洗命中 metrics 进结果分析；`extra_patterns`；bundle 分卷 | 产物二次加工流水线 |
+| **Experiment** | 多文档 YAML（Commands / LLMSpec / Experiment）；matrix 展开；preview + confirm（幂等）；cancel；**上限 500 trials**；`queue_timeout`；`pipeline` 三个块 | pause / resume；`overrides` 三级优先级；**shard 化** + 上限 2000 | 上限 10000；Experiment 模板 / 复用 |
 | **LLM Spec** | 由提交的 YAML 文档 upsert；`api_key_env` / `api_key_cmd`（系统不持有 key） | `max_concurrent` 限流 | 按 spec 的配额与计费归集 |
 | **Agent Registry** | `type/requires_llm` + 展开规则；oracle / nop 两个 builtin | `case validate` 快捷命令；`CASE_SUSPECT` 标记 | 自定义 agent 打包分发 |
 | **执行链** | fetch → prepare → run → verify → collect → **postprocess** → cleanup 全链路；每步幂等 + 重入对账；**全部配 `ScheduleToStart`**；`RunAgent` 同机重投 | 步骤级 metrics 细化 | — |
