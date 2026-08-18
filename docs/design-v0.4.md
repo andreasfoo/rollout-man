@@ -38,7 +38,58 @@
 | **后置清理 / PostProcess** | Trial 产物离开 Runner 前的清洗与打包（§6.4） |
 | **Harbor** | 上游执行系统（Agent runtime / Docker runtime / Verifier / Case format），本系统的依赖 |
 
+## 怎么读这份文档
+
+- **要实现某个部件** → 直接跳到对应章节；每章开头是结论，`>` 引起的段落是「为什么这样定 / 配错会怎样」，可以跳过不影响实现
+- **要评审设计** → 先看 §2 总体架构 与 §15 优先级分级，再按需展开
+- **要排期** → §15.1 分级总表 + §15.3 Phase 计划，两张表就够
+- **行内 [MVP] / [P1] / [P2]** 标记的是交付批次，无标记即 MVP（§0.1）
+
+## 目录
+
+- **0. 文档约定**
+
+**第一部分 · 概览与模型**
+
+- **1. 背景与边界**
+- **2. 总体架构**
+- **3. 领域模型**
+
+**第二部分 · 运行时**
+
+- **4. 编排层（Temporal）**
+- **5. Placement Service**
+- **6. Runner Agent**
+- **7. 失败分类与重试**
+
+**第三部分 · 安全**
+
+- **8. 安全与信任边界**
+
+**第四部分 · 数据、接口与结果**
+
+- **9. 数据模型**
+- **10. API 规格**
+- **11. CLI 规格**
+- **12. 结果分析**
+
+**第五部分 · 工程与运维**
+
+- **13. 技术选型与工程实践**
+- **14. 可观测性与运维**
+
+**第六部分 · 交付计划**
+
+- **15. 优先级分级与开发计划**
+- **16. 开放问题**
+
+- **附录 A：设计原则（一句话版）**
+
 ---
+
+# 第一部分 · 概览与模型
+
+> 这个系统解决什么问题、由哪些部件组成、领域里有哪些东西。
 
 ## 1. 背景与边界
 
@@ -48,7 +99,7 @@ Harbor 已提供 Case、Agent、Trial、Verifier 和执行环境等基础能力�
 
 | # | 痛点 | 本系统的职责 |
 |---|------|--------------|
-| 1 | Case 可达数 GB，无法通过 API 直接上传 | Case Artifact 管理（Git / S3 / CLI 上传 + CAS 去重） |
+| 1 | Case 可达数 GB，无法通过 API 直接上传 | Case Artifact 管理（Git / 对象存储 / CLI 上传 + CAS 去重） |
 | 2 | 同一 Case 需多 Agent × 多 Model × 多 Trial | Experiment Matrix 自动展开 |
 | 3 | 大量任务需排队而非立即执行 | Placement 排队与授予 |
 | 4 | Runner 数量 > 1，需选择合适 Runner | 资源感知调度 |
@@ -127,7 +178,7 @@ Temporal 回答：**怎么保证每一步按顺序做完且不丢**。
 | Runner 连接方向 | Runner **出方向** long-poll Temporal frontend | 与原 pull-based 的 NAT 友好性等价，且不需要自研协议 |
 | Runner 亲和 | **每台 Runner 一个专属 activity queue**（`runner.<id>`） | placement 定了 runner，后续步骤全部 pin 到该 queue，天然共享本地 workdir；不需要 Temporal Session |
 | HA | API Server 多副本（workflow worker 天然多活）；placement matcher advisory lock 单活 [P1] | matcher 失效后果轻：只是暂停新授予 |
-| 大文件 | 全部走 Object Storage | Case 数 GB、日志较大；Temporal payload 上限 2MB |
+| 大文件 | 全部走外部存储，经**命令行适配器**接入（见 §9.4） | Case 数 GB、日志较大；Temporal payload 上限 2MB |
 | Case 去重 | CAS（SHA-256） | CaseFactory 会产生大量重复 Case |
 
 **不引入 Kubernetes / MQ / Redis**，除非规模实测证明必要。
@@ -143,10 +194,6 @@ Temporal 回答：**怎么保证每一步按顺序做完且不丢**。
 | `runner.<id>` | 对应 Runner Agent | 该机器上的全部执行类 activity |
 
 Runner worker 以 `DisableWorkflowWorker: true` 启动，只跑 activity，不参与 workflow 决策。
-
-### 2.4 优先级在哪里生效
-
-Temporal Task Queue 近似 FIFO，但这不重要：**真正的排队竞争发生在 Placement**。所有 TrialWorkflow 启动后先到 `AcquirePlacement` 排队，priority / aging / FIFO 的排序在 matcher 授予 reservation 时生效（§5.4）。Temporal 只负责「把该做的事可靠地做完」，「谁先做」由 placement 决定。
 
 ---
 
@@ -167,10 +214,10 @@ Experiment ────────────────────┘ (引�
 
 ### 3.1 Case Artifact 与 CAS
 
-- 来源：`git`（repo+commit+path）、`artifact`（s3 URI + sha256）、CLI 上传、已有 artifact 引用
-- CAS：`objects/{sha[:2]}/{sha}`，相同内容只存一次；`case_versions` 只保存 metadata → sha256 映射
-- **[MVP]** CLI 直传 Object Storage（单段 / SDK multipart）+ 服务端校验 sha256 后注册
-- **[P1]** 完整 `upload-init` / `upload-commit` 分块协议（断点续传、并发分片）
+- 来源：`git`（repo+commit+path）、`artifact`（对象键 + sha256）、CLI 上传、已有 artifact 引用
+- CAS：`objects/{sha[:2]}/{sha[2:4]}/{sha}`，相同内容只存一次；`case_versions` 只保存 metadata → sha256 映射
+- **[MVP]** CLI 用同一套 `storage.upload` 命令直传，再调 `POST /cases/{id}/versions` 提交对象键 + sha256 注册
+- **sha256 一律本地计算与校验**，不依赖后端返回的摘要（§9.4）。Server 不复算——第一次 fetch 该 case 的 Runner 本来就要验 sha256，不匹配则把该 version 标 `INVALID`，字节流因此始终不经过 Server
 
 **CaseVersion 状态机**（`task.toml` 是异步解析的，而 Experiment 创建时就需要它，因此必须有显式状态，不能靠"上传完就能用"）：
 
@@ -275,6 +322,10 @@ POST /cases/{id}/versions/{v}/admit
 **[P1] 归因辅助**：oracle 未达标与 nop 超标是两种完全不同的问题（前者"题目或环境坏了"，后者"判分漏了"），分别标 `CASE_SUSPECT` / `VERIFIER_SUSPECT`（§12），不塞进 failure taxonomy。
 
 ---
+
+# 第二部分 · 运行时
+
+> 一个 trial 从提交到出结果，中间每一步由谁执行、怎么保证不丢、失败了怎么归因。
 
 ## 4. 编排层（Temporal）
 
@@ -566,6 +617,8 @@ safety_margin: disk 取 max(30GB, 10%)；cpu/mem 取 5%
 **失败 workdir 的磁盘**（`workdir_failed: 24h`）由 Runner 的 `reported_free` 自然体现，不需要额外记账 —— 但前提是 Housekeeper 对 CAS 缓存 + workdir 总量有上限（[P1] CAS LRU），否则 `reported_free` 会被慢慢吃到零而 placement 一无所知。
 
 ### 5.4 排队排序
+
+Temporal Task Queue 近似 FIFO，但这不重要：**真正的排队竞争发生在这里**。所有 TrialWorkflow 启动后先到 `AcquirePlacement` 排队，priority / aging / FIFO 的排序在 matcher 授予 reservation 时生效。Temporal 只负责「把该做的事可靠地做完」，「谁先做」由 placement 决定。
 
 ```text
 Priority → aging → （affinity 评分 [P1]）→ FIFO
@@ -865,7 +918,7 @@ failure:
 |----------|-------|----------------|---|
 | `AGENT` | AGENT_TIMEOUT, AGENT_CRASH, AGENT_OOM, AGENT_EXIT_NONZERO, AGENT_OUTPUT_LIMIT | 仅 AGENT_OOM | AGENT_OOM |
 | `ENVIRONMENT` | IMAGE_BUILD_FAILED, CONTAINER_START_FAILED, NETWORK_ERROR, DEPENDENCY_INSTALL_FAILED, ENVIRONMENT_TIMEOUT | NETWORK_ERROR / CONTAINER_START_FAILED | 是 |
-| `INFRASTRUCTURE` | DOCKER_ERROR, DISK_FULL, MEMORY_PRESSURE, RUNNER_UNAVAILABLE, HOST_ERROR | 全部 | 是 |
+| `INFRASTRUCTURE` | DOCKER_ERROR, DISK_FULL, MEMORY_PRESSURE, RUNNER_UNAVAILABLE, HOST_ERROR, OBJECT_STORE_ERROR | 全部 | 是，`OBJECT_STORE_ERROR` 除外 |
 | `VERIFIER` | VERIFIER_ERROR, VERIFIER_TIMEOUT, INVALID_REWARD | 仅 ERROR / TIMEOUT | 是 |
 | `SYSTEM` | CANCELLED, UNPLACED, POSTPROCESS_FAILED, INTERNAL_ERROR, UNKNOWN | 仅 INTERNAL_ERROR（一次） | 否 |
 
@@ -877,6 +930,7 @@ failure:
 - **`DOCKER_ERROR` 是唯一写法**（不存在 `DOCKER_DAEMON_ERROR`；上面的枚举表是唯一来源）
 - **`UNPLACED`**：排队超时或永久性不可满足（§5.6），结果表单独成列
 - **`POSTPROCESS_FAILED`**：产物清洗失败。清洗重试不成功就必须让 trial 失败——宁可丢一个 trial，也不能把未清洗的 traj 传出去（§6.4）
+- **`OBJECT_STORE_ERROR` 可重试但不换机**：存储命令失败通常是后端或凭证的问题，换一台 Runner 一样失败（§9.4）
 
 ### 7.2 Temporal 错误 → failure code 映射【关键】
 
@@ -966,6 +1020,10 @@ retry_policy:
 
 ---
 
+# 第三部分 · 安全
+
+> 谁可信、secret 走哪条路、什么东西绝不能落到哪里。
+
 ## 8. 安全与信任边界
 
 ### 8.1 信任边界
@@ -981,6 +1039,7 @@ Runner Agent ──runner token/mTLS──> API Server
 - **Runner 是可信组件**：它持有 trial 的明文 secret（必须，否则无法注入容器）、能操作本机 Docker。攻破一台 Runner 等于拿到其上正在跑的 trial 的 LLM key。因此 Runner 机器的准入等同于生产主机
 - **被测 Agent 容器是不可信的**：它可能故意把 key 往输出里写（这正是 Sanitizer 精确匹配层要覆盖的），也可能试图访问宿主
 - **Temporal Server 不对外暴露**，只接受 Runner 的出方向连接
+- **外部存储 / VCS 凭证不在信任边界内**：GitHub、OneDrive 等的凭证由 Runner 主机自行持有（`rclone.conf`、`~/.ssh`、`gh auth` 等），本系统不读取、不存储、不下发（§9.4）。系统只管理两样东西：runner token 与 LLM api_key
 
 ### 8.2 Secret 与 Temporal History
 
@@ -1003,7 +1062,7 @@ Temporal 会把 workflow / activity 的输入输出、heartbeat、error message 
 
 **[P1] 双保险**：namespace 启用加密 Data Converter（AES-GCM PayloadCodec，Web UI 配 codec server）。
 
-**对象存储访问 [MVP]**：history 里**只放 `bucket + key + sha256`，不放 presigned URL** —— presigned URL 的签名就是一份临时凭证，把它当 activity 入参等于把凭证写进 history。Runner 用自身凭证访问对象存储。这一条同样零成本：传 key 比传 URL 还短。
+**对象存储访问 [MVP]**：history 里**只放对象键 + sha256，不放任何预授权 URL** —— 那种 URL 里的 token 就是一份临时凭证，把它当 activity 入参等于把凭证写进 history。Runner 拿到键之后自己跑 `storage_download` 命令（§9.4），该命令用的是宿主自己的凭证，本系统既不持有也不传递它。这一条零成本：传键比传 URL 还短。
 
 **工程约束**：
 - error message / heartbeat detail 在 Runner 侧统一过 Sanitizer，杜绝 stderr 里的 key 经 error 链进入 history
@@ -1039,7 +1098,7 @@ MVP 的最小可用集：
 | 层 | 规则 | 替换为 | 批次 |
 |----|------|--------|---|
 | **精确匹配** | 本 trial 已下发的 LLM api_key、runner token 等 Runner 持有明文的 secret，**含 base64 / URL-encoded 变体** | `***REDACTED_KEY***` | [MVP] |
-| **模式匹配** | 常见 key 形态（`sk-`、`AKIA`、`ghp_` 等前缀）、`Authorization` / `X-Api-Key` header 值、**presigned URL 签名参数**（`X-Amz-Signature` / `X-Amz-Credential` / `Signature=`） | `***REDACTED_KEY***` | [MVP] |
+| **模式匹配** | 常见 key 形态（`sk-`、`AKIA`、`ghp_` 等前缀）、`Authorization` / `X-Api-Key` header 值、**预授权 URL 的凭证参数**（`tempauth=`、`authkey=`、`X-Amz-Signature`、`Signature=`）、`Bearer` / `access_token` 串 | `***REDACTED_KEY***` | [MVP] |
 | IP 脱敏 | IPv4 / IPv6 字面量，`ip_allowlist` 除外 | `***REDACTED_IP***` | **[P2]，默认关闭** |
 
 - **精确匹配层是主要防线**：Runner 明确知道自己给本 trial 下发过哪些 secret，可做零误报的全量替换
@@ -1057,6 +1116,10 @@ runner 级的 `redact_ips: true` 是兜底开关（默认 `false`），打开后
 **key 脱敏没有分档，也没有开关** —— 所有离开 Runner 的文本一律执行精确匹配 + 模式匹配两层。
 
 ---
+
+# 第四部分 · 数据、接口与结果
+
+> 状态存在哪、对象存在哪、外部怎么访问、结果怎么读。
 
 ## 9. 数据模型
 
@@ -1118,24 +1181,85 @@ INDEX  (series_id)                              -- runner_cache_state
 | 数据 | 位置 | retention |
 |------|------|---|
 | 状态、注册表、事件、结果 | PostgreSQL | 永久（**30 天后是唯一可查询事实源**） |
-| Workflow event history | Temporal（temporal db） | namespace 30d，之后归档到 Object Storage |
-| Case archives（CAS） | Object Storage `objects/{sha[:2]}/{sha}` | **永不自动删除**（引用计数删除见 [P2]） |
-| Trial 日志与产物 | Object Storage（§9.3） | **[MVP] 写明 bucket lifecycle**：成功 trial 90d，失败 trial 180d |
+| Workflow event history | Temporal（temporal db） | namespace 30d；**不归档到 OneDrive**（Temporal archival 不支持它），30 天后以 PG 读模型为准 |
+| Case archives（CAS） | 对象存储 `objects/{sha[:2]}/{sha[2:4]}/{sha}` | **永不自动删除**（引用计数删除见 [P2]） |
+| Trial 日志与产物 | 对象存储（§9.3） | **[MVP] 应用侧 GC 作业**：成功 trial 90d、失败 trial 180d，**删除后必须清空回收站**（§9.4） |
 
-> 对象存储侧的 retention 最容易被漏掉：Runner 本地磁盘治理有整整一节，而 artifact 与 CAS object 若没有 lifecycle 就只增不减，也没有 experiment 删除时的级联。跑一年之后这是一笔说不清的账，通常在收到账单时才被发现。MVP 至少要把策略写进部署清单（配 bucket lifecycle 即可，不需要写代码）。
+> 对象存储侧的 retention 最容易被漏掉：Runner 本地磁盘治理有整整一节，而 artifact 与 CAS object 若无人清理就只增不减，也没有 experiment 删除时的级联。跑一年之后这是一笔说不清的账。
+>
+> **OneDrive 没有 lifecycle 策略**，这件事不能靠配置解决，必须写一个服务端 GC 作业（按 `artifacts.created_at` + trial outcome 删除）。这是选 OneDrive 相对对象存储多出来的一块工作量，不要漏排。
 
 ### 9.3 Artifact 路径
 
 ```text
-experiments/experiment-{id}/task-{id}/trial-{id}/attempt-{n}/
-  ├── bundle.tar.zst                        # 完整产物快照（含 traj.jsonl）
-  ├── stdout.log  stderr.log  agent.log  verifier.log
-  └── result.json
+/rollout-man/experiments/experiment-{id}/task-{id}/trial-{id}/attempt-{n}/
+  ├── bundle.tar.zst                        # 完整产物快照（含 traj.jsonl 与全部 log）
+  └── result.json                           # [MVP] 只上传这两个，原因见 §9.4
+      stdout.log  stderr.log  agent.log  verifier.log    # [P1] 单文件上传
 ```
 
-PostgreSQL 只存 key + size + sha256 + kind。**所有对象都是 PostProcess 清洗后的内容**（§6.4），原始产物只存在于 Runner 的 workdir，随 retention 过期。**路径含 attempt**，使覆盖写天然幂等且不同 attempt 不互相覆盖。
+PostgreSQL 只存对象键 + size + sha256 + kind。**所有对象都是 PostProcess 清洗后的内容**（§6.4），原始产物只存在于 Runner 的 workdir，随 retention 过期。**路径含 attempt**，使覆盖写天然幂等且不同 attempt 不互相覆盖。
 
-`traj.jsonl` 只进 bundle 不单独上传（通常几十到几百 MB）；需要单独取用时下载 bundle 后解包。
+**[MVP] 每个 attempt 只上传 2 个对象**（bundle + result.json）：每个对象是一次外部命令调用，500 trials × 6 个文件 = 3000 次调用，压到 1000 次在耗时和被限速的概率上差别都很大。`rollout-man trial logs` 下载 bundle 后本地解包并缓存；[P1] 再补单文件上传，让 `logs` 免于下整包。
+
+### 9.4 外部存储：命令行适配器
+
+**系统不内置任何存储 SDK。** 上传 / 下载 / 取链接 / 删除四个动作各配一条命令模板，由系统填参数、执行、看退出码。换后端只改配置不改代码——OneDrive、S3、内网 WebDAV、甚至一台 scp 目标机都是同一套接法。
+
+理由很实际：这个规模（3 台 Runner、单团队）不值得为某个云的 SDK、鉴权、限流、分片协议再写一层适配，而 `rclone` 这类工具已经把这些做完了，顺带支持几十种后端。同样的做法适用于 Case 的 `git` 来源——那本来就是一条 `git clone`。
+
+**连带的好处是凭证问题一起消失了**：命令自己去找它需要的凭证，本系统不读、不存、不下发 GitHub / OneDrive 的任何凭证，也就不用为它们设计轮换、吊销和泄漏面。
+
+```yaml
+# server.yaml / runner.yaml
+commands:
+  timeout: 30m
+  max_attempts: 3
+
+  # 每条命令二选一写法：run（argv 数组，用 {{.X}} 模板）或 script（sh 脚本，用环境变量）
+  storage_upload:
+    run: ["rclone", "copyto", "--", "{{.LocalPath}}", "onedrive:rollout-man/{{.Key}}"]
+
+  storage_download:
+    script: |
+      set -euo pipefail
+      rclone copyto -- "onedrive:rollout-man/${KEY}" "${LOCAL_PATH}"
+
+  storage_link:
+    run: ["rclone", "link", "--expire", "24h", "--", "onedrive:rollout-man/{{.Key}}"]
+
+  storage_delete:
+    run: ["rclone", "deletefile", "--", "onedrive:rollout-man/{{.Key}}"]
+
+  source_git:                             # Case 的 git 来源同样是一条命令
+    script: |
+      set -euo pipefail
+      git clone --depth 1 --branch "${GIT_REF}" "${GIT_REPO}" "${LOCAL_PATH}"
+```
+
+**契约**（实现只需遵守这几条）：
+
+| 项 | 约定 |
+|---|---|
+| 变量传递 | `run` 形式用 `{{.Key}}` / `{{.LocalPath}}` 模板；`script` 形式用同名大写环境变量 `KEY` / `LOCAL_PATH`（git 来源另有 `GIT_REPO` / `GIT_REF`）。两种写法能力等价，脚本形式适合需要多步或条件判断的场合 |
+| 成功判定 | 退出码 0；非 0 → `INFRASTRUCTURE/OBJECT_STORE_ERROR`（可重试，**不换机**——后端不通换台机器也不通） |
+| `link` 输出 | stdout 第一行即 URL，`GET /trials/{id}/artifacts/{name}` 302 到它 |
+| 凭证 | **本系统不管理外部存储 / VCS 凭证，也不读取、不存储、不下发**。命令自己去找它需要的东西——`rclone.conf`、`~/.ssh`、`gh auth`、宿主环境变量都行。这些凭证属于 Runner 主机，与系统的 runner token / LLM key 完全分开（§8.1） |
+| 完整性 | **sha256 由系统在本地算**：上传前算、下载后验，不依赖后端返回的摘要（各家算法不一，商业版 OneDrive 返回的就不是 SHA-256） |
+| 输出处理 | 命令的 stdout / stderr 过 Sanitizer 后记 event 便于排查；**不进 workflow history** |
+| 执行位置 | `upload` / `download` 在 Runner 上执行；`link` / `delete` 在 Server 上执行 |
+
+**放弃了什么**：拿不到后端的配额、限流细节和服务端校验和。换来的是零 SDK 代码与换后端零改动——MVP 规模下这笔交易划算。真需要配额监控时再加一条可选的 `stat` 命令即可。
+
+**[P1] 任意 exec 步骤**：`pipeline.post` 支持 `- step: exec, run: [...]`，用同一套契约执行自定义动作（通知、二次归档、投递到别的系统）。MVP 只有内置的 redact / bundle / upload 三步。
+
+**用 OneDrive 时的运维清单** —— 这些是后端本身的坑，不是本系统的代码问题，但踩到一样疼：
+
+- **关掉文档库的版本历史**（或把版本上限设为 1）。PostProcess 重入是全量覆盖写，开着版本历史会让同一份 bundle 按重试次数存好几遍，**配额消耗与重试次数成正比且毫无提示**。
+- **删除只进回收站，不释放配额**。§9.2 的 GC 作业跑完要顺带清空回收站，否则「清理」只是把账挪了个地方。
+- **配额是硬上限**，没有超额自动扩容。写满就是全部上传失败，而失败点在 trial 的最后一步——产物跑出来了却传不上去。
+- **并发上传会被限速**。`commands.max_attempts` 加上 rclone 自身的退避通常够用；不够就降低 Runner 侧并发上传数，或减少每 trial 的对象数（§9.3 默认只传 2 个就是这个考虑）。
+- 推荐用 **SharePoint 文档库**而非个人 OneDrive：配额更大、按站点管权限、不绑定某个人的账号（人一离职空间就出问题）。
 
 ---
 
@@ -1160,7 +1284,7 @@ PostgreSQL 只存 key + size + sha256 + kind。**所有对象都是 PostProcess 
 ```text
 POST   /cases                              创建 case
 POST   /cases/{id}/versions                注册版本（source: git|artifact）→ state=PARSING
-POST   /cases/{id}/versions/upload-init    [P1] 分块上传：返回 presigned URLs
+POST   /cases/{id}/versions/upload-init    [P1] 需要服务端协调的上传方式；MVP 由 CLI 直接跑 storage.upload
 POST   /cases/{id}/versions/upload-commit  完成上传：服务端校验 sha256 后注册
 POST   /cases/{id}/versions/{v}/admit      准入校验（§3.5）→ 创建 validation experiment
 GET    /cases/{id}/versions/{v}/admission  准入结果明细（判据、各 trial reward、结论）
@@ -1212,7 +1336,7 @@ POST   /tasks/{id}/retry                对 FAILED 的 trial 重起 workflow
 GET    /tasks/{id}/trials
 GET    /trials/{id}                     含 failure、metrics、artifacts
 GET    /trials/{id}/events              timeline
-GET    /trials/{id}/artifacts/{name}    302 → presigned download URL
+GET    /trials/{id}/artifacts/{name}    302 → storage.link 的输出（§9.4）
 GET    /queue?project=&series=          队列视图（读 placement_waiters）
 ```
 
@@ -1244,7 +1368,7 @@ POST   /internal/llm-credentials/exchange   trial token → LLM 三要素（§8.
 rollout-man
 ├── case
 │   ├── upload <path> --project --series --name [--version]
-│   ├── register --git repo#commit:path | --s3 key --sha256
+│   ├── register --git repo#commit:path | --object key --sha256
 │   ├── admit <case_id> [--version] [--trials 2]   准入：oracle≥1 / nop≤0（§3.5）
 │   │       --all --stale                          [P1] 批量复检过期准入
 │   └── list / get
@@ -1286,13 +1410,34 @@ matrix:
 concurrency: 8                         # 在途上限（排队 + 执行），见 §4.2
 priority: normal                       # critical|high|normal|low
 queue_timeout: 24h                     # 排队超时 → UNPLACED，见 §5.6
-admission:                             # 前置准入，见 §3.5
-  allow_unadmitted: false              # true 仅用于调试：结果打 ⚠ UNADMITTED 且不进跨 experiment 聚合
 
-postprocess:                           # 后置清理，见 §6.4
-  redact_keys: true                    # 强制项，写 false 会被拒绝
-  redact_ips: {traj: true, logs: false}   # 分发件脱、排查件不脱
-  bundle: true                         # 打包为 bundle.tar.zst
+# ── pipeline：显式声明 trial 主链之外的前后置步骤 ─────────────────────
+#   pipeline.pre    confirm 时按 case version 执行一次        （§3.5）
+#   ── 主链（每 trial）：fetch → prepare → run → verify → collect（§6.3）
+#   pipeline.post   每个 trial 产物离开 Runner 前顺序执行      （§6.4）
+#   ── cleanup
+# ────────────────────────────────────────────────────────────────────
+pipeline:
+  pre:
+    - step: admission                  # 前置准入闸门
+      require: admitted                # admitted（默认）| any（调试：结果打 ⚠ UNADMITTED
+                                       #                     且不进跨 experiment 聚合）
+      auto_admit: false                # true：遇到 READY 但未准入的 version 先自动跑一次准入
+      criteria:                        # 省略则用系统默认
+        oracle: {min_reward: 1.0}
+        nop:    {max_reward: 0.0}
+        trials: 2
+
+  post:                                # 顺序执行；任一步失败的处置见 §6.4
+    - step: redact                     # 6a 清洗
+      keys: required                   # 强制项，只接受 required
+      ips: {traj: true, logs: false}   # 分发件脱、排查件不脱
+      extra_patterns: []
+    - step: bundle                     # 6b 打包
+      format: tar.zst
+      include: [traj, logs, result]
+    - step: upload                     # 6c 上传 + 注册
+      objects: [bundle, result]        # 用 storage.upload 命令，见 §9.4
 
 # resources / timeouts 默认来自各 Case 的 task.toml，仅在需要统一覆盖时填写：
 overrides:                             # [P1] 三级优先级：Experiment > task.toml > 默认
@@ -1318,7 +1463,9 @@ Experiment Preview
   Agents:   claude-code, codex        LLM Specs: opus-prod, gpt5-prod
   Trials:   5 each → Total 20         在途上限: 8    Priority: NORMAL
   能力要求: docker, arch=amd64        GPU: 0
-  排队超时: 24h                        准入: 全部 ADMITTED ✓
+  排队超时: 24h
+  pre:      admission — 1/1 case version 已 ADMITTED ✓
+  post:     redact(keys=required, ips: traj✓ logs✗) → bundle(tar.zst) → upload(bundle, result)
 
 Confirm? [y/N] y
 → experiment exp_182 queued (4 tasks, 20 trials)
@@ -1394,7 +1541,11 @@ rollout-man experiment results exp_182 --pass-at 0.8
 
 ---
 
-## 13. 技术选型
+# 第五部分 · 工程与运维
+
+> 用什么写、怎么组织、怎么部署、出问题怎么发现。
+
+## 13. 技术选型与工程实践
 
 | 组件 | 选型 | 说明 |
 |------|------|------|
@@ -1403,7 +1554,7 @@ rollout-man experiment results exp_182 --pass-at 0.8
 | Runner Agent | Go（单静态二进制，systemd 托管） | 交叉编译分发，无运行时依赖；docker 操作用官方 client |
 | CLI | Go（cobra），与 Runner 共享 client SDK | 单二进制 |
 | DB | PostgreSQL | 读模型 + 注册表 + placement 记账 |
-| Object Storage | S3 / MinIO | |
+| 对象存储 | **命令行适配器**（默认 `rclone` → OneDrive） | 不内置任何存储 SDK，换后端只改配置，见 §9.4 |
 | Execution | Harbor | activity 内通过子进程 / SDK 调用 |
 | Container | Docker（显式绑定 `DOCKER_HOST`） | |
 | API 契约 | OpenAPI 3 单一来源 | Go server stub 与 TS client 均由 spec 生成 |
@@ -1428,6 +1579,7 @@ rollout-man/
 │   │   └── cachescan/    [P1]
 │   ├── placement/        matcher.go  scoring.go  reservations.go
 │   ├── failurecode/      taxonomy.go  mapping.go      （§7.2，带完整单测）
+│   ├── storage/         命令行适配器（模板渲染、执行、sha256 校验，§9.4）
 │   ├── sanitizer/
 │   └── harbor/  store/  registry/  api/  cli/
 └── deploy/               docker-compose.dev.yaml  helm/
@@ -1449,7 +1601,7 @@ rollout-man/
 | 组件 | 形态 |
 |---|---|
 | Temporal Server | **自托管**。dev：`temporal server start-dev`；**MVP 起即用 docker-compose + PG persistence**（见下） |
-| namespace | `rollout-man`，retention 30d，之后归档到 Object Storage |
+| namespace | `rollout-man`，retention 30d。**不做 archival**（Temporal 的归档后端不支持 OneDrive），30 天后以 PG 读模型为准（§9.2） |
 | API Server | [MVP] 单副本；[P1] 多副本（workflow worker 天然多活，matcher advisory lock 单活） |
 | Runner Agent | 单二进制 + systemd；新增出方向 7233 端口要求 |
 
@@ -1466,6 +1618,7 @@ SDK 自带（`client.Options.MetricsHandler`）：schedule-to-start 延迟（= �
 - per-llm-spec 在途数 [P1]
 - **image pull/build 实际耗时 与 trial 总耗时**（[MVP] 就要埋 —— 这是 [P1] 决定 affinity 权重的唯一数据来源，见 §5.7）
 - Sanitizer 精确匹配层命中次数（按 agent 分组，[P1] 作为泄漏信号）
+- 存储命令的失败率与耗时（按动作分）；配额监控见 §9.4 的可选 `stat` 命令
 
 Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应缩小（只做结果对比与队列视图）。
 
@@ -1479,6 +1632,10 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 5. **PG 同时承载 app db 与 temporal db**：本场景负载很低，但两者的备份/恢复语义不同 —— PG 单点故障会同时打掉事实源与读模型。MVP 接受；规模上去后 temporal db 独立实例。
 
 ---
+
+# 第六部分 · 交付计划
+
+> 什么进 MVP、什么押后、按什么顺序做、每步怎么验收。
 
 ## 15. 优先级分级与开发计划
 
@@ -1499,11 +1656,11 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 | **Runner** | 注册；REST 心跳；activity worker（`DisableWorkflowWorker`）；**基础 drain（按 trial 收敛）**；disable | EMERGENCY 自动 drain；`pinned_images`；DRAINING 状态机细化 | 自动扩缩容；Runner 分组 / 标签路由 |
 | **Housekeeper** | 磁盘阈值监控 + `degraded` 上报停派；**NEVER DELETE 清单 + in-use registry + label 限定**；dangling image / stopped container / workdir retention（本地 manifest 驱动）；**Docker context 校验** | 四档分级；CAS 本地缓存 LRU + 容量上限；清理审计上报 | 跨 Runner 缓存协同 / 全局 GC |
 | **Sanitizer** | 精确匹配层（含 base64/URL-encoded 变体）+ 模式匹配层（**含 presigned 签名参数**）；流式按行 + 跨行窗口；**IP 分档脱敏**（§6.4） | 命中 metrics；泄漏信号进结果分析；`extra_patterns` | 语义级脱敏（人名/路径/主机名） |
-| **安全** | key 不作为 activity 入参（Runner 用 runner token 取）；对象访问不用 presigned URL；`created_by` + 删除类操作限制；信任边界文档化 | **一次性 trial token + 吊销**；加密 Data Converter；runner token 轮换；角色细化 | Vault / 外部 secret manager |
-| **读模型 / API** | Task/Trial/Queue/Experiment 读接口；artifact presigned 下载；events 表（业务语义）；结果表 reward 分布 | visibility reconciler（5min）；`--pass-at` 查询式阈值；结果聚合完整指标 | 导出 CSV/JSONL 批量作业；跨 experiment 对比 |
+| **安全** | LLM key 不作为 activity 入参（Runner 用 runner token 取）；对象访问不放预授权 URL 进 history；外部存储凭证不由系统管理；`created_by` + 删除类操作限制；信任边界文档化 | **一次性 trial token + 吊销**；加密 Data Converter；runner token 轮换；角色细化 | Vault / 外部 secret manager |
+| **读模型 / API** | Task/Trial/Queue/Experiment 读接口；artifact 短时效 URL 下载；events 表（业务语义）；结果表 reward 分布 | visibility reconciler（5min）；`--pass-at` 查询式阈值；结果聚合完整指标 | 导出 CSV/JSONL 批量作业；跨 experiment 对比 |
 | **CLI** | case / experiment / task / trial / queue / llm-spec / runner 基本子命令；`logs`（拉已上传日志） | `-o json` 全覆盖；`results` 聚合表；时间预估（带样本量） | `logs -f` 实时跟随 |
 | **UI** | 无（用 Temporal Web UI 看 timeline） | 无 | Web UI：Queue / Runner / Experiment dashboard、结果对比 |
-| **存储治理** | 对象存储 **bucket lifecycle 策略写进部署清单** | experiment 删除级联；CAS 引用计数 | — |
+| **外部存储** | 命令行适配器（upload/download/link/delete 四条模板）；客户端 sha256；每 attempt 只传 bundle + result | **GC 作业**（按 retention 删除 + 清空回收站）；单文件上传；可选 `stat` 配额检查 | `exec` 自定义步骤；引用计数删 CAS；experiment 删除级联 |
 | **HA / 运维** | Temporal docker-compose + PG persistence；API Server 单副本；Prometheus 基础指标 | API Server 多副本 + matcher 选主；history archival；replay 回归 CI | 多 Region、多租户、Billing、K8s 调度（**明确非目标**） |
 
 **两处最容易分错的**：
@@ -1533,6 +1690,8 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 | 7 | `ScheduleToStartTimeout` 超时是否走 activity RetryPolicy | 若会重试，则"穿透到外层换机"不成立（§7.4） |
 | 8 | activity cancel → heartbeat 通道 → `docker kill` 的端到端真实时延 | 用户 cancel 的体感、EMERGENCY 自保的有效性 |
 | 9 | 一个 hello-trial 跑完后父 / 子 history 的实际事件数 | 500 / 2000 trials 的上限估算 |
+| 10 | **存储命令**：在 Runner 上跑通配好的 upload/download/link/delete；3 台并发上传 100 个 bundle 无失败 | 决定 `max_attempts` 与每 trial 对象数上限（§9.4） |
+| 11 | **OneDrive 侧**：确认版本历史已关、回收站可编程清空、rclone 能穿过企业代理 | 任一不成立就换后端——命令行适配器让这个切换只是改配置（§9.4） |
 
 都是小实验，一周内做得完，且每一条都可能改变后续设计。
 
@@ -1572,6 +1731,8 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 | 1 | LLM Spec 的 secret 后端：加密环境文件 vs KMS vs Vault | MVP 用加密文件 + KMS 解密；Vault 进 P2。下发链路已定（§8.2），待定的只是 Server 侧静态存储 |
 | 1b | 准入判据是否需要按 series 差异化（有些 Case 天然拿不到满分） | 先全局 `oracle_min = 1.0`；出现反例再按 series 覆盖，**不要一上来就放松到 0.9**——放松后准入就失去意义 |
 | 1c | `bundle` 的格式与是否分卷（超大 traj） | 先 `tar + zstd` 单卷；单 attempt 产物超过 2GB 时再议 |
+| 1d | OneDrive 用哪个身份的空间：个人 OneDrive vs SharePoint 文档库 | 倾向 SharePoint 文档库——配额更大、权限按站点管，且不绑定某个人的账号 |
+| 1e | 配额写满时的降级策略 | 至少要有「停止新 dispatch + 告警」，而不是让 trial 跑完在最后一步失败。需要 §9.4 的可选 `stat` 命令 |
 | 3 | shard 化的 shard 粒度（按 task 还是固定条数） | 倾向固定条数（如每 shard 200 trials），与 matrix 结构解耦 |
 | 4 | `queue_timeout` 默认 24h 是否合适 | 需要观察真实排队分布；MVP 先给 24h 并在超过 50% 时告警 |
 | 5 | Runner 机器的准入与加固标准 | §8.1 定了信任边界，具体加固清单待运维补 |
