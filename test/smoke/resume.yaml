@@ -1,0 +1,31 @@
+# One deliberately slow trial, so the run can be interrupted mid-agent.
+---
+kind: Commands
+timeout: 5m
+max_attempts: 1
+
+---
+kind: Experiment
+name: resume
+
+case_defaults:
+  source: local
+
+cases:
+  - path: test/smoke/slow-case
+
+matrix:
+  agents: [oracle]
+  trials: 2
+
+concurrency: 1
+max_attempts: 1
+
+pipeline:
+  per_case:
+    admission:
+      require: any
+  per_trial:
+    redact:
+      keys: required
+      ips: {traj: true, logs: false}

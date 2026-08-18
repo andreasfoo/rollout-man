@@ -1,9 +1,9 @@
-// Package sanitize scrubs artifacts before they leave the runner.
+// Package redact scrubs artifacts before they leave the runner.
 //
 // Key scrubbing is mandatory and applies to every class. IP scrubbing is
 // tiered: on for artifacts that get distributed, off for the logs people
 // debug with.
-package sanitize
+package redact
 
 import (
 	"bufio"
@@ -53,7 +53,7 @@ type Hits struct {
 
 func (h *Hits) add(o Hits) { h.Exact += o.Exact; h.Pattern += o.Pattern; h.IP += o.IP }
 
-type Sanitizer struct {
+type Redactor struct {
 	exact     []string
 	ipAllow   map[string]bool
 	extra     []*regexp.Regexp
@@ -62,8 +62,8 @@ type Sanitizer struct {
 
 // New builds a sanitizer. secrets are the plaintext values this runner handed
 // to the trial; every encoding variant of each is scrubbed.
-func New(secrets []string, extra []string, redactIPs map[Class]bool) *Sanitizer {
-	s := &Sanitizer{
+func New(secrets []string, extra []string, redactIPs map[Class]bool) *Redactor {
+	s := &Redactor{
 		ipAllow:   map[string]bool{"127.0.0.1": true, "::1": true, "0.0.0.0": true},
 		RedactIPs: redactIPs,
 	}
@@ -101,7 +101,7 @@ func variants(s string) []string {
 }
 
 // ScrubFile rewrites path in place and reports what was hit.
-func (s *Sanitizer) ScrubFile(path string, class Class) (Hits, error) {
+func (s *Redactor) ScrubFile(path string, class Class) (Hits, error) {
 	in, err := os.Open(path)
 	if err != nil {
 		return Hits{}, err
@@ -124,7 +124,7 @@ func (s *Sanitizer) ScrubFile(path string, class Class) (Hits, error) {
 
 // Scrub streams line by line, keeping one line of overlap so a secret split
 // across a newline is still caught.
-func (s *Sanitizer) Scrub(r io.Reader, w io.Writer, class Class) (Hits, error) {
+func (s *Redactor) Scrub(r io.Reader, w io.Writer, class Class) (Hits, error) {
 	var total Hits
 	br := bufio.NewReaderSize(r, 1<<20)
 	bw := bufio.NewWriter(w)
@@ -167,7 +167,7 @@ func (s *Sanitizer) Scrub(r io.Reader, w io.Writer, class Class) (Hits, error) {
 	}
 }
 
-func (s *Sanitizer) scrubExact(line string) (string, Hits) {
+func (s *Redactor) scrubExact(line string) (string, Hits) {
 	var h Hits
 	for _, sec := range s.exact {
 		if n := strings.Count(line, sec); n > 0 {
@@ -178,7 +178,7 @@ func (s *Sanitizer) scrubExact(line string) (string, Hits) {
 	return line, h
 }
 
-func (s *Sanitizer) scrubPatterns(line string, class Class) (string, Hits) {
+func (s *Redactor) scrubPatterns(line string, class Class) (string, Hits) {
 	var h Hits
 	all := append(append([]*regexp.Regexp{}, patterns...), s.extra...)
 	for _, re := range all {

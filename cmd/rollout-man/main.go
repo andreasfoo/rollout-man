@@ -1,4 +1,5 @@
-// Command rollout-man is the MVP CLI.
+// Command rollout-man runs an evaluation experiment: orchestrate, execute,
+// report, ship.
 package main
 
 import (
@@ -13,60 +14,49 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/andreasfoo/rollout-man/internal/cas"
+	"github.com/andreasfoo/rollout-man/internal/casesrc"
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
-	"github.com/andreasfoo/rollout-man/internal/resolve"
-	"github.com/andreasfoo/rollout-man/internal/spec"
-	"github.com/andreasfoo/rollout-man/internal/store"
+	"github.com/andreasfoo/rollout-man/internal/config"
+	rexec "github.com/andreasfoo/rollout-man/internal/exec"
+	"github.com/andreasfoo/rollout-man/internal/fail"
+	"github.com/andreasfoo/rollout-man/internal/run"
 )
 
 func main() {
-	if len(os.Args) < 3 {
+	if len(os.Args) < 2 {
 		usage()
 	}
-	group, verb := os.Args[1], os.Args[2]
-	args := os.Args[3:]
-
-	switch group + " " + verb {
-	case "experiment create", "experiment submit":
-		os.Exit(cmdSubmit(args))
-	case "experiment results":
-		os.Exit(cmdResults(args))
-	case "case resolve":
-		os.Exit(cmdCaseResolve(args))
-	case "worker start":
-		os.Exit(cmdWorker(args))
+	switch os.Args[1] {
+	case "run":
+		os.Exit(cmdRun(os.Args[2:]))
+	case "status":
+		os.Exit(cmdStatus(os.Args[2:]))
+	case "ship":
+		os.Exit(cmdShip(os.Args[2:]))
+	case "cases":
+		os.Exit(cmdCases(os.Args[2:]))
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `rollout-man (MVP)
+	fmt.Fprint(os.Stderr, `rollout-man
 
-  rollout-man worker start   [--config FILE] [--work DIR] [--dsn DSN] [--executor docker|local|auto]
-  rollout-man experiment create <file.yaml> [--temporal ADDR] [--dsn DSN] [--runner ID] [--dry-run]
-  rollout-man experiment results <experiment-id> [--dsn DSN] [--pass-at F]
-  rollout-man case resolve <file.yaml> [--work DIR]
+  run    <file.yaml> [--runs DIR] [--id NAME] [--executor docker|local|auto]
+         orchestrate, execute, record. Re-running the same id resumes: trials
+         already in results.jsonl are not repeated.
 
-The worker must be running: orchestration is Temporal workflows, not an
-in-process loop.
+  status <run-dir> [--pass-at F] [--failures]
+         what happened.
+
+  ship   <run-dir> <file.yaml>
+         hand the run directory to the configured ship command.
+
+  cases  <file.yaml>
+         resolve every case and print its content hash.
 `)
 	os.Exit(2)
-}
-
-func defaultDSN() string {
-	if v := os.Getenv("ROLLOUT_MAN_DSN"); v != "" {
-		return v
-	}
-	return "postgres:///rollout_man?host=/tmp&port=5433&user=rollout&sslmode=disable"
-}
-
-func defaultWork() string {
-	if v := os.Getenv("ROLLOUT_MAN_WORK"); v != "" {
-		return v
-	}
-	return filepath.Join(os.TempDir(), "rollout-man")
 }
 
 func logf(format string, a ...any) {
@@ -77,136 +67,247 @@ func signalCtx() (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
-	go func() { <-ch; cancel() }()
+	go func() {
+		<-ch
+		fmt.Fprintln(os.Stderr, "\ninterrupted; re-run with the same --id to pick up where this stopped")
+		cancel()
+	}()
 	return ctx, cancel
 }
 
-func cmdResults(args []string) int {
-	fs := flag.NewFlagSet("results", flag.ExitOnError)
-	dsn := fs.String("dsn", defaultDSN(), "PostgreSQL DSN")
-	passAt := fs.Float64("pass-at", -1, "also show the pass rate at this reward threshold")
-	if len(args) == 0 {
-		usage()
+func runsRoot(v string) string {
+	if v != "" {
+		return v
 	}
-	id := args[0]
-	fs.Parse(args[1:])
-
-	ctx := context.Background()
-	db, err := store.Open(ctx, *dsn)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "postgres:", err)
-		return 1
+	if e := os.Getenv("ROLLOUT_MAN_RUNS"); e != "" {
+		return e
 	}
-	defer db.Close()
-	return printResults(ctx, db, id, *passAt)
+	return "runs"
 }
 
-func printResults(ctx context.Context, db *store.DB, id string, passAt float64) int {
-	rows, err := db.Results(ctx, id)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if len(rows) == 0 {
-		fmt.Println("no trials recorded for", id)
-		return 0
-	}
-	fmt.Printf("Experiment %s\n\n", id)
-	head := fmt.Sprintf("%-14s %-12s %5s  %7s %7s %7s %7s   %s",
-		"Agent", "LLM Spec", "done", "mean", "median", "p25", "p75", "failures")
-	if passAt >= 0 {
-		head += fmt.Sprintf("   pass@%.2f", passAt)
-	}
-	fmt.Println(head)
-	for _, r := range rows {
-		mean, med, p25, p75 := quart(r.Rewards)
-		line := fmt.Sprintf("%-14s %-12s %5d  %7.3f %7.3f %7.3f %7.3f   %s",
-			r.Agent, dash(r.LLMSpec), r.Completed, mean, med, p25, p75, fails(r.FailCounts))
-		if passAt >= 0 {
-			pass := 0
-			for _, v := range r.Rewards {
-				if v >= passAt {
-					pass++
-				}
-			}
-			denom := r.Completed + r.FailCounts["AGENT_TIMEOUT"] + r.FailCounts["AGENT_EXIT_NONZERO"] + r.FailCounts["AGENT_CRASH"]
-			if denom == 0 {
-				denom = 1
-			}
-			line += fmt.Sprintf("   %d/%d = %.0f%%", pass, denom, 100*float64(pass)/float64(denom))
-		}
-		fmt.Println(line)
-	}
-	return 0
+func build(f *config.File, executor string) (*cmdrun.Runner, rexec.Executor, error) {
+	cmds := cmdrun.New(f.Commands)
+	cmds.Log = logf
+	ex, err := rexec.Pick(executor)
+	return cmds, ex, err
 }
 
-func cmdCaseResolve(args []string) int {
-	fs := flag.NewFlagSet("resolve", flag.ExitOnError)
-	work := fs.String("work", defaultWork(), "working directory")
+func cmdRun(args []string) int {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	runs := fs.String("runs", "", "directory holding runs (default ./runs)")
+	id := fs.String("id", "", "run id (default: experiment name + timestamp)")
+	executor := fs.String("executor", "auto", "docker | local | auto")
 	if len(args) == 0 {
 		usage()
 	}
 	file := args[0]
 	fs.Parse(args[1:])
 
-	f, err := spec.Load(file)
+	f, err := config.Load(file)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "load:", err)
+		return 1
+	}
+	cmds, ex, err := build(f, *executor)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	st, err := cas.New(filepath.Join(*work, "objects"))
+	runID := *id
+	if runID == "" {
+		runID = fmt.Sprintf("%s-%s", f.Experiment.Name, time.Now().UTC().Format("20060102-150405"))
+	}
+	dir := filepath.Join(runsRoot(*runs), runID)
+
+	ctx, cancel := signalCtx()
+	defer cancel()
+
+	// scratch lives outside the run directory: the run directory is a
+	// deliverable and shipping it should not sweep up temporary clones
+	tmp, err := os.MkdirTemp("", "rollout-man-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	runner := cmdrun.New(f.Commands)
-	res := &resolve.Resolver{Runner: runner, Store: st, WorkRoot: *work, Log: logf}
+	defer os.RemoveAll(tmp)
+	r := &run.Runner{
+		File: f, Cmds: cmds, Exec: ex, Dir: dir, Log: logf,
+		Res: &casesrc.Resolver{Cmds: cmds, TempDir: tmp},
+	}
+	fmt.Printf("\n%s  (%s executor)\n  %s\n\n", f.Experiment.Name, ex.Name(), dir)
+	if err := r.Run(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "\n"+err.Error())
+		return 1
+	}
+	fmt.Println()
+	report(dir, -1, false)
+	return 0
+}
+
+func cmdStatus(args []string) int {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	passAt := fs.Float64("pass-at", -1, "also show the pass rate at this reward")
+	failures := fs.Bool("failures", false, "list the failed trials")
+	if len(args) == 0 {
+		usage()
+	}
+	dir := args[0]
+	fs.Parse(args[1:])
+	return report(dir, *passAt, *failures)
+}
+
+func cmdShip(args []string) int {
+	if len(args) < 2 {
+		usage()
+	}
+	dir, file := args[0], args[1]
+	f, err := config.Load(file)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	cmds, ex, err := build(f, "local")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	r := &run.Runner{File: f, Cmds: cmds, Exec: ex, Dir: dir, Log: logf}
+	if err := r.Ship(context.Background()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func cmdCases(args []string) int {
+	if len(args) == 0 {
+		usage()
+	}
+	f, err := config.Load(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	cmds, _, err := build(f, "local")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	res := &casesrc.Resolver{Cmds: cmds, TempDir: os.TempDir()}
 	rc := 0
-	for _, c := range f.Experiment.Cases {
-		ref := c.Merge(f.Experiment.CaseDefaults)
-		cv, err := res.Resolve(context.Background(), ref)
+	for _, raw := range f.Experiment.Cases {
+		ref := raw.Merge(f.Experiment.CaseDefaults)
+		c, err := res.Resolve(context.Background(), ref)
 		if err != nil {
-			fmt.Printf("%-44s INVALID  %v\n", ref.Label(), err)
+			fmt.Printf("%-46s INVALID  %v\n", ref.Label(), err)
 			rc = 1
 			continue
 		}
-		fmt.Printf("%-44s %s  %s\n", cv.Label, cv.SHA256[:16], cv.State)
+		fmt.Printf("%-46s %s  cpus=%d mem=%dMB agent_timeout=%s\n",
+			c.Label, c.SHA256[:16], c.Config.Resources.CPUs, c.Config.Resources.MemoryMB,
+			c.Config.AgentTimeout)
 	}
 	return rc
 }
 
-func agentNames(a []spec.AgentRef) string {
-	var n []string
-	for _, x := range a {
-		n = append(n, x.Name)
-	}
-	return strings.Join(n, ", ")
+// --------------------------------------------------------------- report ---
+
+type row struct {
+	agent, spec string
+	rewards     []float64
+	fails       map[fail.Code]int
 }
 
-func dash(s string) string {
-	if s == "" {
-		return "-"
+func report(dir string, passAt float64, listFailures bool) int {
+	results, err := run.Load(dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
 	}
-	return s
+	if len(results) == 0 {
+		fmt.Println("no trials recorded in", dir)
+		return 0
+	}
+	idx := map[string]*row{}
+	var order []*row
+	for _, r := range run.Sorted(results) {
+		k := r.Agent + "|" + r.LLMSpec
+		x, ok := idx[k]
+		if !ok {
+			x = &row{agent: r.Agent, spec: r.LLMSpec, fails: map[fail.Code]int{}}
+			idx[k] = x
+			order = append(order, x)
+		}
+		if r.OK() {
+			x.rewards = append(x.rewards, *r.Reward)
+		} else {
+			x.fails[r.Code]++
+		}
+	}
+
+	fmt.Printf("%s\n\n", dir)
+	head := fmt.Sprintf("%-14s %-12s %5s  %7s %7s %7s %7s   %s",
+		"Agent", "LLM Spec", "done", "mean", "median", "p25", "p75", "not measured")
+	if passAt >= 0 {
+		head += fmt.Sprintf("   pass@%.2f", passAt)
+	}
+	fmt.Println(head)
+	for _, x := range order {
+		mean, med, p25, p75 := quartiles(x.rewards)
+		line := fmt.Sprintf("%-14s %-12s %5d  %7.3f %7.3f %7.3f %7.3f   %s",
+			x.agent, dash(x.spec), len(x.rewards), mean, med, p25, p75, failSummary(x.fails))
+		if passAt >= 0 {
+			n := 0
+			for _, v := range x.rewards {
+				if v >= passAt {
+					n++
+				}
+			}
+			// Only the agent's own failures belong in the denominator.
+			// Infrastructure trouble is ours, and counting it would quietly
+			// mark every agent down for our bad day.
+			denom := len(x.rewards)
+			for c, k := range x.fails {
+				if c.CountsAgainstAgent() {
+					denom += k
+				}
+			}
+			if denom == 0 {
+				denom = 1
+			}
+			line += fmt.Sprintf("   %d/%d = %.0f%%", n, denom, 100*float64(n)/float64(denom))
+		}
+		fmt.Println(line)
+	}
+
+	if listFailures {
+		fmt.Println()
+		for _, r := range run.Sorted(results) {
+			if !r.OK() {
+				fmt.Printf("  %-44s %-14s %s\n", r.TrialID, r.Code, firstLine(r.Message))
+			}
+		}
+	}
+	return 0
 }
 
-func fails(m map[string]int) string {
+func failSummary(m map[fail.Code]int) string {
 	if len(m) == 0 {
 		return "-"
 	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
-		keys = append(keys, k)
+		keys = append(keys, string(k))
 	}
 	sort.Strings(keys)
-	var parts []string
+	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s=%d", k, m[k]))
+		parts = append(parts, fmt.Sprintf("%s=%d", k, m[fail.Code(k)]))
 	}
 	return strings.Join(parts, " ")
 }
 
-func quart(v []float64) (mean, med, p25, p75 float64) {
+func quartiles(v []float64) (mean, med, p25, p75 float64) {
 	if len(v) == 0 {
 		return
 	}
@@ -216,9 +317,20 @@ func quart(v []float64) (mean, med, p25, p75 float64) {
 		mean += x
 	}
 	mean /= float64(len(s))
-	q := func(f float64) float64 {
-		i := int(f * float64(len(s)-1))
-		return s[i]
-	}
+	q := func(f float64) float64 { return s[int(f*float64(len(s)-1))] }
 	return mean, q(0.5), q(0.25), q(0.75)
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

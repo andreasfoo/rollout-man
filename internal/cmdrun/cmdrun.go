@@ -13,17 +13,17 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/andreasfoo/rollout-man/internal/spec"
+	"github.com/andreasfoo/rollout-man/internal/config"
 )
 
 type Runner struct {
-	Cmds        map[string]spec.Command
+	Cmds        map[string]config.Command
 	Timeout     time.Duration
 	MaxAttempts int
 	Log         func(format string, args ...any)
 }
 
-func New(c spec.Commands) *Runner {
+func New(c config.Commands) *Runner {
 	r := &Runner{Cmds: c.Cmds, Timeout: c.Timeout.D(), MaxAttempts: c.MaxAttempts}
 	if r.Timeout <= 0 {
 		r.Timeout = 30 * time.Minute
@@ -32,7 +32,7 @@ func New(c spec.Commands) *Runner {
 		r.MaxAttempts = 3
 	}
 	if r.Cmds == nil {
-		r.Cmds = map[string]spec.Command{}
+		r.Cmds = map[string]config.Command{}
 	}
 	return r
 }
@@ -72,7 +72,7 @@ func (r *Runner) Run(ctx context.Context, name string, vars map[string]string) (
 	return Result{}, fmt.Errorf("command %s failed after %d attempts: %w", name, r.MaxAttempts, last)
 }
 
-func (r *Runner) once(ctx context.Context, name string, c spec.Command, vars map[string]string) (Result, error) {
+func (r *Runner) once(ctx context.Context, name string, c config.Command, vars map[string]string) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
 

@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/andreasfoo/rollout-man/internal/casedef"
-	"github.com/andreasfoo/rollout-man/internal/failure"
+	"github.com/andreasfoo/rollout-man/internal/fail"
 )
 
 type AgentKind string
@@ -94,14 +94,14 @@ func (l *Local) Prepare(ctx context.Context, env *CaseEnv) error {
 	sb := env.sandbox()
 	for _, d := range []string{"app", "app/seed", "logs/verifier", "logs/agent", "solution", "tmp"} {
 		if err := os.MkdirAll(filepath.Join(sb, d), 0o777); err != nil {
-			return failure.Wrap(failure.HostError, "create sandbox", err)
+			return fail.Wrap(fail.Host, "create sandbox", err)
 		}
 	}
 	if err := os.MkdirAll(env.OutDir(), 0o755); err != nil {
-		return failure.Wrap(failure.HostError, "create out dir", err)
+		return fail.Wrap(fail.Host, "create out dir", err)
 	}
 	if err := copyTree(filepath.Join(env.CaseDir, "solution"), filepath.Join(sb, "solution")); err != nil {
-		return failure.Wrap(failure.ContainerStart, "stage solution", err)
+		return fail.Wrap(fail.EnvFailed, "stage solution", err)
 	}
 	// Seed material is the agent-visible clue set; the case Dockerfile copies it
 	// into /app/seed, so mirror that.
@@ -116,23 +116,23 @@ func (l *Local) RunAgent(ctx context.Context, env *CaseEnv, a AgentSpec) error {
 	case Oracle:
 		script := filepath.Join(env.CaseDir, "solution", "solve.sh")
 		if _, err := os.Stat(script); err != nil {
-			return failure.Wrap(failure.ContainerStart, "case has no solution/solve.sh", err)
+			return fail.Wrap(fail.EnvFailed, "case has no solution/solve.sh", err)
 		}
 		out, code, err := l.shell(ctx, env, "/solution/solve.sh", env.Cfg.AgentTimeout, nil)
 		writeFile(filepath.Join(env.sandbox(), "logs", "agent", "stdout.log"), out)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return failure.New(failure.AgentTimeout, "oracle exceeded agent timeout")
+				return fail.New(fail.AgentTimeout, "oracle exceeded agent timeout")
 			}
-			return failure.Wrap(failure.HostError, "run oracle", err)
+			return fail.Wrap(fail.Host, "run oracle", err)
 		}
 		if code != 0 {
-			return failure.New(failure.AgentExitNonzero, fmt.Sprintf("oracle exited %d", code))
+			return fail.New(fail.AgentFailed, fmt.Sprintf("oracle exited %d", code))
 		}
 		return nil
 	case LLM:
 		if len(a.Command) == 0 {
-			return failure.New(failure.ContainerStart,
+			return fail.New(fail.EnvFailed,
 				"no agent command configured for "+a.Name+" (MVP ships oracle/nop only)")
 		}
 		envv := map[string]string{}
@@ -145,34 +145,34 @@ func (l *Local) RunAgent(ctx context.Context, env *CaseEnv, a AgentSpec) error {
 		writeFile(filepath.Join(env.sandbox(), "logs", "agent", "stdout.log"), out)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return failure.New(failure.AgentTimeout, "agent exceeded timeout")
+				return fail.New(fail.AgentTimeout, "agent exceeded timeout")
 			}
-			return failure.Wrap(failure.HostError, "run agent", err)
+			return fail.Wrap(fail.Host, "run agent", err)
 		}
 		if code != 0 {
-			return failure.New(failure.AgentExitNonzero, fmt.Sprintf("agent exited %d", code))
+			return fail.New(fail.AgentFailed, fmt.Sprintf("agent exited %d", code))
 		}
 		return nil
 	}
-	return failure.New(failure.InternalError, "unknown agent kind")
+	return fail.New(fail.Host, "unknown agent kind")
 }
 
 func (l *Local) RunVerifier(ctx context.Context, env *CaseEnv) (float64, error) {
 	script := filepath.Join(env.CaseDir, "tests", "test.sh")
 	if _, err := os.Stat(script); err != nil {
-		return 0, failure.Wrap(failure.VerifierError, "case has no tests/test.sh", err)
+		return 0, fail.Wrap(fail.VerifierBad, "case has no tests/test.sh", err)
 	}
 	out, code, err := l.shell(ctx, env, "/tests/test.sh", env.Cfg.VerifierTimeout, nil)
 	writeFile(filepath.Join(env.sandbox(), "logs", "verifier", "verifier.log"), out)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return 0, failure.New(failure.VerifierTimeout, "verifier exceeded timeout")
+			return 0, fail.New(fail.VerifierBad, "verifier exceeded timeout")
 		}
-		return 0, failure.Wrap(failure.VerifierError, "run verifier", err)
+		return 0, fail.Wrap(fail.VerifierBad, "run verifier", err)
 	}
 	reward, rerr := readReward(filepath.Join(env.sandbox(), "logs", "verifier", "reward.txt"))
 	if rerr != nil {
-		return 0, failure.Wrap(failure.VerifierError,
+		return 0, fail.Wrap(fail.VerifierBad,
 			fmt.Sprintf("verifier exited %d without a usable reward", code), rerr)
 	}
 	return reward, nil
@@ -264,12 +264,12 @@ func (d *Docker) Prepare(ctx context.Context, env *CaseEnv) error {
 		filepath.Join(env.CaseDir, "environment"))
 	if out, err := c.CombinedOutput(); err != nil {
 		if ctx.Err() != nil {
-			return failure.New(failure.EnvironmentTimeout, "image build exceeded build_timeout_sec")
+			return fail.New(fail.EnvFailed, "image build exceeded build_timeout_sec")
 		}
-		return failure.Wrap(failure.ImageBuildFailed, tail(string(out), 4000), err)
+		return fail.Wrap(fail.EnvFailed, tail(string(out), 4000), err)
 	}
 	if err := os.MkdirAll(env.OutDir(), 0o755); err != nil {
-		return failure.Wrap(failure.HostError, "create out dir", err)
+		return fail.Wrap(fail.Host, "create out dir", err)
 	}
 	return nil
 }
@@ -294,13 +294,13 @@ func (d *Docker) RunAgent(ctx context.Context, env *CaseEnv, a AgentSpec) error 
 	cmd := []string{"bash", "-lc", "/solution/solve.sh"}
 	if a.Kind == LLM {
 		if len(a.Command) == 0 {
-			return failure.New(failure.ContainerStart, "no agent command configured for "+a.Name)
+			return fail.New(fail.EnvFailed, "no agent command configured for "+a.Name)
 		}
 		cmd = a.Command
 	}
 	args = append(args, env.Image)
 	args = append(args, cmd...)
-	return d.run(ctx, env, args, env.Cfg.AgentTimeout, failure.AgentTimeout, failure.AgentExitNonzero)
+	return d.run(ctx, env, args, env.Cfg.AgentTimeout, fail.AgentTimeout, fail.AgentFailed)
 }
 
 func (d *Docker) RunVerifier(ctx context.Context, env *CaseEnv) (float64, error) {
@@ -308,14 +308,14 @@ func (d *Docker) RunVerifier(ctx context.Context, env *CaseEnv) (float64, error)
 		"-v", filepath.Join(env.CaseDir, "tests") + ":/tests:ro",
 		"-v", env.WorkDir + "/state:/state",
 		"-u", env.Cfg.VerifierUser, env.Image, "bash", "-lc", "/tests/test.sh"}
-	err := d.run(ctx, env, args, env.Cfg.VerifierTimeout, failure.VerifierTimeout, failure.VerifierError)
+	err := d.run(ctx, env, args, env.Cfg.VerifierTimeout, fail.VerifierBad, fail.VerifierBad)
 	if err != nil {
 		return 0, err
 	}
 	return readReward(filepath.Join(env.WorkDir, "state", "reward.txt"))
 }
 
-func (d *Docker) run(ctx context.Context, env *CaseEnv, args []string, timeout time.Duration, tCode, xCode failure.Code) error {
+func (d *Docker) run(ctx context.Context, env *CaseEnv, args []string, timeout time.Duration, tCode, xCode fail.Code) error {
 	if timeout <= 0 {
 		timeout = 30 * time.Minute
 	}
@@ -325,14 +325,14 @@ func (d *Docker) run(ctx context.Context, env *CaseEnv, args []string, timeout t
 	out, err := c.CombinedOutput()
 	writeFile(filepath.Join(env.OutDir(), "stdout.log"), string(out))
 	if ctx.Err() != nil {
-		return failure.New(tCode, "exceeded timeout")
+		return fail.New(tCode, "exceeded timeout")
 	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
-			return failure.New(xCode, fmt.Sprintf("exited %d", ee.ExitCode()))
+			return fail.New(xCode, fmt.Sprintf("exited %d", ee.ExitCode()))
 		}
-		return failure.Wrap(failure.DockerError, "docker run", err)
+		return fail.Wrap(fail.Host, "docker run", err)
 	}
 	return nil
 }
@@ -361,10 +361,10 @@ func readReward(path string) (float64, error) {
 	}
 	v, err := strconv.ParseFloat(strings.TrimSpace(string(b)), 64)
 	if err != nil {
-		return 0, failure.Wrap(failure.InvalidReward, "reward.txt is not a number", err)
+		return 0, fail.Wrap(fail.VerifierBad, "reward.txt is not a number", err)
 	}
 	if v < 0 || v > 1 {
-		return 0, failure.New(failure.InvalidReward, "reward out of range: "+strconv.FormatFloat(v, 'f', -1, 64))
+		return 0, fail.New(fail.VerifierBad, "reward out of range: "+strconv.FormatFloat(v, 'f', -1, 64))
 	}
 	return v, nil
 }

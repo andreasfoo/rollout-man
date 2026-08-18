@@ -1,23 +1,16 @@
-# Deployment config for `rollout-man worker start --config deploy.example.yaml`.
-# Only kind: Commands is read here; experiments carry their own LLMSpecs.
+# Commands the runtime shells out to. Keep them next to the experiment or in a
+# file of their own; rollout-man reads the kind: Commands document from either.
 ---
 kind: Commands
 timeout: 30m
 max_attempts: 3
 
-storage_upload:
-  run: ["rclone", "copyto", "--", "{{.LocalPath}}", "onedrive:rollout-man/{{.Key}}"]
-
-storage_download:
-  run: ["rclone", "copyto", "--", "onedrive:rollout-man/{{.Key}}", "{{.LocalPath}}"]
-
-storage_link:
-  run: ["rclone", "link", "--expire", "24h", "--", "onedrive:rollout-man/{{.Key}}"]
-
-storage_delete:
-  run: ["rclone", "deletefile", "--", "onedrive:rollout-man/{{.Key}}"]
-
 source_git:
   script: |
     set -euo pipefail
     git clone --quiet --depth 1 --branch "${GIT_REF}" "${GIT_REPO}" "${LOCAL_PATH}"
+
+# {{.LocalPath}} is the run directory, {{.Key}} the destination from
+# pipeline.per_experiment.ship.dest
+ship:
+  run: ["rclone", "copyto", "--", "{{.LocalPath}}", "onedrive:{{.Key}}"]
