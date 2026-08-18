@@ -304,6 +304,55 @@ digest they return, and some do not return SHA-256 at all.
 
 ---
 
+## Running the MVP
+
+```bash
+go build -o rollout-man ./cmd/rollout-man
+
+# resolve the cases a file refers to: fetch, hash, store, parse task.toml
+./rollout-man case resolve test/smoke/smoke.yaml
+
+# expand the matrix without running anything
+./rollout-man experiment create test/smoke/smoke.yaml --dry-run
+
+# run it
+export ROLLOUT_MAN_DSN='postgres:///rollout_man?sslmode=disable'
+./rollout-man experiment create test/smoke/smoke.yaml --executor local
+./rollout-man experiment results <experiment-id> --pass-at 0.8
+```
+
+`test/smoke/run.sh` is the end-to-end smoke test — 23 assertions covering
+resolve determinism, both admission verdicts, matrix expansion, the redaction
+tiers, staged batch upload, and the read model. It needs Go, a reachable
+PostgreSQL, and `CAP_SYS_ADMIN`; it does **not** need a Docker daemon.
+
+### Executors
+
+| executor | how it runs a trial |
+|---|---|
+| `docker` | builds the case's `environment/Dockerfile`, runs agent and verifier in containers |
+| `local` | runs the same case scripts inside a private mount namespace with `/app`, `/logs`, `/solution` and `/tests` bind-mounted from a per-trial sandbox |
+
+`local` exists so the orchestration can be exercised without a daemon. The
+absolute paths cases hardcode still resolve, and the host environment is
+deliberately **not** inherited — case scripts are untrusted and their output
+becomes an artifact.
+
+### What is not built yet
+
+- **Temporal.** The orchestration currently runs in-process: sequential steps,
+  a semaphore for concurrency, and an attempt loop for retries. The durability
+  the design leans on — surviving a crash mid-trial, resuming from the last
+  completed step — is not there yet.
+- **Placement.** One runner, no resource accounting, no queue. `--runner` is a
+  label on the read model.
+- **Multi-runner staging.** `per_experiment: upload` flushes this process's
+  staging directory; with several runners it has to fan out per queue.
+
+Everything else in the pipeline — resolve, CAS, admission, matrix, the main
+chain, redaction, bundling, staging, upload, report, deploy, and the Postgres
+read model — is implemented and exercised by the smoke test.
+
 ## Scope
 
 The MVP is deliberately small: one team, **≤3 runners**, **≤500 trials per experiment**, no GPU.

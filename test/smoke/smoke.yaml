@@ -1,0 +1,104 @@
+# Smoke test: synthetic cases, local executor, filesystem-backed storage.
+---
+kind: Commands
+timeout: 5m
+max_attempts: 2
+
+storage_upload:
+  script: |
+    set -euo pipefail
+    dst="${ROLLOUT_MAN_BUCKET:-/tmp/rollout-man/bucket}/${KEY}"
+    mkdir -p "$(dirname "$dst")"
+    cp -- "${LOCAL_PATH}" "$dst"
+
+storage_download:
+  script: |
+    set -euo pipefail
+    cp -- "${ROLLOUT_MAN_BUCKET:-/tmp/rollout-man/bucket}/${KEY}" "${LOCAL_PATH}"
+
+source_git:
+  script: |
+    set -euo pipefail
+    git clone --quiet --depth 1 --branch "${GIT_REF}" "${GIT_REPO}" "${LOCAL_PATH}"
+
+# A "real agent" is just another command. This one deliberately leaks its key
+# and an internal IP so the smoke test can prove the redaction tiers work.
+agent_leaky:
+  script: |
+    set -euo pipefail
+    printf 'ROLLOUT-MAN-OK' > /app/answer.txt
+    mkdir -p /logs/agent
+    printf '{"role":"system","text":"calling %s with key %s"}\n' \
+      "$LLM_BASE_URL" "$LLM_API_KEY" > /logs/agent/traj.jsonl
+    printf '{"role":"tool","text":"connected to 10.1.2.3:8080"}\n' >> /logs/agent/traj.jsonl
+    echo "agent.log: used key $LLM_API_KEY against 10.1.2.3" >> /logs/agent/agent.log
+    echo "done"
+
+---
+kind: LLMSpec
+name: fake-prod
+provider: smoke
+base_url: https://api.example.invalid
+model: fake-model-1
+api_key_env: SMOKE_API_KEY
+
+---
+kind: Experiment
+name: smoke
+
+case_defaults:
+  source: local
+
+cases:
+  - path: test/smoke/pass-case
+  - path: test/smoke/leaky-case
+
+matrix:
+  agents:
+    - name: oracle
+    - name: nop
+    - name: leaky
+      llm_spec: fake-prod
+  trials: 2
+
+concurrency: 4
+priority: normal
+queue_timeout: 10m
+
+pipeline:
+  per_case:
+    - step: resolve
+      on_unchanged: skip
+    - step: admission
+      require: admitted
+      auto_admit: true
+      criteria:
+        oracle: {min_reward: 1.0}
+        nop:    {max_reward: 0.0}
+        trials: 1
+
+  per_trial:
+    - step: redact
+      keys: required
+      ips: {traj: true, logs: false}
+    - step: bundle
+      format: tar.zst
+      include: [traj, logs, result]
+    - step: stage
+      max_pending: 20Gi
+      on_cancel: upload
+
+  per_experiment:
+    - step: upload
+      using: storage_upload
+      dest: "evals/{{.ExperimentName}}/"
+    - step: report
+      formats: [json, csv]
+      dest: "evals/{{.ExperimentName}}/report/"
+    - step: deploy
+      run: ["echo", "deployed {{.ExperimentID}}"]
+      on_failure: warn
+
+retry_policy:
+  max_total_attempts: 2
+  retry_on: [DOCKER_ERROR, HOST_ERROR]
