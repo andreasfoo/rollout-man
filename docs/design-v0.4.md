@@ -14,13 +14,7 @@
 
 ## 0. 本版说明
 
-### 0.1 为什么合并成一份
-
-v0.3（架构层）与实现稿 v0.1（Temporal 层）在状态机、表结构、Runner 协议三处互相矛盾，而这三处恰恰是最容易被照抄的地方。实现稿实际上删掉了 v0.3 近一半的内容（手写状态机、调度循环、选主、poll/心跳/orphan 协议），维持两份的成本高于收益：任何改动都要改两处，而这正是矛盾的成因。两份文档的读者目前是同一批人，没有分层必要。
-
-**本文是唯一基线。** 后续若出现"架构读者 ≠ 实现读者"，再拆。
-
-### 0.2 相对 v0.3 / 实现稿 v0.1 的实质变化
+### 0.1 相对 v0.3 / 实现稿 v0.1 的实质变化
 
 | # | 变化 | 来源 |
 |---|---|---|
@@ -47,7 +41,7 @@ v0.3（架构层）与实现稿 v0.1（Temporal 层）在状态机、表结构�
 | 21 | 对象存储侧 retention 策略补齐 | 二轮评审 B12 |
 | 22 | 一致性修正：`max_total_attempts` 命名、trials 唯一键、image 保护条件、`DOCKER_ERROR` 枚举、删除 `poll_interval`、case 解析状态、retry WorkflowID 统一 | 评审 §4 |
 
-### 0.3 优先级标记约定
+### 0.2 优先级标记约定
 
 全文用行内标记声明交付批次，汇总见 §15.1：
 
@@ -1479,42 +1473,7 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 
 ---
 
-## 附录 A：v0.3 / 实现稿 v0.1 → v0.4 变更速查
-
-**架构级**（§0.2 已列，此处只列一致性修正与 bug）：
-
-| 位置 | v0.3 / v0.1 | v0.4 |
-|---|---|---|
-| `retry_policy.max_attempts` | 架构稿注释"最多重试次数"（=3 次执行），实现稿代码 `attempt <= MaxAttempts`（=2 次执行） | 改名 `max_total_attempts`，**含首次**，默认 3 |
-| `trials` 唯一键 | `(task_id, attempt)` —— 10 个 trial 的 attempt 都是 1，约束直接爆 | `(task_id, trial_index, attempt)` |
-| Task 聚合状态 | 从未定义 | `PENDING/RUNNING/COMPLETED/CANCELLED`，无成败 |
-| image 保护条件 | `last_used < image_unused retention 的 image` —— 方向写反，热镜像被删 | `now - last_used < retention` |
-| `DOCKER_ERROR` | 枚举表与示例 yaml 不一致（`DOCKER_DAEMON_ERROR`） | 以枚举表为准 |
-| `poll_interval` | 与 `heartbeat_interval` 并存，但文档说心跳合并在 poll 里 | 删除，只保留 `heartbeat_interval` |
-| `task.toml` 解析 | 异步解析，但 Experiment 创建时就需要 → 竞态 | `PARSING/READY/INVALID` 状态 + 创建时校验 READY |
-| retry 的 WorkflowID | 两套语义并存 | 统一 `-r{seq}` + `RejectDuplicate` |
-| GPU | 硬约束里有 `available_gpu`，但表里只有数量没有型号 | MVP 明确不支持，`gpu` 必须为 0 |
-| 鉴权 | 缺失 | §8.4 最小可用集 |
-| Temporal retention 30d 之后 | 未说明 | §9.2：PG 是唯一可查询事实源 |
-| `MATRIX_TOO_LARGE` 上限 | 10000（≈26 天，无实际意义） | 500 / 2000 / 10000 分级 |
-| `redact_ips` | 默认 `true` | 默认 `false`，降到 P2 |
-| §8.4 回退方案 | "Phase 2 结束时若超 3 人周则重新评审" | **删除**，判据前移到 Phase 0 |
-
-**代码级 bug（实现稿 v0.1 示例代码）**：
-
-| 位置 | 问题 |
-|---|---|
-| `TrialWorkflow` 外层循环 | CAN 时携带了 `WithResumeState(attempt, exclude)`，但循环恒 `for attempt := 1` 且 `exclude` 从 nil 开始 —— **resume state 从未被读取**，续接后从第 1 次 attempt 重来并丢失 avoid_same_runner |
-| `runAttempt` 的 defer 位置 | 注册在 placement 授予之后，cancel / CAN 路径留下幽灵 waiter |
-| `RecordAttemptFailed` 的 ctx | 用 `serverCtx(ctx)`，cancel 后必然失败 → 读模型停在 RUNNING |
-| `NewDisconnectedContext` | `dctx, _ :=` 丢弃 cancel func；且补偿块无整体超时 |
-| `_ = f.Get(gctx, nil)` | 吞掉 child 启动失败，与"trial 跑完失败"不可区分 |
-| `RunAgent` `MaxAttempts=1` | 使重入接管成为死代码（§6.2） |
-| `FetchRequest{URI: ...}` | 若为 presigned URL，签名进 history（§8.2） |
-
----
-
-## 附录 B：设计原则（一句话版）
+## 附录 A：设计原则（一句话版）
 
 > Case 是 Artifact，Experiment 是声明，Task 是分组，Trial 是唯一的执行单位；
 > **Temporal** 负责可靠地把每一步按顺序做完（状态机、队列、lease、心跳、重试、级联取消全部退役）；
