@@ -132,15 +132,10 @@ concurrency: 8                          # in-flight cap (queued + executing)
 priority: normal
 queue_timeout: 24h                      # stop waiting for a runner → UNPLACED
 
-# ── pipeline: three phases around the main chain ────────────────────────
-#   pre        once per case, at confirm
-#   ── main chain (per trial): fetch → prepare → run → verify → collect
-#   post       per trial, before any artifact leaves the runner
-#   ── cleanup
-#   finalize   once, after every trial reaches a terminal state
-# ────────────────────────────────────────────────────────────────────────
+# ── pipeline: hooks around the main chain. The key names the unit. ──────
 pipeline:
-  pre:
+
+  per_case:                             # ← once per case, at confirm, on a runner
     - step: resolve                     # fetch → sha256 → CAS → parse task.toml
       on_unchanged: skip
     - step: admission                   # is this case even measurable?
@@ -150,24 +145,34 @@ pipeline:
         nop:    {max_reward: 0.0}       # doing nothing must score zero
         trials: 2
 
-  post:
+  # ──────────────────────────────────────────────────────────────────
+  #  Once every case passes, the matrix expands into N trials. Each
+  #  trial's main chain — fetch → prepare → run → verify → collect — is
+  #  built in and not configurable. per_trial steps run right after it,
+  #  on the same runner.
+  # ──────────────────────────────────────────────────────────────────
+
+  per_trial:                            # ← once per trial, on that trial's runner
     - step: redact
       keys: required                    # never optional
       ips: {traj: true, logs: false}    # scrub what ships, keep what you debug with
     - step: bundle
       format: tar.zst
       include: [traj, logs, result]
-    - step: upload
-      mode: batch                       # per_trial (default) | batch
-      using: storage_upload
-      dest: "evals/{{.ExperimentName}}/{{.CasePath}}/{{.TrialID}}/"
-      objects: [bundle, result]
-      batch:
-        max_pending: 20Gi               # per runner; exceeding it forces a flush
-        on_cancel: flush
+    - step: stage                       # hold locally; per_experiment ships it
+      max_pending: 20Gi                 # per runner; exceeding it ships early
+      on_cancel: upload
+    # To ship per trial instead, swap that step for:
+    #   - step: upload
+    #     using: storage_upload
+    #     dest: "evals/{{.ExperimentName}}/{{.CasePath}}/{{.TrialID}}/"
+    #     objects: [bundle, result]
 
-  finalize:
-    - step: flush_uploads               # one packed upload per runner, not per trial
+  per_experiment:                       # ← once, after every trial is terminal
+    - step: upload                      # each runner ships its staged artifacts in one go
+      using: storage_upload
+      dest: "evals/{{.ExperimentName}}/"
+      objects: [bundle, result]
     - step: report                      # [P1]
       formats: [json, csv]
       dest: "evals/{{.ExperimentName}}/report/"
@@ -180,31 +185,57 @@ retry_policy:
   retry_on: [DOCKER_ERROR, NETWORK_ERROR, AGENT_OOM]
 ```
 
+### Three units, one per block
+
+The pipeline key names its own unit — a step runs at the scale of the block it sits in, and nothing
+is declared in one place but executed in another:
+
+```text
+experiment                                              ← submitted once
+│
+├── per_case          × N_cases        at confirm, on a runner
+│     resolve → admission                               all must pass before queueing
+│
+├── trial             × N_trials       the main chain, built in
+│     fetch → prepare → run → verify → collect
+│   └── per_trial     × N_trials       right after it, same runner
+│         redact → bundle → (stage | upload)
+│   └── cleanup
+│
+└── per_experiment    × 1              after every trial is terminal
+      upload(staged) → report → deploy
+```
+
+`per_case` runs on a runner rather than the server because resolving a case can mean cloning several
+gigabytes; bytes never pass through the API server.
+
 ### Batching the uploads
 
-`mode: per_trial` ships each trial's artifacts as it finishes. `mode: batch` stages them on the
-runner and ships one packed upload per runner in `finalize` — 500 trials × 2 objects becomes three
-command invocations instead of a thousand, which matters a lot against a backend that throttles per
-request.
+Where you put `upload` decides whether artifacts ship per trial or in bulk — there is no separate
+mode flag. `upload` in `per_trial` ships each trial as it finishes. `stage` in `per_trial` plus
+`upload` in `per_experiment` holds them on the runner and ships one packed upload per runner: 500
+trials × 2 objects becomes three command invocations instead of a thousand, which matters a lot
+against a backend that throttles per request.
 
 The cost is real and worth stating: staged artifacts occupy runner disk until the experiment ends,
 so the staging directory has to be pinned against the housekeeper (which would otherwise reclaim it
 as an expired workdir — correctly, by its own rules), counted in placement's disk accounting, capped
-by `max_pending`, and flushed on drain and on cancel. And if a runner dies ungracefully, its staged
-artifacts are gone; rewards and failure attribution survive in Postgres, logs and trajectories do
-not. Those experiments are marked `ARTIFACTS_INCOMPLETE` rather than quietly looking complete. Use
-`per_trial` when that trade is not acceptable.
+by `max_pending`, and shipped before drain completes and before a cancel finishes. And if a runner
+dies ungracefully, its staged artifacts are gone; rewards and failure attribution survive in
+Postgres, logs and trajectories do not. Those experiments are marked `ARTIFACTS_INCOMPLETE` rather
+than quietly looking complete. Move `upload` back into `per_trial` when that trade is not
+acceptable.
 
 ### Why a gate before, and a scrub after
 
-**Admission** (`pipeline.pre`) exists because a broken case is indistinguishable from a weak agent
+**Admission** (`per_case`) exists because a broken case is indistinguishable from a weak agent
 once the numbers are in the table. If the environment is broken, the reference solution has rotted,
 or the verifier has a hole, every score produced from that case is noise that *looks exactly like a
 capability difference*. So a case version is not usable until `oracle` scores full marks and `nop`
 scores zero. The check runs through the ordinary execution path, which means passing it also proves
 the whole chain works on this cluster.
 
-**Post-processing** (`pipeline.post`) exists because trial output is not shippable as produced. The
+**Post-processing** (`per_trial`) exists because trial output is not shippable as produced. The
 trajectory contains the API key almost by construction — the agent was handed one, and it goes into
 the prompt. Redaction is therefore a separate step from collection, so that a failed scrub *blocks
 the upload* instead of quietly shipping the raw file. Key scrubbing is mandatory and has no switch.
