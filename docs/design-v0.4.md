@@ -1578,7 +1578,7 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 
 ---
 
-## 附录：设计原则（一句话版）
+## 附录 A：设计原则（一句话版）
 
 > Case 是 Artifact，**准入过的** Case 才配进 Experiment；Experiment 是声明，Task 是分组，Trial 是唯一的执行单位；
 > **Temporal** 负责可靠地把每一步按顺序做完（状态机、队列、lease、心跳、重试、级联取消全部退役）；
