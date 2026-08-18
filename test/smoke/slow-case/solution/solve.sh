@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Deliberately slow so the worker can be killed mid-activity.
+# Deliberately slow so a run can be interrupted mid-trial.
 set -euo pipefail
 echo "oracle: working..."
-sleep "${SLOW_SECONDS:-25}"
+sleep 12
 printf 'ROLLOUT-MAN-OK' > /app/answer.txt
 echo "oracle: done"

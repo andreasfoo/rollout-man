@@ -1,15 +1,10 @@
-# The two shipped Harbor cases. These need a Docker daemon: their environments
-# are prebuilt ASan images on DockerHub. Included so `case resolve` and the
-# admission gate can be exercised against real task.toml metadata.
+# The two shipped Harbor cases. Their environments are prebuilt ASan images on
+# DockerHub, so measuring them needs a Docker daemon; without one the oracle
+# cannot score and the admission gate must refuse the case.
 ---
 kind: Commands
 timeout: 30m
-max_attempts: 2
-storage_upload:
-  script: |
-    set -euo pipefail
-    dst="${ROLLOUT_MAN_BUCKET:-/tmp/rollout-man/bucket}/${KEY}"
-    mkdir -p "$(dirname "$dst")"; cp -- "${LOCAL_PATH}" "$dst"
+max_attempts: 1
 
 ---
 kind: Experiment
@@ -29,30 +24,16 @@ matrix:
   trials: 1
 
 concurrency: 2
+max_attempts: 1
 
 pipeline:
   per_case:
-    - step: resolve
-    - step: admission
+    admission:
       require: admitted
-      auto_admit: true
-      criteria:
-        oracle: {min_reward: 1.0}
-        nop:    {max_reward: 0.0}
-        trials: 1
+      oracle_min_reward: 1.0
+      nop_max_reward: 0.0
+      trials: 1
   per_trial:
-    - step: redact
+    redact:
       keys: required
       ips: {traj: true, logs: false}
-    - step: bundle
-      format: tar.zst
-      include: [traj, logs, result]
-    - step: upload
-      using: storage_upload
-      dest: "evals/{{.ExperimentName}}/{{.CasePath}}/{{.TrialID}}/"
-  per_experiment:
-    - step: report
-      formats: [json]
-
-retry_policy:
-  max_total_attempts: 1

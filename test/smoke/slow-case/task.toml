@@ -9,11 +9,11 @@ category = "smoke"
 difficulty = "trivial"
 
 [agent]
-timeout_sec = 300.0
+timeout_sec = 60.0
 user = "agent"
 
 [verifier]
-timeout_sec = 300.0
+timeout_sec = 60.0
 user = "root"
 
 [environment]

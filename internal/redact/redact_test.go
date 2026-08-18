@@ -1,4 +1,4 @@
-package sanitize
+package redact
 
 import (
 	"encoding/base64"
@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func scrub(t *testing.T, s *Sanitizer, in string, c Class) string {
+func scrub(t *testing.T, s *Redactor, in string, c Class) string {
 	t.Helper()
 	var out strings.Builder
 	if _, err := s.Scrub(strings.NewReader(in), &out, c); err != nil {
