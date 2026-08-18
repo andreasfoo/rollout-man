@@ -3,7 +3,6 @@
 版本：v0.4（合并稿，唯一设计基线）
 日期：2026-08-18
 状态：Draft，待评审
-取代：《详细设计报告 v0.3》、《实现层详细设计（Temporal 版）v0.1》——两份同时作废
 
 **命名**：本系统名为 **rollout-man**，CLI 二进制、Temporal namespace、Docker label
 前缀、环境变量前缀（`ROLLOUT_MAN_*`）统一使用该名。文中出现的 **Harbor** 一律指
@@ -12,36 +11,9 @@
 
 ---
 
-## 0. 本版说明
+## 0. 文档约定
 
-### 0.1 相对 v0.3 / 实现稿 v0.1 的实质变化
-
-| # | 变化 | 来源 |
-|---|---|---|
-| 1 | 引入 Temporal 做 durable execution：手写状态机、PG queue、lease/回收、选主、poll/心跳/orphan 判定、级联 cancel 全部退役 | 实现稿 §0.1 |
-| 2 | **Trial 是唯一编排/执行单位**；Task 退化为读模型分组，无 SUCCESS/FAILED | 实现稿 §0.2 |
-| 3 | Trial 终态改为 `COMPLETED / FAILED / CANCELLED`；`TEST_FAILED` 移出 Failure Taxonomy | 实现稿 §0.2 |
-| 4 | 调度器收敛为 **Placement Service**（资源/优先级/affinity 智能全部保留自研） | 实现稿 §4 |
-| 5 | **新增 Temporal 错误 → failure code 映射表**，含超时类型区分（§7.2） | 二轮评审 B1 |
-| 6 | 全部 runner activity 配 `ScheduleToStartTimeout`；`RunAgent` 允许同机重投以启用重入接管 | 评审 §2.2 / 二轮评审 B2 |
-| 7 | placement 授予后 **Signal 推送**，取代纯轮询 | 评审 §2.3 |
-| 8 | 资源记账公式改为可实现形式（§5.3）；预留释放在 cleanup 之后 | 评审 §2.4 / 二轮评审 §1.1 |
-| 9 | **placement 排队有上限**（`queue_timeout`），waiter 生命周期与 reaper 补全 | 二轮评审 B3/B5 |
-| 10 | 终态读模型写入一律走 disconnected context（取消路径不再丢状态） | 二轮评审 B4 |
-| 11 | drain / EMERGENCY 按 **trial** 收敛而非 activity | 二轮评审 B6 |
-| 12 | history 中禁止出现 presigned URL；对象访问走 key + 交换端点 | 二轮评审 B7 |
-| 13 | confirm 改为「先 StartWorkflow、读模型由 workflow 落库」 | 二轮评审 B8 |
-| 14 | `concurrency` 语义明确为「在途上限」；shard 化列入 P1 | 二轮评审 B9 |
-| 15 | 结果表按 COMPLETED 模型重做，引入显式 `reward_threshold` | 二轮评审 B13 |
-| 16 | affinity 移出 MVP（先采数据再定权重）；资源记账移入 MVP | 评审 §1.1 |
-| 17 | `redact_ips` 默认关闭；MVP 脱敏两层 | 评审 §3.3 |
-| 18 | matrix 上限 MVP 500 / P1 2000 / P2 10000 | 评审 §3.4 |
-| 19 | 补齐信任边界与凭证生命周期章节（§8） | 评审 §4.6 f/g |
-| 20 | **删除 v0.3→PG queue 的"回退方案"**；决策点前移到 Phase 0 | 评审 §3.1 |
-| 21 | 对象存储侧 retention 策略补齐 | 二轮评审 B12 |
-| 22 | 一致性修正：`max_total_attempts` 命名、trials 唯一键、image 保护条件、`DOCKER_ERROR` 枚举、删除 `poll_interval`、case 解析状态、retry WorkflowID 统一 | 评审 §4 |
-
-### 0.2 优先级标记约定
+### 0.1 优先级标记
 
 全文用行内标记声明交付批次，汇总见 §15.1：
 
@@ -50,6 +22,21 @@
 - **[P2]** — 有明确需求再做
 
 无标记的段落属于 MVP。
+
+### 0.2 术语
+
+| 术语 | 含义 |
+|---|---|
+| **Case / CaseVersion** | 评测题目及其某个版本；内容寻址存储（CAS） |
+| **Experiment** | 一次评测声明：case × agent × llm_spec × N trials |
+| **Task** | matrix 展开后的一个单元；读模型分组，无成败状态 |
+| **Trial** | 唯一的执行单位，一个 TrialWorkflow |
+| **attempt** | Trial 内部的重试计数（换机重试不产生新 Trial） |
+| **Runner** | 执行机器；每台一个专属 Temporal activity queue |
+| **Placement** | 决定 trial 何时、在哪台机器执行的自研服务 |
+| **准入 / Admission** | Case 版本在被正式使用前必须通过的 oracle/nop 校验（§3.5） |
+| **后置清理 / PostProcess** | Trial 产物离开 Runner 前的清洗与打包（§6.4） |
+| **Harbor** | 上游执行系统（Agent runtime / Docker runtime / Verifier / Case format），本系统的依赖 |
 
 ---
 
@@ -145,7 +132,7 @@ Temporal 回答：**怎么保证每一步按顺序做完且不丢**。
 
 **不引入 Kubernetes / MQ / Redis**，除非规模实测证明必要。
 
-**没有 Plan B。** 引入 Temporal 是不可逆决策：到 Phase 1 结束，workflow 层级、activity 划分、runner worker 模型、读模型投影、错误模型全部按 Temporal 写死，此时"回退到 PG queue"等于重写整个编排层加大半个 Runner Agent。因此判据前移到 **Phase 0（1 周）**，用可证伪的三条去留标准（§15.2），过了就锁死。v0.3 时代那种"Phase 2 结束再评审"的回退条款已删除——它不会被执行，写着只会让人以为有退路。
+**没有 Plan B。** 引入 Temporal 是不可逆决策：到 Phase 1 结束，workflow 层级、activity 划分、runner worker 模型、读模型投影、错误模型全部按 Temporal 写死，此时"回退到 PG queue"等于重写整个编排层加大半个 Runner Agent。因此判据前移到 **Phase 0（1 周）**，用可证伪的三条去留标准（§15.2），过了就锁死。不设"跑一段时间再评审是否回退"的条款——到那个时点没有人会选择执行它，写着只会让人以为有退路。
 
 ### 2.3 Task Queue 规划
 
@@ -185,14 +172,17 @@ Experiment ────────────────────┘ (引�
 - **[MVP]** CLI 直传 Object Storage（单段 / SDK multipart）+ 服务端校验 sha256 后注册
 - **[P1]** 完整 `upload-init` / `upload-commit` 分块协议（断点续传、并发分片）
 
-**CaseVersion 状态机**（修正 v0.3 的竞态：`task.toml` 异步解析，但 Experiment 创建时就需要它）：
+**CaseVersion 状态机**（`task.toml` 是异步解析的，而 Experiment 创建时就需要它，因此必须有显式状态，不能靠"上传完就能用"）：
 
 ```text
-PARSING → READY      解析成功，可被 Experiment 引用
-        → INVALID    解析失败，附错误详情，不可引用
+PARSING → READY       解析成功，可用于准入（validation experiment）
+        → INVALID     解析失败，附错误详情，不可引用
+READY   → ADMITTED    通过准入判据（§3.5），可用于正式 experiment
+        → REJECTED    未通过准入，附判据明细
 ```
 
-Experiment 创建时校验所引用的每个 version 必须是 `READY`，否则 422。
+- **正式 Experiment 只能引用 `ADMITTED`**，否则 422 `CASE_NOT_ADMITTED`（除非显式 `admission.allow_unadmitted`）
+- validation experiment 只要求 `READY`
 
 ### 3.2 Experiment Matrix
 
@@ -213,7 +203,7 @@ experiment:
 
 规模上限（`MATRIX_TOO_LARGE`）：**[MVP] 500** / **[P1] 2000（配合 shard 化）** / **[P2] 10000**。
 
-> v0.3 的 10000 上限没有实际意义：10000 × 30min ÷ concurrency 8 ≈ 26 天，没有用户会提交后等下去。防呆要防在有意义的位置。
+> 上限的作用是防呆，要防在有意义的位置：10000 × 30min ÷ concurrency 8 ≈ 26 天，没有用户会提交这样一个 experiment 然后等下去。
 
 每个 Trial 的 resources / timeouts **来源于 Case 的 `task.toml`**，在 CaseVersion 注册时解析进 `task_config`；Experiment 可选择性覆盖（§11.2）。
 
@@ -250,6 +240,39 @@ llm_spec:
 - **nop** 应得 0 分，否则 Verifier 有漏洞
 - 推荐流程：新 Case 注册后先跑 oracle + nop 的 validation experiment。**[P1]** CLI 快捷命令 `case validate`
 - oracle 失败 **不塞进 `ENVIRONMENT` failure category**（那会污染 ENVIRONMENT 的统计），而是在结果分析里标记 `CASE_SUSPECT`（§12）
+
+### 3.5 Case 准入（Admission Gate）
+
+**没有通过准入的 CaseVersion 不能进正式 experiment。** 理由很直接：一个 Case 若环境是坏的、参考解已失效、或 Verifier 有漏洞，用它跑出来的所有 agent 分数都是噪声——而这种噪声在结果表上看起来和真实的能力差异一模一样，事后无法区分。准入是把这类污染挡在数据产生之前的唯一手段。
+
+**准入判据**（默认值，可在 `admission` 配置里覆盖）：
+
+| builtin agent | 判据 | 含义 |
+|---|---|---|
+| `oracle` | `reward >= oracle_min`，默认 **1.0** | Case 可解、环境正确、Verifier 认得出正确解 |
+| `nop` | `reward <= nop_max`，默认 **0.0** | Verifier 不会平凡通过 |
+
+- 每个 builtin 各跑 `admission.trials` 次（默认 **2**，跑两次而不是一次以排除偶发）
+- **全部 trial 都要满足**，任一不满足 → `REJECTED`，不满足的 trial id 记进 `admission_result`
+- **trial 自身失败（infra / 环境类）不算 REJECTED**，按普通 retry 重跑；只有"跑完了但分数不对"才构成判据结果
+- oracle / nop 都是 `requires_llm: false`，**准入不消耗任何 LLM 额度**，可以放心多跑
+
+**流程**：
+
+```text
+POST /cases/{id}/versions/{v}/admit
+  → 内部创建 validation experiment（agents: [oracle, nop]，不与 llm_specs 展开）
+  → 走与正式 experiment 完全相同的执行链（同一套 placement / runner / 归因 / 后置清理）
+  → FinalizeExperiment 按判据回写 case_versions.state = ADMITTED | REJECTED
+```
+
+复用同一条执行链而不是另写一套校验逻辑，额外好处是：**准入通过本身就证明了这条链在这台集群上能跑通** —— 环境、镜像构建、verifier、artifact 上传全部正常。新 Case 第一次出问题几乎总是在这一步暴露，而不是等跑完 200 个正式 trial 之后。
+
+**绕过**：experiment 可声明 `admission.allow_unadmitted: true`（仅调试用）。此时结果表对该 case 的所有行打 `⚠ UNADMITTED` 标记，且这些结果**不进入任何跨 experiment 的聚合对比**。
+
+**[P1] 复检**：Case 的环境会漂移（base image 上游更新、依赖源失效、外部服务变更），`admitted_at` 超过 `admission.revalidate_after`（默认 30d）时在 preview 里告警，`rollout-man case admit --all --stale` 批量复检。
+
+**[P1] 归因辅助**：oracle 未达标与 nop 超标是两种完全不同的问题（前者"题目或环境坏了"，后者"判分漏了"），分别标 `CASE_SUSPECT` / `VERIFIER_SUSPECT`（§12），不塞进 failure taxonomy。
 
 ---
 
@@ -321,12 +344,12 @@ func ExperimentWorkflow(ctx workflow.Context, in ExperimentInput) error {
 
 - **WorkflowID = `exp-{id}`，Start 侧 `RejectDuplicate`**：重复 confirm 天然幂等（对应 §10.1 的 409 语义）
 - **cancel**：`client.CancelWorkflow("exp-182")` 一条调用级联到所有 child 与其 activity
-- **child 启动失败必须显式记账**：`GetChildWorkflowExecution()` 与最终结果分开等待。v0.1 用 `_ = f.Get()` 把两者一起吞掉，导致"没起来"和"跑完失败了"不可区分，且读模型无人写
+- **child 启动失败必须显式记账**：`GetChildWorkflowExecution()` 与最终结果分开等待。若只等最终结果，"没起来"和"跑完失败了"不可区分；而 child 从未运行意味着没有任何 server activity 会写读模型，那一行 trial 永远停在 PENDING
 - **ContinueAsNew 用 `GetContinueAsNewSuggested()`**，不写死 20000
 - **drain 后再 CAN**：MVP 的 500 trials 上限下几乎不会触发（约 3–4K events）。注意父 run 因 CAN 关闭时 `ParentClosePolicy` 的行为需在 Phase 0 验证（§15.2）——当前"drain 到 inFlight==0"的写法对此免疫，但 [P1] 改 shard 化时必须先有结论
 - 进度查询不打扰 workflow：走读模型（§5.9），UI/CLI 不直接 Query
 
-**`concurrency` 的准确语义**：semaphore 计的是**在途 trial（排队 + 执行）**，不是"同时 RUNNING"。资源紧张时 8 个名额可能全被排队中的 trial 占着。v0.3 §11.2 写的"同时 RUNNING 上限"是错的，本版按实现修正定义并在 CLI preview 里如实说明。
+**`concurrency` 的准确语义**：semaphore 计的是**在途 trial（排队 + 执行）**，不是"同时 RUNNING"。资源紧张时 8 个名额可能全被排队中的 trial 占着。CLI preview 里按此如实说明，不要写成"同时 RUNNING 上限"。
 
 > 为什么不把 semaphore 移到 grant 之后：semaphore 同时承担"限并发"和"限制父 workflow 同时持有的 child 数"，后者是 history 增长的闸门。移到 placement 就必须一次性启动全部 child，CAN 会触发得更频繁。正确的解耦方式是 [P1] shard 化。
 
@@ -448,13 +471,13 @@ func runAttempt(ctx workflow.Context, in TrialInput, attempt int, exclude []stri
 - **补偿是结构化的**：`defer` + `NewDisconnectedContext` 保证 cancel / 失败路径也执行清理与资源释放；`WithCancelTimeout(90s)` 保证补偿自身不会变成新的卡点
 - **换机重试是显式控制流**：activity 级 retry 只处理"同机可恢复"；需要换机的错误穿透到外层 attempt 循环 → `exclude` → 重新 placement
 
-**终态记录必须走 disconnected context**（`recordAttemptFailed` / `recordTrialFailed` 内部）。v0.1 用 `serverCtx(ctx)`，workflow 被 cancel 后 ctx 已取消，这些 activity 会立刻失败 —— 结果是用户点了取消，PG 里所有 trial 停在 RUNNING，要等 5 分钟对账才恢复。reconciler 是对账，不是主路径。
+**终态记录必须走 disconnected context**（`recordAttemptFailed` / `recordTrialFailed` 内部）。若用普通 ctx，workflow 被 cancel 后 ctx 已取消，这些 activity 会立刻失败 —— 结果是用户点了取消，PG 里所有 trial 停在 RUNNING，要等 5 分钟对账才恢复。reconciler 是对账，不是主路径。
 
 ### 4.4 状态：从状态机到投影
 
-v0.3 §4.1 的状态转移表不再是代码，而是**读模型投影**：
+Trial 的"状态"不是一张需要维护的转移表，而是 workflow 事实的**读模型投影**：
 
-| v0.3 状态 | v0.4 中的对应事实 |
+| 读模型状态 | 对应的 Temporal 事实 |
 |---|---|
 | QUEUED / BLOCKED | TrialWorkflow 在 placement 循环中（`BlockedReason` search attribute 区分） |
 | DISPATCHED / STARTING | 已授予，首个 runner activity Scheduled / Started |
@@ -464,7 +487,7 @@ v0.3 §4.1 的状态转移表不再是代码，而是**读模型投影**：
 
 合法性不再靠 `WHERE state = :expected` 事务防御 —— 非法转移在 Temporal 里根本不可表达。
 
-**Task 没有成败状态**（修正 v0.3 §4.1 的遗漏：从未定义"10 个 trial 里 3 个失败时 Task 是什么状态"）：
+**Task 没有成败状态**（"10 个 trial 里 3 个失败时 Task 算成功还是失败"没有唯一答案，因此不做聚合判定）：
 
 ```text
 Task: PENDING / RUNNING / COMPLETED / CANCELLED
@@ -485,7 +508,7 @@ Task: PENDING / RUNNING / COMPLETED / CANCELLED
 
 ## 5. Placement Service
 
-v0.3 §5.4/5.5/5.6 的智能全部保留，外壳从「调度循环 + assignment + lease」换成「reservation 授予服务」。
+资源匹配、优先级排序、affinity 评分全部自研；对外形态是「reservation 授予服务」，而不是传统的「调度循环 + assignment + lease」。
 
 ### 5.1 结构
 
@@ -522,15 +545,9 @@ runner 不在该 attempt 的 exclude 列表中
 
 ### 5.3 资源记账
 
-v0.3 §5.5 的公式不可实现：
+记账要同时避开两个陷阱：只看 Runner 上报的 free 会超卖（刚授予的还没体现在心跳里），而"上报值再减去全部预留"会整程双算（心跳里已经扣过一次）。中间那条"只减去尚未体现在上报里的预留"听起来对，但 **Server 无从判定某笔占用是否已经反映在上报里**，写不出来。
 
-```text
-available = reported_free - Σ reserved(assigned but not yet reflected in report) - safety_margin
-                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                             Server 无从判定这个条件
-```
-
-**v0.4 改为取交集**，既不需要判定"是否已反映在上报里"，也不会整程双算：
+**取交集**，两个陷阱都避开：
 
 ```text
 available_X = min( reported_free_X - safety_margin_X ,
@@ -542,7 +559,7 @@ safety_margin: disk 取 max(30GB, 10%)；cpu/mem 取 5%
 - 第一项防"实际已经满了"——含失败 workdir 保留、CAS 缓存、非本系统占用等 Server 不知道的部分
 - 第二项防"这一轮刚授予但还没体现在心跳里"
 
-**为什么记账必须进 MVP**（而不是像 v0.3 那样排到 Phase 5）：matcher 每 2s 一轮、心跳每 15s 一次，**没有记账就意味着最多连续 7 轮基于同一份陈旧快照对同一台机器重复授予**。这在 3 台 Runner 的 MVP 规模下照样会打爆一台机器。记账解决的是超卖，不是利用率。
+**为什么记账必须进 MVP**（而不是当成后期的利用率优化）：matcher 每 2s 一轮、心跳每 15s 一次，**没有记账就意味着最多连续 7 轮基于同一份陈旧快照对同一台机器重复授予**。这在 3 台 Runner 的 MVP 规模下照样会打爆一台机器。记账解决的是超卖，不是利用率。
 
 **释放时机**：在 `CleanupTrial` 之后（资源占用真实结束的时刻），不是"Trial 进入 RUNNING"。见 §4.3 的 defer 顺序。
 
@@ -562,11 +579,11 @@ Priority → aging → （affinity 评分 [P1]）→ FIFO
 
 matcher 授予后 `SignalWorkflow(trial-xxx, "placement_granted", grant)`；workflow 侧 `AwaitWithTimeout(60s, granted)` —— **signal 是主路径，timer 只是兜底**。
 
-> v0.1 的纯轮询方案（指数退避到 5 分钟封顶）会导致：matcher 在 T 时刻授予并写入 reservation，trial 要到最多 T+5min 才发现自己被授予了，这段时间资源被预留但没人用。空闲集群下还有个每次都发生的轻量版本：首次调用必然未授予，每个 trial 白等第一个 backoff。
+> 不能只靠 workflow 侧轮询。纯指数退避（退到 5 分钟封顶）会导致：matcher 在 T 时刻授予并写入 reservation，trial 要到最多 T+5min 才发现自己被授予，这段时间资源被预留但没人用；集群越忙、排队越久，浪费越严重。空闲集群下还有个每次都发生的轻量版本：首次调用必然未授予，每个 trial 白等第一个 backoff。
 
 ### 5.6 排队超时与 BLOCKED 语义
 
-**每个 trial 的排队必须有结局。** v0.3 的 BLOCKED 和 v0.1 的无限退避循环都没有终止条件，后果是：trial 永不进终态 → 占住 experiment semaphore 名额 → 后续 trial 一个都起不来 → `FinalizeExperiment` 永不执行 → experiment 永远不结束。
+**每个 trial 的排队必须有结局。** 若排队没有终止条件，后果是：trial 永不进终态 → 占住 experiment semaphore 名额 → 后续 trial 一个都起不来 → `FinalizeExperiment` 永不执行 → experiment 永远不结束。
 
 | blocking_reason | 含义 | 处置 |
 |-----------------|------|------|
@@ -582,7 +599,7 @@ matcher 授予后 `SignalWorkflow(trial-xxx, "placement_granted", grant)`；work
 
 ### 5.7 Affinity [P1]
 
-**MVP 只做「硬约束过滤 + 选负载最低」。** v0.3 §5.4 的线性加权公式：
+**MVP 只做「硬约束过滤 + 选负载最低」。** 一个看起来很合理的线性加权公式是：
 
 ```text
 100 × same_series_active + 50 × same_project_active + 40 × image_exists
@@ -605,7 +622,7 @@ matcher 授予后 `SignalWorkflow(trial-xxx, "placement_granted", grant)`；work
 | attempt 结束（成功/失败/cancel/CAN） | `ReleasePlacement(trial, attempt)` 幂等删 waiter + reservation |
 | 兜底 reaper（10min 周期） | **同时扫 waiters 与 reservations**：对应 workflow 已关闭 → 删 |
 
-> v0.1 的两个漏洞：(a) defer 注册在授予之后，cancel 路径会留下幽灵 waiter，matcher 之后仍会给它授予资源；(b) reaper 只对账 reservation，一个还没拿到 reservation 的幽灵 waiter 不在扫描范围内，要等它被授予后才进入视野 —— experiment 批量 cancel 时就是几十上百个幽灵在抢资源。v0.4 用「defer 前置 + reaper 扫两张表」堵住。
+> 这里有两个容易漏的坑：(a) 若 defer 注册在授予之后，cancel 路径会留下幽灵 waiter，matcher 之后仍会给它授予资源；(b) 若 reaper 只对账 reservation，一个还没拿到 reservation 的幽灵 waiter 不在扫描范围内，要等它被授予后才进入视野 —— experiment 批量 cancel 时就是几十上百个幽灵在抢资源。「defer 前置 + reaper 扫两张表」同时堵住这两条。
 
 ### 5.9 读模型
 
@@ -626,8 +643,8 @@ Runner Agent（Go 单二进制，systemd 托管）
 │     └── FetchCase / PrepareEnv / RunAgent / RunVerifier / CollectArtifacts / CleanupTrial
 ├── in-use registry   trial 级资源登记（Housekeeper 与 drain 共用）
 ├── CacheScanner      5min 扫描 image / build cache → REST 上报 [P1]
-├── Housekeeper       磁盘监控与分级清理（§6.6）
-└── Sanitizer         库形式被各 activity 调用（§8.5）
+├── Housekeeper       磁盘监控与分级清理（§6.7）
+└── Sanitizer         库形式被 PostProcess 与各 activity 调用（§6.4 / §8.5）
 ```
 
 ```yaml
@@ -637,9 +654,9 @@ runner:
   server: https://orchestrator.internal
   temporal: temporal.internal:7233
   token: ${RUNNER_TOKEN}
-  heartbeat_interval: 15s            # 唯一的间隔配置；v0.3 的 poll_interval 已删除
+  heartbeat_interval: 15s            # 唯一的间隔配置（没有独立的 poll 间隔）
   max_concurrent_trials: 4
-  docker_host: unix:///var/run/docker.sock   # 必须显式绑定，见 §6.6
+  docker_host: unix:///var/run/docker.sock   # 必须显式绑定，见 §6.7
   workdir: /data/rollout-man
   resources: {cpu: 32, memory: 128Gi, disk: 1.8Ti, gpu: 0}
   capabilities: {docker: true, rootless: false, arch: amd64}
@@ -647,7 +664,7 @@ runner:
     redact_ips: false                # 默认关闭，见 §8.5
     ip_allowlist: ["127.0.0.1", "::1"]
     extra_patterns: []
-housekeeping: {...}                  # 见 §6.6
+housekeeping: {...}                  # 见 §6.7
 ```
 
 真正的 trial 并发由 placement 记账限制；worker 的 `MaxConcurrentActivityExecutionSize = max_concurrent_trials × 3` 只是防御性上限（一个 trial 同时只有一个 activity 在跑，系数 3 已宽裕，且要给 disconnected 的 cleanup 留槽位）。
@@ -662,16 +679,17 @@ housekeeping: {...}                  # 见 §6.6
 | `PrepareEnv` | harbor build 天然增量；重入前检查 image 是否已存在 |
 | `RunAgent` | **重入对账**：label 匹配且 attempt 相同的容器仍在运行 → 直接接管监控（续 heartbeat），不新起容器；attempt 不匹配 → kill 旧容器后启动 |
 | `RunVerifier` | 同上模式；结果写 `workdir/{trial}/verify-{attempt}.json` 后原子 rename |
-| `CollectArtifacts` | Object Storage 按确定路径覆盖写（脱敏后内容 + sha256），天然幂等 |
+| `CollectArtifacts` | 只落 `workdir/{trial}/out/`，不直接上传；写临时文件后原子 rename |
+| `PostProcess` | 从 `out/` 重新执行清洗 → 打包 → 上传，全量覆盖写，不复用上次中间态（§6.4） |
 | `CleanupTrial` | 目标态操作（容器不存在 = 成功）；失败仅记 event 不阻塞，由 Housekeeper 兜底 |
 
 **`RunAgent` 的重试配置是重入接管能否生效的前提**（§7.4）：
 
-> v0.1 给 `RunAgent` 配了同机 `MaxAttempts=1`。于是 worker 进程消失 → heartbeat 超时 → activity 失败 → **没有同机重投** → 穿透到 workflow 外层 → attempt+1 → attempt 号不再匹配 → 走"kill 旧容器重来"分支。**"attempt 相同"这个条件永远不成立，接管分支是死代码。**
+> 这一条容易配错且后果隐蔽。若给 `RunAgent` 配同机 `MaxAttempts=1`：worker 进程消失 → heartbeat 超时 → activity 失败 → **没有同机重投** → 穿透到 workflow 外层 → attempt+1 → attempt 号不再匹配 → 走"kill 旧容器重来"分支。**"attempt 相同"这个条件永远不成立，接管分支成为死代码。**
 >
 > 实际后果：**Runner Agent 的任何一次正常重启（版本升级、配置变更、systemd restart、OOM kill）都会作废其上所有在跑 trial 的全部进度** —— 每个最多浪费 `timeouts.agent`（默认 30min）的执行时间和相应的 LLM token 花费。
 >
-> v0.4 把 `RunAgent` 改为 `MaximumAttempts: 3` + `NonRetryableErrorTypes` 显式列出所有真实 agent 失败码，让 **heartbeat 超时能在同一个 `runner.<id>` 队列上重投**，重投的 activity 才走得到接管分支。前提是 §7.2 的错误映射先做对，否则区分不了哪种超时该同机重试。
+> 因此 `RunAgent` 配 `MaximumAttempts: 3` + `NonRetryableErrorTypes` 显式列出所有真实 agent 失败码，让 **heartbeat 超时能在同一个 `runner.<id>` 队列上重投**，重投的 activity 才走得到接管分支。前提是 §7.2 的错误映射先做对，否则区分不了哪种超时该同机重试。
 
 `RunAgent` 是唯一的长 activity：每 15s `activity.RecordHeartbeat(ctx, progress)`，三个作用叠在同一机制上——**存活证明**（`HeartbeatTimeout=60s`，取代 orphan 判定）、**cancel 通道**（Temporal 经 heartbeat 响应下发取消，收到后 kill 容器，取代"下发 kill 指令"）、**断点信息**（重入接管时从 heartbeat detail 恢复监控基线）。
 
@@ -686,15 +704,57 @@ housekeeping: {...}                  # 见 §6.6
 3. RunAgent        启动容器 → 监控 timeout/OOM/输出上限；采集 cpu/mem 峰值、disk delta
                                                     失败 → CONTAINER_START_FAILED / AGENT_*
 4. RunVerifier     → reward（无论高低）             失败 → VERIFIER_*
-5. CollectArtifacts stdout/stderr/agent/verifier log + result.json
-                    → Sanitizer 脱敏 → 上传 Object Storage → 注册 artifact
-6. RecordTrialCompleted（server activity）
-7. CleanupTrial（defer）停容器、按 outcome 保留 workdir → 注销 in-use registry
+5. CollectArtifacts 收集 stdout/stderr/agent/verifier log + traj.jsonl + result.json
+                    → 落 workdir/{trial}/out/
+6. PostProcess     清洗（key 强制 / IP 分档）→ 打包 → 上传 → 注册 artifact（§6.4）
+                                                失败 → POSTPROCESS_FAILED
+7. RecordTrialCompleted（server activity）
+8. CleanupTrial（defer）停容器、按 outcome 保留 workdir → 注销 in-use registry
 ```
 
 失败归因由 activity 就地判定并映射到 Failure Taxonomy；判不出来的用 `SYSTEM/UNKNOWN`，**绝不吞掉原始错误信息**（message 保留截断并脱敏后的原始 stderr）。
 
-### 6.4 心跳与健康
+### 6.4 后置清理（PostProcess）
+
+Trial 的产物**不是跑完就能直接用**：agent 的 trajectory 里几乎必然含有 LLM key（它自己就在 prompt 里）、宿主与容器 IP、内部服务地址；而这些产物又恰恰是最需要对外分发的东西（交给别的团队分析、作为数据集发布、附在报告里）。因此在 `CollectArtifacts` 之后、上传之前插入独立的 `PostProcess` 步骤。
+
+**拆成独立 activity 而不是塞进 collect**，是为了让清洗失败能单独归因并**阻断上传** —— 清洗没成功就把原始 traj 传上对象存储，是不可逆的泄漏。
+
+```text
+5. CollectArtifacts   收集到 workdir/{trial}/out/：
+                        stdout.log  stderr.log  agent.log  verifier.log
+                        traj.jsonl（agent ↔ LLM 的完整交互）
+                        result.json
+6. PostProcess        6a redact    按产物分档清洗（下表）
+                      6b bundle    tar + zstd → bundle.tar.zst
+                      6c upload    bundle + 便查用单文件都上传
+                      6d register  artifacts 行 + sha256（均为清洗后内容）
+```
+
+**分档清洗**（一刀切两边都不对）：
+
+| 产物 | key 脱敏 | IP 脱敏 | 进 bundle | 单文件上传 | 依据 |
+|---|---|---|---|---|---|
+| `traj.jsonl` | **是** | **是** | 是 | 否（通常很大） | 对外分发的主体，也是 key 最可能出现的地方 |
+| `result.json` | **是** | **是** | 是 | 是（小，CLI 常读） | 同上，且会进结果聚合 |
+| `agent.log` / `stdout.log` / `stderr.log` | **是** | 否（默认，可开） | 是 | 是 | 主要给自己 debug，脱 IP 会毁掉排查价值 |
+| `verifier.log` | **是** | 否 | 是 | 是 | 同上 |
+
+**key 脱敏在所有档位上都是强制的，不可关闭**；IP 脱敏按"是否对外分发"分档 —— 这比一个全局 `redact_ips` 开关合理得多，因为分发件和排查件的诉求本来就相反（§8.5）。
+
+**打包**：`bundle.tar.zst` 是该 attempt 的完整产物快照，便于一次性下载与长期归档；同时把小文件单独上传，让 `rollout-man trial logs` 不必为看一行日志下载整个包。两者内容一致，bundle 的 sha256 单独记录。
+
+**失败处置**：
+
+| 子步骤 | 失败后果 |
+|---|---|
+| `redact` | **阻断**：activity 失败 → 同机重试 → 仍失败则 trial `FAILED(SYSTEM/POSTPROCESS_FAILED)`。绝不允许"清洗失败但照样上传" |
+| `bundle` | **降级**：记 event，跳过打包只上传单文件，trial 仍可 `COMPLETED` |
+| `upload` | 同机重试（`MaxAttempts=3`）；仍失败则 trial `FAILED` |
+
+**幂等**：以 `(trial_id, attempt)` 为键，产物路径确定（§9.3），覆盖写。重入时从 `workdir/{trial}/out/` 重新执行全部子步骤，不复用上一次的中间态 —— 这也意味着 `CollectArtifacts` 必须把原始产物完整留在 workdir 里，直到 `CleanupTrial` 才清除。
+
+### 6.5 心跳与健康
 
 REST 心跳（15s）仍然保留，但**只服务 placement**，不再承担派发：
 
@@ -713,7 +773,7 @@ REST 心跳（15s）仍然保留，但**只服务 placement**，不再承担派�
 
 健康判定取两个信号的并：placement 用 REST 心跳；Temporal `DescribeTaskQueue` 的 poller 存在性作为运维观测。**不再有全局 orphan 扫描** —— 失联的表现就是其上 `RunAgent` 的 heartbeat timeout。
 
-### 6.5 drain 与 EMERGENCY 自保
+### 6.6 drain 与 EMERGENCY 自保
 
 **drain 必须按 trial 收敛，不能按 activity 收敛。**
 
@@ -724,14 +784,14 @@ REST 心跳（15s）仍然保留，但**只服务 placement**，不再承担派�
 4. worker.Stop() → 安全下线
 ```
 
-> v0.1 写的是"等在跑的 activity 自然结束 → `worker.Stop()`"。但 **pin 到 runner 的单位是 trial，不是 activity**：`RunAgent` 结束后还有 `RunVerifier` → `CollectArtifacts` → `CleanupTrial` 要投到同一个 `runner.<id>` 队列。worker 一停，这些 activity 没有 poller，触发 `ScheduleToStartTimeout` → 整个 trial 换机重跑，刚跑完的 30 分钟 agent 执行全部作废。
+> 收敛粒度不能取 activity，因为 **pin 到 runner 的单位是 trial**：`RunAgent` 结束后还有 `RunVerifier` → `CollectArtifacts` → `CleanupTrial` 要投到同一个 `runner.<id>` 队列。若在"无 activity 在跑"时就停 worker，这些 activity 没有 poller，触发 `ScheduleToStartTimeout` → 整个 trial 换机重跑，刚跑完的 30 分钟 agent 执行全部作废。
 >
 > EMERGENCY 自保走同一条路径时问题更尖锐：**磁盘快满的时候把所有在跑的 trial 作废，然后让它们去别的机器重跑一遍** —— 正好在最需要省资源的时刻浪费最多资源。
 
 **[MVP]** 基础 drain（停止授予 + 等 trial 收敛 + 停 worker）。这在 in-use registry（Housekeeper 的 MVP 项）之上只差一个条件判断，而 MVP 期间一定会有 Runner 升级需求 —— 没有它，每次升级都在赌当时有没有 trial 在跑。
 **[P1]** EMERGENCY 自动 drain、DRAINING 状态机细化、`pinned_images` 下发。
 
-### 6.6 Housekeeper
+### 6.7 Housekeeper
 
 **纯本地 ticker，不经 Temporal。** Housekeeper 是自保机制，必须在 Temporal / Server 都不可用时照常工作（磁盘不会因为控制面停机就停止增长）。清理动作单机、可重入、无跨机事务，不需要 durable execution。
 
@@ -771,7 +831,7 @@ protected = {
 逐项执行并记 event（删了什么、释放多少），不用批量 prune。
 ```
 
-> v0.3 §6.6 这一行写的是 `last_used < image_unused retention 的 image`，字面含义是"最后使用时间**早于** retention 的受保护"——正好写反。照字面实现的后果是热镜像被删、冷镜像永久保留，症状是"莫名其妙的 cold start 变多"，极难排查。v0.4 写成 `now - last_used < retention`。
+> 注意这一行的方向：受保护的是**最近用过**的 image。写成 `last_used < retention` 就正好反了——热镜像被删、冷镜像永久保留，症状是"莫名其妙的 cold start 变多"，极难排查。
 
 **in-use registry**：每个 trial 在 placement 授予时登记 `(trial_id, attempt) → {workdir, image refs, volumes}`，`CleanupTrial` 完成时注销。Housekeeper 构建 protected 快照时取读锁——"先登记后使用、先快照后删除"保证与执行中的 activity 无竞态；另加 **10min deletion grace**（近期被登记过的资源不动）覆盖登记间隙。worker 重启后 registry 由 docker label 扫描重建，与 §6.2 的重入对账共用同一机制。
 
@@ -807,19 +867,20 @@ failure:
 | `ENVIRONMENT` | IMAGE_BUILD_FAILED, CONTAINER_START_FAILED, NETWORK_ERROR, DEPENDENCY_INSTALL_FAILED, ENVIRONMENT_TIMEOUT | NETWORK_ERROR / CONTAINER_START_FAILED | 是 |
 | `INFRASTRUCTURE` | DOCKER_ERROR, DISK_FULL, MEMORY_PRESSURE, RUNNER_UNAVAILABLE, HOST_ERROR | 全部 | 是 |
 | `VERIFIER` | VERIFIER_ERROR, VERIFIER_TIMEOUT, INVALID_REWARD | 仅 ERROR / TIMEOUT | 是 |
-| `SYSTEM` | CANCELLED, UNPLACED, INTERNAL_ERROR, UNKNOWN | 仅 INTERNAL_ERROR（一次） | 否 |
+| `SYSTEM` | CANCELLED, UNPLACED, POSTPROCESS_FAILED, INTERNAL_ERROR, UNKNOWN | 仅 INTERNAL_ERROR（一次） | 否 |
 
 原则：**evaluation failure 不 retry；infrastructure failure retry 且优先换 Runner**。
 
-两处修正：
+三条容易搞错的约定：
 
-- **`TEST_FAILED` 已从 taxonomy 移除**。agent 没解决问题是**正常的测量结果**（reward 低），不是"没测出来"。verifier 正常跑完就是 `COMPLETED`，reward 高低是事实不是失败
-- **`DOCKER_ERROR` 是唯一写法**（v0.3 §4.2 示例 yaml 里的 `DOCKER_DAEMON_ERROR` 是笔误，以枚举表为准）
-- **新增 `UNPLACED`**：排队超时或永久性不可满足（§5.6），结果表单独成列
+- **`TEST_FAILED` 不在 taxonomy 里**。agent 没解决问题是**正常的测量结果**（reward 低），不是"没测出来"。verifier 正常跑完就是 `COMPLETED`，reward 高低是事实不是失败
+- **`DOCKER_ERROR` 是唯一写法**（不存在 `DOCKER_DAEMON_ERROR`；上面的枚举表是唯一来源）
+- **`UNPLACED`**：排队超时或永久性不可满足（§5.6），结果表单独成列
+- **`POSTPROCESS_FAILED`**：产物清洗失败。清洗重试不成功就必须让 trial 失败——宁可丢一个 trial，也不能把未清洗的 traj 传出去（§6.4）
 
 ### 7.2 Temporal 错误 → failure code 映射【关键】
 
-这是 v0.3 和实现稿 v0.1 都缺失的一节，**缺了它，系统会在没有任何告警的情况下产出错误的评测结论**。
+**这一节缺失或写错，系统会在没有任何告警的情况下产出错误的评测结论。**
 
 问题在于 activity 失败远不止 `ApplicationError`，而 `RunAgent` 的 `StartToCloseTimeout` **就等于** `timeouts.agent`：
 
@@ -861,7 +922,7 @@ err → *ActivityError → Unwrap() → 依次判定：
 
 ```yaml
 retry_policy:
-  max_total_attempts: 3           # 含首次。v0.3 的 max_attempts 语义在两份文档里差一次，改名消除歧义
+  max_total_attempts: 3           # 含首次（名字里带 total，消除"最多重试 N 次"的歧义）
   backoff: {initial: 30s, multiplier: 2, max: 10m}    # 必须确定性，见 §4.5
   retry_on: [DOCKER_ERROR, RUNNER_UNAVAILABLE, NETWORK_ERROR, AGENT_OOM,
              CONTAINER_START_FAILED, VERIFIER_ERROR, INTERNAL_ERROR]
@@ -882,11 +943,12 @@ retry_policy:
 | `RunAgent` | **5m** | timeouts.agent | 60s | **3**（见 §6.2） |
 | `RunVerifier` | **5m** | timeouts.verifier | 60s | 2 |
 | `CollectArtifacts` | **5m** | 15m | 30s | 3 |
+| `PostProcess` | **5m** | 30m | 60s | 3 |
 | `CleanupTrial` | **30s** | 60s | — | **1** |
 
-**`ScheduleToStartTimeout` 不可省略。** v0.1 声称"assignment lease / 过期回收 → `ScheduleToStart`/`StartToClose` timeout 替代"，但超时配置表里只有 StartToClose 和 Heartbeat，一行 ScheduleToStart 都没有。后果很具体：placement 把 trial 授予 runner-02 → runner-02 的 worker 此刻已经挂了（进程死了，不再 long-poll）→ `FetchCase` 永远停在 Scheduled 状态（Temporal 默认 ScheduleToStart 不限时）→ **reservation 一直占着，trial 永远不动，也不会换机**。这正是原 lease 机制要解决的问题，被"替代"掉之后没有落地。
+**`ScheduleToStartTimeout` 不可省略**，它替代的正是手写 lease / 过期回收。缺了它后果很具体：placement 把 trial 授予 runner-02 → runner-02 的 worker 此刻已经挂了（进程死了，不再 long-poll）→ `FetchCase` 永远停在 Scheduled 状态（Temporal 默认 ScheduleToStart 不限时）→ **reservation 一直占着，trial 永远不动，也不会换机**。
 
-**`CleanupTrial` 单独配短超时 + `MaxAttempts=1`。** v0.1 的 defer 里 `.Get()` 是阻塞的，而 cleanup 配了 `StartToClose=5m, MaxAttempts=3` —— **Runner 失联恰恰是最常见的 cleanup 失败场景**，此时每次换机重试都要先在 cleanup 上耗掉最多 15 分钟才能开始下一次 attempt，与"cleanup 失败仅记 event 不阻塞"的声明自相矛盾。v0.4 改为：runner 不在就 30s 立刻失败，只记 event，由 Housekeeper 兜底（它本来就有 label 对账和 retention）。整个 defer 块另有 90s 上限（§4.3）。
+**`CleanupTrial` 单独配短超时 + `MaxAttempts=1`。** defer 里的 `.Get()` 是阻塞的，而 **Runner 失联恰恰是最常见的 cleanup 失败场景** —— 若给它配 `StartToClose=5m, MaxAttempts=3`，每次换机重试都要先在 cleanup 上耗掉最多 15 分钟才能开始下一次 attempt，与"cleanup 失败仅记 event 不阻塞"的意图自相矛盾。因此：runner 不在就 30s 立刻失败，只记 event，由 Housekeeper 兜底（它本来就有 label 对账和 retention）。整个 defer 块另有 90s 上限（§4.3）。
 
 ### 7.5 三种"提前结束"的区分
 
@@ -920,28 +982,32 @@ Runner Agent ──runner token/mTLS──> API Server
 - **被测 Agent 容器是不可信的**：它可能故意把 key 往输出里写（这正是 Sanitizer 精确匹配层要覆盖的），也可能试图访问宿主
 - **Temporal Server 不对外暴露**，只接受 Runner 的出方向连接
 
-### 8.2 Secret 不进 History【硬规则】
+### 8.2 Secret 与 Temporal History
 
-Temporal 会把 workflow/activity 的输入输出、heartbeat、error message **全部持久化进 event history**，而 history 里的明文**无法事后清除**（只能等 retention 过期或换 namespace）。这与"日志里泄漏了删掉就好"性质不同 —— 因此这条必须与执行链同批交付，不能延后。
+Temporal 会把 workflow / activity 的输入输出、heartbeat、error message **全部持久化进 event history**，而 history 里的明文**无法事后清除**（只能等 retention 过期或换 namespace）。这与"日志里泄漏了删掉就好"性质不同。
 
-**LLM key 链路（三段式）**：
+**MVP 的取舍**：单团队内网、Runner 等同生产主机（§8.1），因此 MVP **不做一次性 token、不做吊销、不做加密 Data Converter**。但保留一条几乎零成本的底线 —— **key 不作为 workflow / activity 的入参**：
 
 ```text
-1. TrialWorkflow 只携带 llm_spec_name
-2. server activity IssueTrialToken 生成一次性短期 token
-   （绑定 trial_id + attempt + spec，TTL = total timeout + 余量）→ token 进 history 无害
-3. RunAgent 在 Runner 内用该 token 调
-   POST /internal/llm-credentials/exchange（HTTPS + runner token）换取三要素
-   → 只注入容器 env，不落盘、不写 artifact
+[MVP]  1. TrialWorkflow 只携带 llm_spec_name
+       2. RunAgent 在 Runner 内用 runner token 调
+          GET /internal/llm-specs/{name}/credentials 取三要素
+          → 只注入容器 env，不落盘、不写 artifact
 ```
 
-**对象存储访问同理**：history 里**只允许出现 `bucket + key + sha256`，禁止出现 presigned URL** —— presigned URL 的签名就是一份临时凭证。v0.1 的 `FetchRequest{URI: in.CaseURI}` 若传的是 presigned URL，就直接违反了它自己立的规则。Runner 用自身凭证访问对象存储，或复用同一个交换端点换取短期 URL。
+比"把三要素直接放进 activity 入参"只多一个 REST 端点（Runner 本来就在和 Server 通心跳），却避开了一个**不可逆**的坑：一旦某个版本误把 key 写进入参，那批 history 里的明文要等 30 天 retention 过期才消失，期间任何能打开 Temporal Web UI 的人都看得到。
 
-**[P1] 双保险**：namespace 启用加密 Data Converter（`converter.NewCodecDataConverter` + AES-GCM PayloadCodec，Web UI 配 codec server），即使误传也不以明文落 Temporal 存储。
+**输出侧的 key 清洗不在此列，MVP 就要做全**（§6.4 / §8.5）—— 被测 agent 会把 key 写进 traj 和日志，而那些产物是要对外分发的。
+
+**[P1] 收紧为一次性 token**：`IssueTrialToken` 签发绑定 `trial_id + attempt + spec` 的短期 token（TTL = total timeout + 余量），Runner 拿 token 换三要素。收益不只是保密，更重要的是**吊销能力** —— 双跑窗口出现时，新 attempt 签发即吊销旧 token，旧容器的 LLM 调用被拒，烧钱止血（§14.3）。
+
+**[P1] 双保险**：namespace 启用加密 Data Converter（AES-GCM PayloadCodec，Web UI 配 codec server）。
+
+**对象存储访问 [MVP]**：history 里**只放 `bucket + key + sha256`，不放 presigned URL** —— presigned URL 的签名就是一份临时凭证，把它当 activity 入参等于把凭证写进 history。Runner 用自身凭证访问对象存储。这一条同样零成本：传 key 比传 URL 还短。
 
 **工程约束**：
 - error message / heartbeat detail 在 Runner 侧统一过 Sanitizer，杜绝 stderr 里的 key 经 error 链进入 history
-- code review checklist 增加一条：**workflow/activity 入参禁止出现 secret 类型，且任何 URL 型字段必须确认不带签名** —— 光看类型名抓不到 presigned URL
+- code review checklist：**activity 入参里任何 URL 型字段必须确认不带签名** —— 光看类型名抓不到 presigned URL
 
 ### 8.3 凭证生命周期
 
@@ -949,13 +1015,13 @@ Temporal 会把 workflow/activity 的输入输出、heartbeat、error message **
 |---|---|---|---|---|
 | user token | 管理员 | 长期 | 手动 | 手动 |
 | runner token | 注册 Runner 时由管理员签发，写入 systemd 环境文件 | 长期 | [P1] `runner rotate-token` | `runner disable` 立即失效 |
-| trial token | `IssueTrialToken`（每 attempt 一个） | total timeout + 10min | 不适用 | **新 attempt 签发时吊销旧 attempt 的 token** |
+| trial token **[P1]** | `IssueTrialToken`（每 attempt 一个） | total timeout + 10min | 不适用 | **新 attempt 签发时吊销旧 attempt 的 token** |
 
-最后一条是双跑窗口的止血手段（§14.3）：旧容器即使还在跑，它的 LLM 调用会被 Server 拒绝，不会继续烧钱。
+最后一条是双跑窗口的止血手段（§14.3）：旧容器即使还在跑，它的 LLM 调用也会被 Server 拒绝，不会继续烧钱。MVP 没有这个能力，双跑窗口只能靠同机重投接管来收窄（§6.2）。
 
 ### 8.4 鉴权 [MVP]
 
-v0.3 只有 user/runner 两类 token，**没有任何授权模型** —— 谁能 cancel 别人的 experiment？谁能删 llm-spec？"不做多租户"不等于"不做鉴权"。
+只有 user / runner 两类 token 是不够的，那等于**没有授权模型** —— 谁能 cancel 别人的 experiment？谁能删 llm-spec？"不做多租户"不等于"不做鉴权"。
 
 MVP 的最小可用集：
 
@@ -981,13 +1047,14 @@ MVP 的最小可用集：
 - artifact 记录的 `sha256` 是**脱敏后**内容的摘要（下载校验一致）
 - 每次命中记 metrics（层级 / 次数，不记原文）。**某 trial 精确匹配层命中次数异常本身就是有价值的信号** —— 说明被测 agent 在往输出里泄漏 key，应在结果分析中标记 [P1]
 
-**为什么 `redact_ips` 默认改为 `false`**（v0.3 默认开）：
+**IP 脱敏按产物分档，不用一个全局开关**（分档规则见 §6.4）：
 
-1. **debug 价值损失**：evaluation 场景下日志里的 IP 多半是容器网络地址、目标服务地址，是排查环境问题的关键信息，脱掉之后满屏 `***REDACTED_IP***`
-2. **误伤率高**：IPv4 正则会命中版本号（`1.2.3.4`）、坐标、部分 hash 前缀、docker 输出里的各种四段数字 —— 而这些恰恰是 evaluation 日志里的高频内容
-3. 内网环境下 IP 本来也不算 secret；真正的 secret 是 key，已由精确匹配层零误报覆盖
+- **分发件（`traj.jsonl` / `result.json`）默认脱 IP**：它们会离开团队，里面的 IP 是内网拓扑信息
+- **排查件（各类 `.log`）默认不脱**：evaluation 场景下日志里的 IP 多半是容器网络地址、目标服务地址，是排查环境问题的关键信息；而且 IPv4 正则会误伤版本号（`1.2.3.4`）、坐标、hash 前缀、docker 输出里的各种四段数字 —— 这些恰恰是 evaluation 日志里的高频内容，脱完满屏 `***REDACTED_IP***` 且无从还原
 
-保留为合规部署的可选开关。
+runner 级的 `redact_ips: true` 是兜底开关（默认 `false`），打开后排查件也一并纳入，供合规部署使用。
+
+**key 脱敏没有分档，也没有开关** —— 所有离开 Runner 的文本一律执行精确匹配 + 模式匹配两层。
 
 ---
 
@@ -1000,11 +1067,12 @@ projects        id, name, metadata(jsonb)
 series          id, project_id, name, metadata
 cases           id, project_id, series_id, name
 case_versions   id, case_id, version, source(jsonb), sha256, size, artifact_key,
-                state(PARSING|READY|INVALID), parse_error,
+                state(PARSING|READY|ADMITTED|REJECTED|INVALID), parse_error,
+                admission_result(jsonb), admitted_at, admission_experiment_id,
                 task_config(jsonb)          -- 注册时解析 task.toml：resources / timeouts
 agents          id, name, type(llm|builtin), requires_llm, version, runtime, command, parameters
 llm_specs       id, name, provider, base_url, model, api_key_ref, max_concurrent, parameters
-experiments     id, name, config(jsonb), state, reward_threshold,
+experiments     id, name, config(jsonb), state,
                 created_by, created_at, confirmed_at
 tasks           id, experiment_id, case_version_id, agent_id, llm_spec_id,   -- builtin 为 NULL
                 state(PENDING|RUNNING|COMPLETED|CANCELLED),                  -- 无成败
@@ -1025,7 +1093,10 @@ events          id, task_id, trial_id, runner_id, type, timestamp, payload(jsonb
 runners         id, status, resources(jsonb), capabilities(jsonb),
                 max_concurrent_trials, last_heartbeat, registered_at
 runner_cache_state  runner_id, kind(image|build_cache), ref, series_id, size, last_used   -- [P1]
-artifacts       id, task_id, trial_id, type, object_key, size, sha256, created_at
+artifacts       id, task_id, trial_id, attempt,
+                kind(bundle|traj|log|result), name, object_key, size, sha256,
+                redaction(jsonb),           -- 各层命中次数，不含原文
+                created_at
 ```
 
 关键索引与约束：
@@ -1038,9 +1109,9 @@ INDEX  (task_id, timestamp)                     -- events
 INDEX  (series_id)                              -- runner_cache_state
 ```
 
-> v0.3 的 `trials(task_id, attempt)` unique 是错的：`requested_trials = 10` 时同一 task 下 10 个 trial 的 attempt 都是 1，约束直接爆。必须加 `trial_index`。
+> `trials` 的唯一键必须带 `trial_index`：`requested_trials = 10` 时同一 task 下 10 个 trial 的 attempt 都是 1，只用 `(task_id, attempt)` 会直接冲突。
 >
-> `not_before` / `effective_priority` / `blocking_reason` 从 `tasks` 移到 `placement_waiters` —— 它们是排队状态，不是 task 属性。
+> `not_before` / `effective_priority` / `blocking_reason` 放在 `placement_waiters` 而不是 `tasks` —— 它们是排队状态，不是 task 属性。
 
 ### 9.2 存储分工与 retention
 
@@ -1051,17 +1122,20 @@ INDEX  (series_id)                              -- runner_cache_state
 | Case archives（CAS） | Object Storage `objects/{sha[:2]}/{sha}` | **永不自动删除**（引用计数删除见 [P2]） |
 | Trial 日志与产物 | Object Storage（§9.3） | **[MVP] 写明 bucket lifecycle**：成功 trial 90d，失败 trial 180d |
 
-> v0.3 与 v0.1 把 Runner 本地磁盘治理写了整整两节，但**对象存储侧完全没有 retention** —— artifact 与 CAS object 只增不减，也没有 experiment 删除时的级联。跑一年之后这是一笔说不清的账，通常在收到账单时才被发现。MVP 至少要把策略写进部署清单（配 bucket lifecycle 即可，不需要写代码）。
+> 对象存储侧的 retention 最容易被漏掉：Runner 本地磁盘治理有整整一节，而 artifact 与 CAS object 若没有 lifecycle 就只增不减，也没有 experiment 删除时的级联。跑一年之后这是一笔说不清的账，通常在收到账单时才被发现。MVP 至少要把策略写进部署清单（配 bucket lifecycle 即可，不需要写代码）。
 
 ### 9.3 Artifact 路径
 
 ```text
 experiments/experiment-{id}/task-{id}/trial-{id}/attempt-{n}/
+  ├── bundle.tar.zst                        # 完整产物快照（含 traj.jsonl）
   ├── stdout.log  stderr.log  agent.log  verifier.log
   └── result.json
 ```
 
-PostgreSQL 只存 key + size + sha256 + type。所有对象均为 Sanitizer 脱敏后的内容。**路径含 attempt**，使 `CollectArtifacts` 的覆盖写天然幂等且不会互相覆盖。
+PostgreSQL 只存 key + size + sha256 + kind。**所有对象都是 PostProcess 清洗后的内容**（§6.4），原始产物只存在于 Runner 的 workdir，随 retention 过期。**路径含 attempt**，使覆盖写天然幂等且不同 attempt 不互相覆盖。
+
+`traj.jsonl` 只进 bundle 不单独上传（通常几十到几百 MB）；需要单独取用时下载 bundle 后解包。
 
 ---
 
@@ -1079,7 +1153,7 @@ PostgreSQL 只存 key + size + sha256 + type。所有对象均为 Sanitizer 脱�
 | 403 | FORBIDDEN（非创建者的删除/取消） |
 | 404 | *_NOT_FOUND |
 | 409 | CONFLICT（重复注册 / 重复 confirm / 有引用的 spec 删除） |
-| 422 | VALIDATION_FAILED（含 case version 非 READY、gpu != 0、capability 无解） |
+| 422 | VALIDATION_FAILED、**CASE_NOT_ADMITTED**（引用了未通过准入的 version，§3.5）、gpu != 0、capability 无解 |
 
 ### 10.2 Case
 
@@ -1088,6 +1162,8 @@ POST   /cases                              创建 case
 POST   /cases/{id}/versions                注册版本（source: git|artifact）→ state=PARSING
 POST   /cases/{id}/versions/upload-init    [P1] 分块上传：返回 presigned URLs
 POST   /cases/{id}/versions/upload-commit  完成上传：服务端校验 sha256 后注册
+POST   /cases/{id}/versions/{v}/admit      准入校验（§3.5）→ 创建 validation experiment
+GET    /cases/{id}/versions/{v}/admission  准入结果明细（判据、各 trial reward、结论）
 GET    /cases?project=&series=  /cases/{id}
 ```
 
@@ -1122,9 +1198,9 @@ GET    /experiments  /{id}  /{id}/results
 3. tasks / trials 行由 workflow 内的 server activity 落库
 ```
 
-> v0.1 写的是"展开 matrix 落库 → ExecuteWorkflow"。两步不是原子的，进程在中间崩溃就留下一个**有全套 PENDING 行但没有任何 workflow 在跑**的 experiment，而 `RejectDuplicate` 帮不上忙（问题是压根没起来），用户重试 confirm 还会撞上 409。
+> 顺序不能反过来。"先展开 matrix 落库 → 再 ExecuteWorkflow"的两步不是原子的，进程在中间崩溃就留下一个**有全套 PENDING 行但没有任何 workflow 在跑**的 experiment，而 `RejectDuplicate` 帮不上忙（问题是压根没起来），用户重试 confirm 还会撞上 409。
 >
-> 反过来做则天然正确：workflow 是事实源，读模型就应该由 workflow 写，at-least-once + 幂等 upsert。matrix 展开的确定性由输入（experiment config + case version）保证，放进 workflow 里展开同样是确定性的。
+> 现在这个顺序天然正确：workflow 是事实源，读模型就应该由 workflow 写，at-least-once + 幂等 upsert。matrix 展开的确定性由输入（experiment config + case version）保证，放进 workflow 里展开同样是确定性的。
 
 ### 10.5 Task / Trial
 
@@ -1140,7 +1216,7 @@ GET    /trials/{id}/artifacts/{name}    302 → presigned download URL
 GET    /queue?project=&series=          队列视图（读 placement_waiters）
 ```
 
-**retry 的 WorkflowID 统一带序号**：`trial-{task_id}-{trial_index}-r{retry_seq}`。v0.1 同时存在两套 retry 语义（child 的 `ALLOW_DUPLICATE_FAILED_ONLY` 与 retry 端点的"带序号"），读模型对账要处理两种 ID 格式。v0.4 统一走带序号 + `RejectDuplicate`。
+**retry 的 WorkflowID 统一带序号**：`trial-{task_id}-{trial_index}-r{retry_seq}`。不要同时存在两套 retry 语义（child 的 `ALLOW_DUPLICATE_FAILED_ONLY` 与端点侧的"带序号"），否则读模型对账要处理两种 ID 格式。统一走带序号 + `RejectDuplicate`。
 
 ### 10.6 Runner（runner token 认证，内部）
 
@@ -1154,7 +1230,7 @@ GET    /runners  /runners/{id}
 POST   /internal/llm-credentials/exchange   trial token → LLM 三要素（§8.2）
 ```
 
-v0.3 的 `poll` 与 `trials/{tid}/transition` 已删除（派发与状态上报由 Temporal 承担）。
+没有 `poll`，也没有 `trials/{tid}/transition` —— 派发与状态上报由 Temporal 承担。
 
 ---
 
@@ -1169,7 +1245,8 @@ rollout-man
 ├── case
 │   ├── upload <path> --project --series --name [--version]
 │   ├── register --git repo#commit:path | --s3 key --sha256
-│   ├── validate <case_id> [--version]        [P1] 跑 oracle + nop
+│   ├── admit <case_id> [--version] [--trials 2]   准入：oracle≥1 / nop≤0（§3.5）
+│   │       --all --stale                          [P1] 批量复检过期准入
 │   └── list / get
 ├── experiment
 │   ├── create <experiment.yaml> [--yes] [--dry-run]
@@ -1209,7 +1286,13 @@ matrix:
 concurrency: 8                         # 在途上限（排队 + 执行），见 §4.2
 priority: normal                       # critical|high|normal|low
 queue_timeout: 24h                     # 排队超时 → UNPLACED，见 §5.6
-reward_threshold: 0.8                  # 结果表"达标"的判定线，见 §12
+admission:                             # 前置准入，见 §3.5
+  allow_unadmitted: false              # true 仅用于调试：结果打 ⚠ UNADMITTED 且不进跨 experiment 聚合
+
+postprocess:                           # 后置清理，见 §6.4
+  redact_keys: true                    # 强制项，写 false 会被拒绝
+  redact_ips: {traj: true, logs: false}   # 分发件脱、排查件不脱
+  bundle: true                         # 打包为 bundle.tar.zst
 
 # resources / timeouts 默认来自各 Case 的 task.toml，仅在需要统一覆盖时填写：
 overrides:                             # [P1] 三级优先级：Experiment > task.toml > 默认
@@ -1235,7 +1318,7 @@ Experiment Preview
   Agents:   claude-code, codex        LLM Specs: opus-prod, gpt5-prod
   Trials:   5 each → Total 20         在途上限: 8    Priority: NORMAL
   能力要求: docker, arch=amd64        GPU: 0
-  排队超时: 24h                        达标线: reward ≥ 0.8
+  排队超时: 24h                        准入: 全部 ADMITTED ✓
 
 Confirm? [y/N] y
 → experiment exp_182 queued (4 tasks, 20 trials)
@@ -1243,7 +1326,7 @@ Confirm? [y/N] y
 
 **preview 只展示确定性信息** —— trial 数、并发、优先级、涉及的 agent/spec、能力要求、各项阈值。
 
-> v0.3 的 `Estimated: CPU 160 core-hours, Disk 320 GB` 在冷启动时只能用 `默认 profile × trials` 算，与实际可能差数倍，但界面上看起来像精确预估。**看起来精确、实际是猜的数字比不显示更糟。**
+> 不要显示 `Estimated: CPU 160 core-hours, Disk 320 GB` 这类数字：冷启动时只能用 `默认 profile × trials` 算，与实际可能差数倍，但界面上看起来像精确预估。**看起来精确、实际是猜的数字，比不显示更糟。**
 >
 > **[P1]** 加时间预估，且必须标注样本量：`~4.2h（基于 Spring series 近 30 次 trial 中位数）`；无样本时显示 `未知`。预计超过 24h 时给出警告 —— 这比 `MATRIX_TOO_LARGE` 上限有用得多，因为它防的是"提交了才发现要等一个月"。
 
@@ -1253,43 +1336,58 @@ Confirm? [y/N] y
 
 `GET /experiments/{id}/results` / `rollout-man experiment results`：
 
-```text
-Experiment #182                                        达标线 reward ≥ 0.8
+**本系统不定义"什么算成功"。** 它负责把 rollout 跑完、把每个 trial 的原始 reward 和失败归因如实记下来；至于 reward 到多少算通过，是分析阶段的判断，随分析目的而变，不该被冻结进 experiment 配置——同一批 rollout 换个问题就该换个切法。因此结果表默认呈现**分布**，不呈现"达标率"。
 
-Agent / Model      完成  达标  reward中位  Agent-Fail  Agent-TO  Env-TO  Infra  Verifier  Unplaced  Cancel   达标率
-Claude / Opus        88    62      0.83         14         4        3      12       6         0        0     62/88 = 70%
-Codex   / GPT-5      92    71      0.86         12         3        2       8       5         0        2     71/92 = 77%
+```text
+Experiment #182
+
+Agent / Model      完成  reward: 均值 中位  P25   P75   Agent-Fail  Agent-TO  Env-TO  Infra  Verifier  Unplaced  Cancel
+Claude / Opus        88          0.71  0.83  0.42  0.95      14         4        3      12       6         0        0
+Codex   / GPT-5      92          0.76  0.86  0.51  0.97      12         3        2       8       5         0        2
+
+  reward 直方图（Claude / Opus）  0.0 ████▏12   0.2 ██▎7   0.4 ███▍10  0.6 █████▏15  0.8 ████████████▏44
 ```
 
-**列的定义**（v0.3 的表在 `TEST_FAILED` 移出 taxonomy 后已经失效，本版重做）：
+**列的定义**：
 
 | 列 | 含义 |
 |---|---|
 | 完成 | `COMPLETED` 数（verifier 正常跑完并产出 reward，**无论高低**） |
-| 达标 | `COMPLETED 且 reward ≥ reward_threshold` |
+| reward 分布 | 均值 / 中位 / P25 / P75 + 直方图，仅统计 `COMPLETED` |
 | Agent-Fail | 崩溃 / 非零退出 / OOM / 输出超限 |
 | **Agent-TO** | `AGENT_TIMEOUT` —— agent 自己磨蹭到超时 |
 | **Env-TO** | `ENVIRONMENT_TIMEOUT` —— 环境/构建超时 |
 | Infra / Verifier / Cancel / Unplaced | 见 §7.1 |
 
-**达标率的分母口径**：
+**要看通过率时，阈值是查询参数，不是配置**：
+
+```text
+rollout-man experiment results exp_182 --pass-at 0.8
+  → 额外输出一列 "通过率 (reward≥0.8)"，同一批数据可以换任意阈值反复看
+```
+
+对应 `GET /experiments/{id}/results?pass_at=0.8`。不传就不显示这一列。
+
+**通过率的分母口径**（传了 `--pass-at` 时）：
 
 ```text
 分母 = 完成 + Agent-Fail + Agent-TO
 排除 = Env-TO / Infra / Verifier / Cancelled / Unplaced
 ```
 
-> v0.3 的表把 Timeout 混成一列并整列排除，**这会系统性地高估所有 agent 的达标率**：`AGENT_TIMEOUT`（agent 自己磨蹭到超时）是实打实的能力问题，必须计入分母；只有 `ENVIRONMENT_TIMEOUT` 才该排除。两者混在一列的前提是 §7.2 的映射表不存在 —— 有了它，拆列是自然的。
+> Timeout 不能混成一列再整列排除，那会**系统性地高估所有 agent 的通过率**：`AGENT_TIMEOUT`（agent 自己磨蹭到超时）是实打实的能力问题，必须计入分母；只有 `ENVIRONMENT_TIMEOUT` 才该排除。能拆开的前提是 §7.2 的映射表存在。
 >
-> 同时，`reward_threshold` 必须**显式写进 experiment 配置**（默认值也要写进文档）。v0.3 的 "Success / Partial" 分界从未定义过，导致每个人心里的"成功率"都不一样。
+> 注意这里和 §3.5 准入判据的区别：准入的 `oracle >= 1.0` / `nop <= 0.0` 是**必须写死**的门限，因为那两个 builtin 的正确答案是已知的（参考解必然满分、空操作必然零分），判据是二值的、与分析目的无关。被测 agent 的 reward 没有这种性质。
 
-附带指标：reward 分布（均值 / 中位 / P25–P75）、平均时长、资源峰值分布、retry 率、queue wait P95。`result.json` 保留每 trial 原始 reward 供离线分析。
+附带指标：平均时长、资源峰值分布、retry 率、queue wait P95。`result.json` 保留每 trial 原始 reward 供离线分析。
+
+**准入状态在结果表里必须可见**：引用了 `allow_unadmitted` case 的行前缀 `⚠`，并在表尾注明 —— 未准入 case 的分数不具备可比性，混进聚合会污染所有对比结论。
 
 **oracle / nop 单独成行**，不与 LLM Agent 混排：
 
 - oracle 未得满分 → 标记该 Case 为 `CASE_SUSPECT`（环境 / 参考解 / verifier 有问题）
 - nop 得分非 0 → 标记 Verifier 为 `VERIFIER_SUSPECT`
-- **不把 oracle 失败塞进 `ENVIRONMENT` failure category**（v0.3 §3.4 的做法），那会污染 ENVIRONMENT 的统计口径 —— oracle 失败的三种成因（环境坏 / 参考解失效 / verifier bug）恰恰需要人来判断，归进一个自动化的 category 反而掩盖了它
+- **不把 oracle 失败塞进 `ENVIRONMENT` failure category**，那会污染 ENVIRONMENT 的统计口径 —— oracle 失败的三种成因（环境坏 / 参考解失效 / verifier bug）恰恰需要人来判断，归进一个自动化的 category 反而掩盖了它
 - 含 SUSPECT Case 的结果在聚合表中打星号提示
 
 **[P2]** 导出 CSV/JSONL 批量作业、跨 experiment 对比。
@@ -1325,7 +1423,7 @@ rollout-man/
 │   │   ├── server/       placement.go  readmodel.go  token.go  finalize.go
 │   │   └── runner/       fetch.go  prepare.go  run.go  verify.go  collect.go  cleanup.go
 │   ├── runner/
-│   │   ├── inuse/        in-use registry（§6.6）
+│   │   ├── inuse/        in-use registry（§6.7）
 │   │   ├── housekeeper/  分级清理
 │   │   └── cachescan/    [P1]
 │   ├── placement/        matcher.go  scoring.go  reservations.go
@@ -1388,28 +1486,30 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 
 | 模块 | **MVP** | **P1**（MVP 后 1–2 迭代） | **P2**（有明确需求再做） |
 |---|---|---|---|
-| **Case Registry** | CAS（sha256）；`--git` / `--s3+sha256` 注册；CLI 直传 + 服务端校验；`task.toml` 解析 + `PARSING/READY/INVALID` | 完整分块上传协议（断点续传、并发分片） | Case 预热（dispatch 前预下发 artifact / 预拉 image） |
-| **Experiment** | matrix 展开；preview + confirm（幂等）；cancel；**上限 500 trials**；`queue_timeout` / `reward_threshold` | pause / resume；`overrides` 三级优先级；**shard 化** + 上限 2000 | 上限 10000；Experiment 模板 / 复用 |
-| **LLM Spec** | Registry CRUD；`api_key_ref` + 加密文件/KMS；**一次性 trial token 交换端点** | `max_concurrent` 限流；key 轮换；加密 Data Converter | Vault / 外部 secret manager |
+| **Case Registry** | CAS（sha256）；`--git` / `--s3+sha256` 注册；CLI 直传 + 服务端校验；`task.toml` 解析 + 状态机 | 完整分块上传协议（断点续传、并发分片） | Case 预热（dispatch 前预下发 artifact / 预拉 image） |
+| **前置准入** | oracle≥1 / nop≤0 判据；`case admit` 走正式执行链；正式 experiment 强制 `ADMITTED`；`allow_unadmitted` 逃生口 + 结果打标 | 定期复检（`revalidate_after`）与批量复检；`CASE_SUSPECT` / `VERIFIER_SUSPECT` 归因 | 准入判据按 series 差异化；准入结果趋势看板 |
+| **后置清理** | 独立 `PostProcess` activity；key 强制脱敏 + IP 分档；`bundle.tar.zst` 打包；清洗失败阻断上传 | 清洗命中 metrics 进结果分析；`extra_patterns`；bundle 增量/分卷 | 产物二次加工流水线（脱敏后再抽样标注等） |
+| **Experiment** | matrix 展开；preview + confirm（幂等）；cancel；**上限 500 trials**；`queue_timeout` | pause / resume；`overrides` 三级优先级；**shard 化** + 上限 2000 | 上限 10000；Experiment 模板 / 复用 |
+| **LLM Spec** | Registry CRUD；`api_key_ref` + 加密文件/KMS；Runner 侧凭证获取端点 | `max_concurrent` 限流；key 轮换 | 按 spec 的配额与计费归集 |
 | **Agent Registry** | `type/requires_llm` + 展开规则；oracle / nop 两个 builtin | `case validate` 快捷命令；`CASE_SUSPECT` 标记 | 自定义 agent 打包分发 |
-| **执行链** | fetch → prepare → run → verify → collect → cleanup 全链路；每步幂等 + 重入对账；**全部配 `ScheduleToStart`**；`RunAgent` 同机重投 | 步骤级 metrics 细化 | — |
+| **执行链** | fetch → prepare → run → verify → collect → **postprocess** → cleanup 全链路；每步幂等 + 重入对账；**全部配 `ScheduleToStart`**；`RunAgent` 同机重投 | 步骤级 metrics 细化 | — |
 | **Failure** | Taxonomy 固化；**Temporal 错误 → code 映射（含超时类型）**；`TEST_FAILED` 不进 taxonomy | 精细 code 归因；归因准确率回归用例 | 失败聚类 / 自动根因提示 |
 | **Retry** | Activity 级同机重试 + workflow 级换机重试；`avoid_same_runner`；`max_total_attempts` 统一语义 | Experiment 级覆盖；按 code 差异化 backoff | 自适应 retry 预算 |
 | **Placement** | 硬约束过滤；**资源预留记账**；**授予后 Signal 推送**；**排队超时 + waiter 生命周期 + reaper**；同分取负载最低 | priority + aging；affinity 评分（**先采数据**）；cache state 上报；group scheduling；per-llm-spec 限流；matcher 选主 | affinity defer；大任务 backfill；GPU 型号匹配 |
 | **Runner** | 注册；REST 心跳；activity worker（`DisableWorkflowWorker`）；**基础 drain（按 trial 收敛）**；disable | EMERGENCY 自动 drain；`pinned_images`；DRAINING 状态机细化 | 自动扩缩容；Runner 分组 / 标签路由 |
 | **Housekeeper** | 磁盘阈值监控 + `degraded` 上报停派；**NEVER DELETE 清单 + in-use registry + label 限定**；dangling image / stopped container / workdir retention（本地 manifest 驱动）；**Docker context 校验** | 四档分级；CAS 本地缓存 LRU + 容量上限；清理审计上报 | 跨 Runner 缓存协同 / 全局 GC |
-| **Sanitizer** | 精确匹配层（含 base64/URL-encoded 变体）+ 模式匹配层（**含 presigned 签名参数**）；流式按行 + 跨行窗口 | 命中 metrics；泄漏信号进结果分析；`extra_patterns` | IP 脱敏（**默认关闭**） |
-| **安全** | secret 不进 history（三段式 token）；对象访问不用 presigned URL；`created_by` + 删除类操作限制；信任边界文档化 | 加密 Data Converter；runner token 轮换；角色细化 | — |
-| **读模型 / API** | Task/Trial/Queue/Experiment 读接口；artifact presigned 下载；events 表（业务语义） | visibility reconciler（5min）；结果聚合完整指标 | 导出 CSV/JSONL 批量作业；跨 experiment 对比 |
+| **Sanitizer** | 精确匹配层（含 base64/URL-encoded 变体）+ 模式匹配层（**含 presigned 签名参数**）；流式按行 + 跨行窗口；**IP 分档脱敏**（§6.4） | 命中 metrics；泄漏信号进结果分析；`extra_patterns` | 语义级脱敏（人名/路径/主机名） |
+| **安全** | key 不作为 activity 入参（Runner 用 runner token 取）；对象访问不用 presigned URL；`created_by` + 删除类操作限制；信任边界文档化 | **一次性 trial token + 吊销**；加密 Data Converter；runner token 轮换；角色细化 | Vault / 外部 secret manager |
+| **读模型 / API** | Task/Trial/Queue/Experiment 读接口；artifact presigned 下载；events 表（业务语义）；结果表 reward 分布 | visibility reconciler（5min）；`--pass-at` 查询式阈值；结果聚合完整指标 | 导出 CSV/JSONL 批量作业；跨 experiment 对比 |
 | **CLI** | case / experiment / task / trial / queue / llm-spec / runner 基本子命令；`logs`（拉已上传日志） | `-o json` 全覆盖；`results` 聚合表；时间预估（带样本量） | `logs -f` 实时跟随 |
 | **UI** | 无（用 Temporal Web UI 看 timeline） | 无 | Web UI：Queue / Runner / Experiment dashboard、结果对比 |
 | **存储治理** | 对象存储 **bucket lifecycle 策略写进部署清单** | experiment 删除级联；CAS 引用计数 | — |
 | **HA / 运维** | Temporal docker-compose + PG persistence；API Server 单副本；Prometheus 基础指标 | API Server 多副本 + matcher 选主；history archival；replay 回归 CI | 多 Region、多租户、Billing、K8s 调度（**明确非目标**） |
 
-**相对 v0.3 §12.1 的两处关键调整**：
+**两处最容易分错的**：
 
-- **affinity 移出 MVP** → P1。它是性能优化，MVP 阶段没有数据支撑权重（§5.7）
-- **资源预留记账移入 MVP**（v0.3 排在 Phase 5）。它是 placement 正确性的一部分，不记账就会基于陈旧心跳重复授予导致 OOM / 盘满（§5.3）
+- **affinity 属于 P1，不属于 MVP**：它是性能优化，而 MVP 阶段没有数据支撑权重（§5.7）
+- **资源预留记账属于 MVP，不属于后期优化**：它是 placement 正确性的一部分，不记账就会基于陈旧心跳重复授予导致 OOM / 盘满（§5.3）
 
 ### 15.2 Phase 0：验证与决策（1 周，MVP 前置）
 
@@ -1441,21 +1541,25 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 | Phase | 内容 | 分级 | 验收标准 |
 |---|---|---|---|
 | **0** | Temporal 部署 + walking skeleton + §15.2 验证 | MVP 前置 | 9 项验证有明确结论；判据 1–3 通过 |
-| **1** Execution Core | Case Registry、Experiment、Trial、执行链、单 Runner、Harbor 集成 | MVP | 一条 YAML → 单 Runner 跑完 N trials → CLI 可查 reward |
-| **2** Reliability | Failure Taxonomy + **错误映射**、两级 retry、artifact、Sanitizer、secret 链路 | MVP | 见下方三条 |
+| **1** Execution Core | Case Registry、**准入**、Experiment、Trial、执行链（含 **PostProcess**）、单 Runner、Harbor 集成 | MVP | 新 Case → `case admit` 通过 → 一条 YAML → 单 Runner 跑完 N trials → CLI 可查 reward，产物已清洗打包 |
+| **2** Reliability | Failure Taxonomy + **错误映射**、两级 retry、artifact、Sanitizer 全量规则、凭证链路 | MVP | 见下方四条 |
 | **3** Multi Runner | Runner 注册、心跳、placement 硬约束 + 记账 + 排队超时、基础 drain、Housekeeper 基础清理 | MVP（**收尾即 MVP 可用**） | 3 Runner 并发消费；停 1 台不丢任务；drain 平滑下线；磁盘打满不误删 in-use 资源 |
 | **4** Optimization | affinity、cache 上报、group scheduling、aging、pause/resume、EMERGENCY drain、shard 化 | P1 | 同 series 任务集中到有 cache 的 Runner；无任务等待超过 max_wait |
 | **5** Resource Mgmt | 分级清理、CAS LRU、pinned_images、reconciler、多副本 HA | P1 | 读模型漂移 5min 内自愈；CAS 缓存不超上限 |
 | **6** Productization | Web UI、结果对比、实时日志 | P2 | — |
 
-**Phase 2 的验收必须拆成三条**（v0.3 只有一条，覆盖不了关键路径）：
+**Phase 2 的验收必须拆成四条**（只验一条"kill runner 能重排"覆盖不了关键路径）：
 
 1. `kill -9` Runner Agent → trial 自动换机重跑，归因 **`RUNNER_UNAVAILABLE`**（**不是 `AGENT_TIMEOUT`**）
    —— 这一条同时验证 §7.2 的错误映射，是唯一能发现"基础设施故障被记成 agent 失败"的测试
 2. `systemctl restart` Runner Agent → 在跑的 trial **不重跑**，同一个容器被接管，最终 reward 正常产出
-   —— 这一条验证 §6.2 的重入接管；**v0.3 / v0.1 的验收标准里没有任何一条覆盖它**，而按 v0.1 的配置它根本不会发生
+   —— 这一条验证 §6.2 的重入接管。它极容易被漏掉：表面上与第 1 条像是同一件事，实际走的是完全不同的路径，且配错时不会有任何报错
 3. experiment cancel → 5 秒内 PG 里所有 trial 变为 CANCELLED（不依赖 reconciler）
    —— 这一条验证 §4.3 的 disconnected context
+4. 构造一个把 api_key 原样写进 traj 与 stdout 的假 agent → 跑完后从对象存储取回 `bundle.tar.zst` 与各单文件，**全文检索 key 明文零命中**；同时 `agent.log` 里的 IP 仍然可读
+   —— 这一条同时验证 §6.4 的分档清洗与"清洗失败阻断上传"（把 Sanitizer 规则改坏一次，确认 trial 变 `POSTPROCESS_FAILED` 而不是照样上传）
+
+**Phase 1 的验收补一条**：故意把某个 Case 的 verifier 改成恒返回满分 → `case admit` 必须因 nop 超标而 `REJECTED`，且该 version 无法被正式 experiment 引用（422 `CASE_NOT_ADMITTED`）—— 验证 §3.5，这是准入唯一有意义的验收方式（只验"好 case 能通过"证明不了任何事）。
 
 **Phase 3 的验收补一条**：提交一个要求不存在的 capability 的 experiment → 在 preview/confirm 阶段被拒绝，或（若无法静态判定）在 `queue_timeout` 后终态 `UNPLACED`，experiment 正常结束 —— 验证 §5.6，防止"永远不结束的 experiment"。
 
@@ -1465,8 +1569,9 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 
 | # | 问题 | 当前倾向 |
 |---|---|---|
-| 1 | LLM Spec 的 secret 后端：加密环境文件 vs KMS vs Vault | MVP 用加密文件 + KMS 解密；Vault 进 P2。**下发链路已定**（§8.2），待定的只是 Server 侧静态存储 |
-| 2 | `reward_threshold` 的默认值 | 建议 0.8，但需要跑过一批真实 case 后再定；先做成必填 + 文档给建议值 |
+| 1 | LLM Spec 的 secret 后端：加密环境文件 vs KMS vs Vault | MVP 用加密文件 + KMS 解密；Vault 进 P2。下发链路已定（§8.2），待定的只是 Server 侧静态存储 |
+| 1b | 准入判据是否需要按 series 差异化（有些 Case 天然拿不到满分） | 先全局 `oracle_min = 1.0`；出现反例再按 series 覆盖，**不要一上来就放松到 0.9**——放松后准入就失去意义 |
+| 1c | `bundle` 的格式与是否分卷（超大 traj） | 先 `tar + zstd` 单卷；单 attempt 产物超过 2GB 时再议 |
 | 3 | shard 化的 shard 粒度（按 task 还是固定条数） | 倾向固定条数（如每 shard 200 trials），与 matrix 结构解耦 |
 | 4 | `queue_timeout` 默认 24h 是否合适 | 需要观察真实排队分布；MVP 先给 24h 并在超过 50% 时告警 |
 | 5 | Runner 机器的准入与加固标准 | §8.1 定了信任边界，具体加固清单待运维补 |
@@ -1475,9 +1580,9 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 
 ## 附录 A：设计原则（一句话版）
 
-> Case 是 Artifact，Experiment 是声明，Task 是分组，Trial 是唯一的执行单位；
+> Case 是 Artifact，**准入过的** Case 才配进 Experiment；Experiment 是声明，Task 是分组，Trial 是唯一的执行单位；
 > **Temporal** 负责可靠地把每一步按顺序做完（状态机、队列、lease、心跳、重试、级联取消全部退役）；
 > **Placement** 负责谁先做、在哪台机器做（资源、优先级、affinity 的智能全部保留）；
-> **Runner activity** 负责真正做（幂等 + 重入对账 + 脱敏）；
+> **Runner activity** 负责真正做（幂等 + 重入对账 + 清洗打包）；
 > **Housekeeper** 保证 Runner 能持续运行；
 > PostgreSQL 从事实源退位为读模型，事实源是 Temporal 的 event history —— 但 30 天之后，PG 是唯一还在的那个。
