@@ -1,9 +1,14 @@
-# Agent Evaluation Orchestration Platform — 详细设计 v0.4
+# rollout-man — Agent Evaluation Orchestration Platform 详细设计 v0.4
 
 版本：v0.4（合并稿，唯一设计基线）
 日期：2026-08-18
 状态：Draft，待评审
 取代：《详细设计报告 v0.3》、《实现层详细设计（Temporal 版）v0.1》——两份同时作废
+
+**命名**：本系统名为 **rollout-man**，CLI 二进制、Temporal namespace、Docker label
+前缀、环境变量前缀（`ROLLOUT_MAN_*`）统一使用该名。文中出现的 **Harbor** 一律指
+上游执行系统（Agent runtime / Docker runtime / Verifier / Case format），是本系统的
+依赖而非本系统的一部分。
 
 ---
 
@@ -113,7 +118,7 @@ Temporal 回答：**怎么保证每一步按顺序做完且不丢**。
                      StartWorkflow / Signal│gRPC
                                           ▼
                                 ┌──────────────────┐
-                                │  Temporal Server │  namespace: harbor-exp
+                                │  Temporal Server │  namespace: rollout-man
                                 └───────┬──────────┘
               long-poll（出方向 gRPC 7233，NAT 友好）
         ┌───────────────────┬───────────┴────────┬───────────────────┐
@@ -641,7 +646,7 @@ runner:
   heartbeat_interval: 15s            # 唯一的间隔配置；v0.3 的 poll_interval 已删除
   max_concurrent_trials: 4
   docker_host: unix:///var/run/docker.sock   # 必须显式绑定，见 §6.6
-  workdir: /data/harbor-runner
+  workdir: /data/rollout-man
   resources: {cpu: 32, memory: 128Gi, disk: 1.8Ti, gpu: 0}
   capabilities: {docker: true, rootless: false, arch: amd64}
   sanitizer:
@@ -655,7 +660,7 @@ housekeeping: {...}                  # 见 §6.6
 
 ### 6.2 Activity 幂等与恢复语义
 
-所有 runner activity 以 `(trial_id, attempt)` 为幂等键，本地状态在 `workdir/{trial_id}/`，容器打 label `harbor-exp.trial_id` / `harbor-exp.attempt`。
+所有 runner activity 以 `(trial_id, attempt)` 为幂等键，本地状态在 `workdir/{trial_id}/`，容器打 label `rollout-man.trial_id` / `rollout-man.attempt`。
 
 | Activity | 幂等 / 恢复行为 |
 |---|---|
@@ -766,7 +771,7 @@ protected = {
     in-use registry 中登记的 image / volume / workdir,
     Server 下发的 pinned_images [P1],
     now - last_used < image_unused retention 的 image,      ← 注意方向
-    非本系统创建的资源（无 harbor-exp.* label 的容器/volume 默认不动）,
+    非本系统创建的资源（无 rollout-man.* label 的容器/volume 默认不动）,
 }
 删除对象 = 候选集合 - protected
 逐项执行并记 event（删了什么、释放多少），不用批量 prune。
@@ -1161,12 +1166,12 @@ v0.3 的 `poll` 与 `trials/{tid}/transition` 已删除（派发与状态上报�
 
 ## 11. CLI 规格
 
-命令名 `harbor-exp`。全局参数 `--server` / `--token`（或 `HARBOR_EXP_SERVER/TOKEN`）/ `--output json|table`。
+命令名 `rollout-man`。全局参数 `--server` / `--token`（或 `ROLLOUT_MAN_SERVER/TOKEN`）/ `--output json|table`。
 
 ### 11.1 命令树
 
 ```text
-harbor-exp
+rollout-man
 ├── case
 │   ├── upload <path> --project --series --name [--version]
 │   ├── register --git repo#commit:path | --s3 key --sha256
@@ -1229,7 +1234,7 @@ scheduling:                            # [P1]
 ### 11.3 Preview
 
 ```text
-$ harbor-exp experiment create experiment.yaml
+$ rollout-man experiment create experiment.yaml
 
 Experiment Preview
   Cases:    CVE-2026-1234:v17
@@ -1252,7 +1257,7 @@ Confirm? [y/N] y
 
 ## 12. 结果分析
 
-`GET /experiments/{id}/results` / `harbor-exp experiment results`：
+`GET /experiments/{id}/results` / `rollout-man experiment results`：
 
 ```text
 Experiment #182                                        达标线 reward ≥ 0.8
@@ -1318,8 +1323,8 @@ Codex   / GPT-5      92    71      0.86         12         3        2       8   
 ### 13.1 代码组织
 
 ```text
-harbor-exp/
-├── cmd/{server,runner,harbor-exp}/
+rollout-man/
+├── cmd/{server,runner,rollout-man}/
 ├── internal/
 │   ├── workflows/        experiment.go  trial.go        （纯确定性，禁 I/O）
 │   ├── activities/
@@ -1352,7 +1357,7 @@ harbor-exp/
 | 组件 | 形态 |
 |---|---|
 | Temporal Server | **自托管**。dev：`temporal server start-dev`；**MVP 起即用 docker-compose + PG persistence**（见下） |
-| namespace | `harbor-exp`，retention 30d，之后归档到 Object Storage |
+| namespace | `rollout-man`，retention 30d，之后归档到 Object Storage |
 | API Server | [MVP] 单副本；[P1] 多副本（workflow worker 天然多活，matcher advisory lock 单活） |
 | Runner Agent | 单二进制 + systemd；新增出方向 7233 端口要求 |
 
