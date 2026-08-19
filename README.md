@@ -3,9 +3,10 @@
 A deterministic pipeline for agent evaluation: **orchestrate** the work,
 **execute** it, **report** what happened, **ship** the artifacts.
 
-It does not run agents itself — [Harbor](#) cases do that, via their own
-`Dockerfile`, `solution/solve.sh` and `tests/test.sh`. rollout-man decides what
-runs, makes sure the numbers mean something, and hands you the results.
+It does not run anything itself. **Harbor** answers *how* a trial runs — the
+agent runtime, the container runtime, the verifier, the case format.
+rollout-man answers *what runs, when, and whether the number means anything*,
+and reaches Harbor through a command you configure.
 
 > **Status: working MVP.** One binary, two dependencies, no database and no
 > workflow engine. `docs/design-v0.4.md` describes where this is headed;
@@ -19,8 +20,8 @@ runs, makes sure the numbers mean something, and hands you the results.
 orchestrate   resolve each case to a content hash → gate on admission →
               expand case × agent × llm_spec × trials into a fixed trial list
 
-execute       per trial: build the environment → run the agent → run the
-              verifier → take the reward
+execute       per trial: hand the case and the agent to Harbor, read back the
+              reward, the failure code and the artifacts
 
 report        append one line per trial to results.jsonl; aggregate on demand
 
@@ -164,31 +165,55 @@ ours, and counting it would quietly mark every agent down for our bad day.
 
 ---
 
-## Executors
+## Running a trial
 
-| executor | how it runs a trial |
-|---|---|
-| `docker` | builds the case's `environment/Dockerfile`, then keeps **one container alive for the whole trial** and runs the agent and the verifier in it with `docker exec` |
-| `local` | runs the same case scripts inside a private mount namespace with `/app`, `/logs`, `/solution` and `/tests` bind-mounted from a per-trial sandbox |
+rollout-man does not run containers. Building the case image, starting it,
+running the agent inside it and running the verifier are **Harbor's** job —
+rollout-man's job is to decide *what* to run, ask for it, and record what came
+back. Reaching Harbor is a configured command, exactly like storage is:
 
-One container per trial, not one per step. The Harbor contract splits a trial
-in two — the agent leaves a deliverable in `/app`, the verifier reads it back
-and writes the score to `/logs/verifier/reward.txt` — so the two steps have to
-see the same filesystem. Two `docker run --rm` invocations would throw the
-deliverable away in between and score every agent zero, plausibly and silently.
+```yaml
+kind: Commands
 
-The agent runs as `agent` and the verifier as `root` (whatever `task.toml`
-says); `/solution` and `/tests` are mounted read-only; the network is off
-unless the case asks for it. Step timeouts are enforced by `timeout(1)`
-*inside* the container, because killing the `docker exec` client on the host
-leaves the process running — and that process would keep writing into the next
-step.
+harbor:
+  script: |
+    harbor run --case "$CASE_DIR" --agent "$AGENT_NAME" --output "$OUT_DIR" ...
+```
 
-`local` exists so the pipeline can be exercised without a daemon. The absolute
-paths cases hardcode still resolve, and the host environment is deliberately
-**not** inherited — case scripts are untrusted and their output becomes an
-artifact. Its timeouts kill the whole process group, so an agent that outruns
-its clock releases the slot then, not when it happens to finish.
+```
+in    CASE_DIR OUT_DIR TRIAL_ID AGENT_KIND AGENT_NAME AGENT_COMMAND
+      AGENT_USER VERIFIER_USER AGENT_TIMEOUT_SEC VERIFIER_TIMEOUT_SEC
+      BUILD_TIMEOUT_SEC CPUS MEMORY_MB STORAGE_MB GPUS ALLOW_INTERNET
+      LLM_BASE_URL LLM_MODEL LLM_API_KEY
+
+out   $OUT_DIR/reward.txt    the score — the only thing that means "measured"
+      $OUT_DIR/failure.txt   first line a failure code, rest an explanation
+      $OUT_DIR/*             artifacts to keep (traj.jsonl, agent.log, …)
+```
+
+Every limit `task.toml` declares is handed over, because the adapter is the only
+thing that can enforce them — it is the thing that started the case.
+
+The answer is read back in order of specificity: a declared failure code, then a
+number, then the exit status. An adapter that dies **without** saying why is
+`ENV_FAILED`, never an agent code: "could not measure" is ours, and putting it
+in the agent's denominator corrupts the number quietly.
+
+`--executor` names the command (`--executor harbor`); `auto` picks up a command
+named `harbor` if the submission declares one.
+
+`test/smoke/fake-harbor.sh` is a working stand-in and doubles as the reference
+adapter — it is what the contract looks like when you write it out.
+
+## The local executor
+
+`--executor local` is the one exception, and it is a **test fixture, not a
+runtime**: it runs the same case scripts in a private mount namespace so the
+orchestration can be exercised on a machine with no Harbor and no daemon. The
+absolute paths cases hardcode still resolve, and the host environment is
+deliberately **not** inherited — case scripts are untrusted and their output
+becomes an artifact. Its timeouts kill the whole process group, so an agent that
+outruns its clock releases the slot then, not when it happens to finish.
 
 ## Credentials
 
@@ -201,7 +226,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 46 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 48 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 
@@ -213,14 +238,13 @@ two things worth naming:
   produces no number, and a retryable failure that succeeds on the second
   attempt. The check that matters is the last line: only the agent's own
   failures land in the denominator.
-- **the docker executor**, against a case shaped exactly like the real Harbor
-  ones. It needs a daemon and a base image; with no registry reachable,
-  `test/smoke/make-base-image.sh` builds one from the host's own bash and
-  coreutils so the step runs instead of being skipped and counted as green.
-  Without a daemon the step reports `SKIP`, and the summary counts skips
-  separately.
+- **the trial adapter**, against a stand-in Harbor: the case's limits reach it,
+  the score and artifacts come back from it, a declared failure code passes
+  through, and an adapter that dies silently is `ENV_FAILED` rather than
+  anything that would count against the agent.
 
-Both need `CAP_SYS_ADMIN` for the local executor. Only step 9 needs Docker.
+Both need `CAP_SYS_ADMIN` for the mount namespace. Neither needs Harbor or
+Docker.
 
 ## Scope
 

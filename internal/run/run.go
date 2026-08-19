@@ -151,8 +151,9 @@ func (r *Runner) admit(ctx context.Context, c *casesrc.Case, a *config.Admission
 			res := r.once(ctx, t)
 			if !res.OK() {
 				// a probe that could not run is not a verdict
-				return fmt.Errorf("admission %s for %s could not run: %s: %s",
-					p.kind, c.Label, res.Code, res.Message)
+				// res.Message already carries the code.
+				return fmt.Errorf("admission %s for %s could not run: %s",
+					p.kind, c.Label, res.Message)
 			}
 			got = append(got, *res.Reward)
 		}
@@ -272,20 +273,14 @@ func (r *Runner) once(ctx context.Context, t *trial) Result {
 		WorkDir: filepath.Join(r.Dir, "trials", t.ID),
 		Cfg:     t.Case.Config,
 	}
-	defer r.Exec.Cleanup(ctx, env)
-
-	prepared := false
 	var secrets []string
 	// A failed trial is the one you most need to read, and its logs are the
-	// ones most likely to hold a key: collect and scrub on every exit, not
-	// just the happy one.
+	// ones most likely to hold a key: scrub on every exit, not just the happy
+	// one.
 	finish := func(err error) Result {
-		if prepared {
-			r.Exec.Collect(ctx, env)
-			if rc := r.File.Experiment.Pipeline.PerTrial.Redact; rc != nil {
-				if hits, serr := r.scrub(env.OutDir(), rc, secrets); serr == nil {
-					res.Redaction = &hits
-				}
+		if rc := r.File.Experiment.Pipeline.PerTrial.Redact; rc != nil {
+			if hits, serr := r.scrub(env.OutDir(), rc, secrets); serr == nil {
+				res.Redaction = &hits
 			}
 		}
 		code := fail.Of(err)
@@ -311,18 +306,8 @@ func (r *Runner) once(ctx context.Context, t *trial) Result {
 		}
 	}
 
-	if err := r.Exec.Prepare(ctx, env); err != nil {
-		return finish(err)
-	}
-	prepared = true
-	if err := r.Exec.RunAgent(ctx, env, as); err != nil {
-		return finish(err)
-	}
-	reward, err := r.Exec.RunVerifier(ctx, env)
+	reward, err := r.Exec.Trial(ctx, env, as)
 	if err != nil {
-		return finish(err)
-	}
-	if err := r.Exec.Collect(ctx, env); err != nil {
 		return finish(err)
 	}
 	writeResultJSON(env.OutDir(), t, reward)

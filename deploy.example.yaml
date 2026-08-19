@@ -5,6 +5,35 @@ kind: Commands
 timeout: 30m
 max_attempts: 3
 
+# How a trial actually runs. Building the case image, starting it, running the
+# agent inside it and running the verifier all belong to Harbor -- rollout-man
+# only asks for a number and reads the answer back out of $OUT_DIR.
+#
+#   in   CASE_DIR OUT_DIR TRIAL_ID AGENT_KIND AGENT_NAME AGENT_COMMAND
+#        AGENT_USER VERIFIER_USER AGENT_TIMEOUT_SEC VERIFIER_TIMEOUT_SEC
+#        BUILD_TIMEOUT_SEC CPUS MEMORY_MB STORAGE_MB GPUS ALLOW_INTERNET
+#        LLM_BASE_URL LLM_MODEL LLM_API_KEY
+#   out  $OUT_DIR/reward.txt   the score -- the only thing that means "measured"
+#        $OUT_DIR/failure.txt  first line a failure code, rest an explanation
+#        $OUT_DIR/*            artifacts to keep (traj.jsonl, agent.log, ...)
+#
+# Exit non-zero without failure.txt and the trial is ENV_FAILED: "could not
+# measure" is ours, and it must never land in the agent's denominator. Fill in
+# your own Harbor invocation; the flags below are a sketch, not a contract.
+harbor:
+  script: |
+    set -uo pipefail
+    harbor run \
+      --case      "$CASE_DIR" \
+      --agent     "$AGENT_NAME" \
+      --output    "$OUT_DIR" \
+      --timeout   "$AGENT_TIMEOUT_SEC" \
+      --cpus      "$CPUS" \
+      --memory-mb "$MEMORY_MB"
+    rc=$?
+    [ "$rc" -eq 0 ] || printf 'ENV_FAILED\nharbor run exited %s\n' "$rc" > "$OUT_DIR/failure.txt"
+    exit "$rc"
+
 source_git:
   script: |
     set -euo pipefail

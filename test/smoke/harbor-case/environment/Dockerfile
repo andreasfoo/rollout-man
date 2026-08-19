@@ -1,5 +1,5 @@
-# The base is rewritten by test/smoke/run.sh so the step can run against a
-# locally built rootfs when the image registry is unreachable.
+# rollout-man never reads this file. Building it is Harbor's job; the case only
+# has to declare it, the way every real Harbor case does.
 FROM debian:bookworm-slim
 
 RUN mkdir -p /app /logs/agent /logs/verifier \

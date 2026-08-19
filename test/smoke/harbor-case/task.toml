@@ -1,7 +1,7 @@
 schema_version = "1.2"
 
 [task]
-name = "smoke/docker-case"
+name = "smoke/harbor-case"
 description = "Mirrors the Harbor contract the real cases use: the agent leaves a file in /app, the verifier scores it and writes /logs/verifier/reward.txt"
 
 [metadata]
