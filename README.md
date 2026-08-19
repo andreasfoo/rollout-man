@@ -226,6 +226,30 @@ deliberately **not** inherited — case scripts are untrusted and their output
 becomes an artifact. Its timeouts kill the whole process group, so an agent that
 outruns its clock releases the slot then, not when it happens to finish.
 
+## Shipping a batch
+
+`pipeline.per_experiment.ship` runs **once, after every trial in the batch has
+finished** — that is what the key name means, and it is the whole answer to
+"when does the upload happen". It gets the run directory and a destination, and
+what shipping means is the command's business:
+
+```yaml
+pipeline:
+  per_experiment:
+    ship:
+      using: ship
+      dest: "test/cases/jobs/{{.Experiment}}/{{.RunID}}"
+```
+
+`adapters/ship-github.sh` commits the trails into this repo under that path —
+each trial's own agent output plus `results.jsonl`, not the whole run directory.
+Admission probes are the gate's evidence, not the batch's product, so they stay
+behind. `experiments/libaom-trails.yaml` is a complete worked example: one local
+case, `oracle` and `claude-code`, trails back into `test/cases/jobs/`.
+
+Nothing about the upload is manual, and no credential belongs to rollout-man:
+the command uses whatever git identity and remote auth the machine already has.
+
 ## Credentials
 
 rollout-man manages none. `api_key_env` and `api_key_cmd` say *where to find* a
