@@ -38,9 +38,10 @@ const (
 
 // LLMEnv is resolved on the runner. The key never leaves this struct.
 type LLMEnv struct {
-	BaseURL string
-	Model   string
-	APIKey  string
+	Provider string // names the env vars the agent expects (anthropic, openai, ...)
+	BaseURL  string
+	Model    string
+	APIKey   string
 }
 
 type AgentSpec struct {

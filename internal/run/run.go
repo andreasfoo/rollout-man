@@ -459,7 +459,7 @@ func (r *Runner) resolveLLM(ctx context.Context, name string) (*rexec.LLMEnv, er
 	if !ok {
 		return nil, fail.New(fail.Host, "unknown llm_spec "+name)
 	}
-	env := &rexec.LLMEnv{BaseURL: s.BaseURL, Model: s.Model}
+	env := &rexec.LLMEnv{Provider: s.Provider, BaseURL: s.BaseURL, Model: s.Model}
 	switch {
 	case s.APIKeyEnv != "":
 		env.APIKey = os.Getenv(s.APIKeyEnv)
