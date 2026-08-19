@@ -1,0 +1,34 @@
+# The docker executor against the Harbor contract: /app for the deliverable,
+# /solution and /tests read-only, the score written inside the container.
+---
+kind: Commands
+timeout: 10m
+
+---
+kind: Experiment
+name: docker
+
+case_defaults:
+  source: local
+
+cases:
+  - path: test/smoke/docker-case
+
+matrix:
+  agents: [oracle, nop]
+  trials: 1
+
+concurrency: 2
+max_attempts: 1
+
+pipeline:
+  per_case:
+    admission:
+      require: admitted
+      oracle_min_reward: 1.0
+      nop_max_reward: 0.0
+      trials: 1
+  per_trial:
+    redact:
+      keys: required
+      ips: {traj: true, logs: false}
