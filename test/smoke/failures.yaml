@@ -1,0 +1,39 @@
+# Every failure code the taxonomy can produce, on purpose.
+#
+# The point of the taxonomy is one number: the denominator. An agent that
+# crashed or ran out its clock is a measurement; a case that would not build and
+# a verifier that produced no number are ours, not the agent's. This experiment
+# provokes both kinds in one run so the split is testable rather than asserted.
+#
+# No admission gate here: these cases are unmeasurable by construction, which is
+# exactly what the gate exists to reject.
+---
+kind: Commands
+timeout: 5m
+
+---
+kind: Experiment
+name: failures
+
+case_defaults:
+  source: local
+
+cases:
+  - path: test/smoke/fail-cases/agent-fail
+  - path: test/smoke/fail-cases/agent-timeout
+  - path: test/smoke/fail-cases/verifier-mute
+  - path: test/smoke/fail-cases/no-solution
+  - path: test/smoke/fail-cases/flaky-verifier
+
+matrix:
+  agents: [oracle]
+  trials: 1
+
+concurrency: 5
+max_attempts: 2
+
+pipeline:
+  per_trial:
+    redact:
+      keys: required
+      ips: {traj: true, logs: false}

@@ -13,8 +13,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/andreasfoo/rollout-man/internal/casedef"
@@ -49,6 +51,11 @@ type CaseEnv struct {
 	WorkDir string // per-trial working directory
 	Cfg     *casedef.TaskConfig
 	Image   string
+
+	// Per-trial docker state. It lives here and not on Docker because one
+	// Executor value serves every trial in the run, concurrently.
+	container  string
+	hasTimeout bool
 }
 
 func (e *CaseEnv) sandbox() string { return filepath.Join(e.WorkDir, "root") }
@@ -202,6 +209,14 @@ func (l *Local) shell(ctx context.Context, env *CaseEnv, cmd string, timeout tim
 	}, "\n")
 
 	c := exec.CommandContext(ctx, "unshare", "--mount", "--propagation", "private", shell(), "-c", script)
+	// The case script runs children (a sleep, a build) that outlive a kill of
+	// unshare itself, and CombinedOutput waits on the pipe until every writer
+	// is gone -- so without a process-group kill an "agent timeout" would only
+	// be noticed once the agent finished anyway. Setpgid + kill(-pgid) ends the
+	// whole tree; WaitDelay is the backstop for anything that ignores it.
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c.WaitDelay = 10 * time.Second
 	// Deliberately NOT os.Environ(): the case scripts are untrusted and their
 	// output is an artifact, so the host environment must not reach them.
 	c.Env = []string{
@@ -251,101 +266,185 @@ func (l *Local) Cleanup(ctx context.Context, env *CaseEnv) error {
 
 // --------------------------------------------------------------- docker ---
 
+// Docker keeps ONE container alive for the whole trial and runs each step with
+// docker exec. That is not an optimisation: the agent's deliverable lives at
+// /app/crash.bin and the verifier's score lands in /logs/verifier/reward.txt,
+// so agent and verifier have to see the same filesystem. Two `docker run --rm`
+// invocations would throw the deliverable away between them.
 type Docker struct{}
 
 func (d *Docker) Name() string { return "docker" }
 
 func (d *Docker) Prepare(ctx context.Context, env *CaseEnv) error {
-	ctx, cancel := context.WithTimeout(ctx, env.Cfg.BuildTimeout)
+	if err := os.MkdirAll(env.OutDir(), 0o755); err != nil {
+		return fail.Wrap(fail.Host, "create out dir", err)
+	}
+	env.Image = "rollout-man/case:" + strings.ToLower(filepath.Base(env.WorkDir))
+
+	bctx, cancel := context.WithTimeout(ctx, env.Cfg.BuildTimeout)
 	defer cancel()
-	env.Image = "rollout-man/case:" + filepath.Base(env.WorkDir)
-	c := exec.CommandContext(ctx, "docker", "build", "-t", env.Image,
+	build := exec.CommandContext(bctx, "docker", "build", "-t", env.Image,
 		"-f", filepath.Join(env.CaseDir, "environment", "Dockerfile"),
 		filepath.Join(env.CaseDir, "environment"))
-	if out, err := c.CombinedOutput(); err != nil {
-		if ctx.Err() != nil {
+	if out, err := build.CombinedOutput(); err != nil {
+		writeFile(filepath.Join(env.OutDir(), "build.log"), string(out))
+		if bctx.Err() != nil {
 			return fail.New(fail.EnvFailed, "image build exceeded build_timeout_sec")
 		}
 		return fail.Wrap(fail.EnvFailed, tail(string(out), 4000), err)
 	}
-	if err := os.MkdirAll(env.OutDir(), 0o755); err != nil {
-		return fail.Wrap(fail.Host, "create out dir", err)
+
+	env.container = "rm-" + strings.ToLower(filepath.Base(env.WorkDir))
+	args := []string{"run", "-d", "--name", env.container,
+		"--entrypoint", "/bin/sh",
+		"-v", filepath.Join(env.CaseDir, "solution") + ":/solution:ro",
+		"-v", filepath.Join(env.CaseDir, "tests") + ":/tests:ro",
+		"--cpus", strconv.Itoa(max(1, env.Cfg.Resources.CPUs)),
+		"--memory", strconv.Itoa(max(512, env.Cfg.Resources.MemoryMB)) + "m",
+		"-w", "/app",
 	}
+	if !env.Cfg.AllowInternet {
+		args = append(args, "--network", "none")
+	}
+	// `sleep infinity` is GNU-only; the loop works on busybox images too.
+	args = append(args, env.Image, "-c", "while :; do sleep 3600; done")
+	if out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput(); err != nil {
+		return fail.Wrap(fail.EnvFailed, "start case container: "+tail(string(out), 2000), err)
+	}
+
+	// The case Dockerfile is supposed to create these, but a case that forgot
+	// would otherwise fail as VerifierBad ("no reward") instead of EnvFailed.
+	if out, err := d.exec(ctx, env, "root", "mkdir -p /app /logs/agent /logs/verifier"); err != nil {
+		return fail.Wrap(fail.EnvFailed, "prepare log dirs: "+tail(out, 1000), err)
+	}
+	_, terr := d.exec(ctx, env, "root", "command -v timeout >/dev/null")
+	env.hasTimeout = terr == nil
 	return nil
 }
 
-func (d *Docker) container(env *CaseEnv) string { return "rm-" + filepath.Base(env.WorkDir) }
-
 func (d *Docker) RunAgent(ctx context.Context, env *CaseEnv, a AgentSpec) error {
-	if a.Kind == Nop {
-		return nil
-	}
-	args := []string{"run", "--rm", "--name", d.container(env) + "-agent",
-		"-v", filepath.Join(env.CaseDir, "solution") + ":/solution:ro",
-		"-v", env.WorkDir + "/state:/state",
-		"--cpus", strconv.Itoa(max(1, env.Cfg.Resources.CPUs)),
-		"--memory", strconv.Itoa(max(512, env.Cfg.Resources.MemoryMB)) + "m",
-		"-u", env.Cfg.AgentUser,
-	}
-	if a.LLM != nil {
-		args = append(args, "-e", "LLM_BASE_URL="+a.LLM.BaseURL, "-e", "LLM_MODEL="+a.LLM.Model,
-			"-e", "LLM_API_KEY="+a.LLM.APIKey)
-	}
-	cmd := []string{"bash", "-lc", "/solution/solve.sh"}
-	if a.Kind == LLM {
+	var cmd string
+	var envv map[string]string
+	switch a.Kind {
+	case Nop:
+		return writeFile(filepath.Join(env.OutDir(), "stdout.log"), "nop: no action taken\n")
+	case Oracle:
+		cmd = "/solution/solve.sh"
+	case LLM:
 		if len(a.Command) == 0 {
-			return fail.New(fail.EnvFailed, "no agent command configured for "+a.Name)
+			return fail.New(fail.EnvFailed,
+				"no agent command configured for "+a.Name+" (MVP ships oracle/nop only)")
 		}
-		cmd = a.Command
+		cmd = quoteArgv(a.Command)
+		if a.LLM != nil {
+			envv = map[string]string{
+				"LLM_BASE_URL": a.LLM.BaseURL,
+				"LLM_MODEL":    a.LLM.Model,
+				"LLM_API_KEY":  a.LLM.APIKey,
+			}
+		}
+	default:
+		return fail.New(fail.Host, "unknown agent kind")
 	}
-	args = append(args, env.Image)
-	args = append(args, cmd...)
-	return d.run(ctx, env, args, env.Cfg.AgentTimeout, fail.AgentTimeout, fail.AgentFailed)
+	out, err := d.step(ctx, env, env.Cfg.AgentUser, cmd, env.Cfg.AgentTimeout, envv,
+		fail.AgentTimeout, fail.AgentFailed)
+	writeFile(filepath.Join(env.OutDir(), "stdout.log"), out)
+	return err
 }
 
 func (d *Docker) RunVerifier(ctx context.Context, env *CaseEnv) (float64, error) {
-	args := []string{"run", "--rm", "--name", d.container(env) + "-verify",
-		"-v", filepath.Join(env.CaseDir, "tests") + ":/tests:ro",
-		"-v", env.WorkDir + "/state:/state",
-		"-u", env.Cfg.VerifierUser, env.Image, "bash", "-lc", "/tests/test.sh"}
-	err := d.run(ctx, env, args, env.Cfg.VerifierTimeout, fail.VerifierBad, fail.VerifierBad)
+	out, err := d.step(ctx, env, env.Cfg.VerifierUser, "/tests/test.sh",
+		env.Cfg.VerifierTimeout, nil, fail.VerifierBad, fail.VerifierBad)
+	writeFile(filepath.Join(env.OutDir(), "verifier.stdout.log"), out)
 	if err != nil {
 		return 0, err
 	}
-	return readReward(filepath.Join(env.WorkDir, "state", "reward.txt"))
+	// The score is whatever the case wrote inside the container, at the path
+	// the Harbor contract fixes -- never a path we invented on the host.
+	raw, cerr := d.exec(ctx, env, "root", "cat /logs/verifier/reward.txt")
+	if cerr != nil {
+		return 0, fail.New(fail.VerifierBad, "verifier wrote no /logs/verifier/reward.txt")
+	}
+	return parseReward(raw)
 }
 
-func (d *Docker) run(ctx context.Context, env *CaseEnv, args []string, timeout time.Duration, tCode, xCode fail.Code) error {
+// step runs one chain step inside the live container. The timeout is enforced
+// *inside* the container when coreutils timeout(1) is there, because killing
+// the `docker exec` client on the host leaves the process running in the
+// container -- and that process would keep writing into the next step.
+func (d *Docker) step(ctx context.Context, env *CaseEnv, user, cmd string, timeout time.Duration,
+	extraEnv map[string]string, tCode, xCode fail.Code) (string, error) {
 	if timeout <= 0 {
 		timeout = 30 * time.Minute
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	inner := "exec /bin/bash -lc " + shq(cmd)
+	if env.hasTimeout {
+		inner = "exec timeout -k 10 " + strconv.Itoa(int(timeout.Seconds())) +
+			" /bin/bash -lc " + shq(cmd)
+	}
+	// Host-side backstop: a container whose timeout(1) is missing, or whose
+	// process ignores SIGKILL delivery, still has to end this step.
+	hctx, cancel := context.WithTimeout(ctx, timeout+30*time.Second)
 	defer cancel()
-	c := exec.CommandContext(ctx, "docker", args...)
+
+	args := []string{"exec", "-u", user, "-w", "/app"}
+	for _, k := range sortedKeys(extraEnv) {
+		args = append(args, "-e", k+"="+extraEnv[k])
+	}
+	args = append(args, env.container, "/bin/sh", "-c", inner)
+
+	raw, err := exec.CommandContext(hctx, "docker", args...).CombinedOutput()
+	out := string(raw)
+	if hctx.Err() != nil {
+		return out, fail.New(tCode, "exceeded timeout")
+	}
+	if err == nil {
+		return out, nil
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return out, fail.Wrap(fail.Host, "docker exec", err)
+	}
+	if env.hasTimeout && ee.ExitCode() == 124 {
+		return out, fail.New(tCode, "exceeded timeout")
+	}
+	return out, fail.New(xCode, fmt.Sprintf("exited %d", ee.ExitCode()))
+}
+
+// exec is for the runner's own housekeeping, not for case code: no timeout
+// wrapper, no per-case user, output returned raw.
+func (d *Docker) exec(ctx context.Context, env *CaseEnv, user, cmd string) (string, error) {
+	c := exec.CommandContext(ctx, "docker", "exec", "-u", user, env.container, "/bin/sh", "-c", cmd)
 	out, err := c.CombinedOutput()
-	writeFile(filepath.Join(env.OutDir(), "stdout.log"), string(out))
-	if ctx.Err() != nil {
-		return fail.New(tCode, "exceeded timeout")
-	}
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			return fail.New(xCode, fmt.Sprintf("exited %d", ee.ExitCode()))
-		}
-		return fail.Wrap(fail.Host, "docker run", err)
-	}
-	return nil
+	return string(out), err
 }
 
 func (d *Docker) Collect(ctx context.Context, env *CaseEnv) error {
-	src := filepath.Join(env.WorkDir, "state")
-	for _, n := range []string{"agent.log", "verifier.log", "traj.jsonl"} {
-		copyIfExists(filepath.Join(src, n), filepath.Join(env.OutDir(), n))
+	if env.container == "" {
+		return nil
+	}
+	for _, f := range []struct{ in, out string }{
+		{"/logs/agent/agent.log", "agent.log"},
+		{"/logs/agent/traj.jsonl", "traj.jsonl"},
+		{"/logs/verifier/verifier.log", "verifier.log"},
+		{"/logs/verifier/reward.txt", "reward.txt"},
+	} {
+		cp := exec.CommandContext(ctx, "docker", "cp",
+			env.container+":"+f.in, filepath.Join(env.OutDir(), f.out))
+		cp.Stdout, cp.Stderr = nil, nil
+		_ = cp.Run()
+	}
+	if _, err := os.Stat(filepath.Join(env.OutDir(), "traj.jsonl")); err != nil {
+		writeFile(filepath.Join(env.OutDir(), "traj.jsonl"), "")
 	}
 	return nil
 }
 
 func (d *Docker) Cleanup(ctx context.Context, env *CaseEnv) error {
+	if env.container != "" {
+		_ = exec.Command("docker", "rm", "-f", env.container).Run()
+		env.container = ""
+	}
 	if env.Image != "" {
 		_ = exec.Command("docker", "rmi", "-f", env.Image).Run()
 	}
@@ -359,7 +458,11 @@ func readReward(path string) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	v, err := strconv.ParseFloat(strings.TrimSpace(string(b)), 64)
+	return parseReward(string(b))
+}
+
+func parseReward(raw string) (float64, error) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
 	if err != nil {
 		return 0, fail.Wrap(fail.VerifierBad, "reward.txt is not a number", err)
 	}
@@ -367,6 +470,15 @@ func readReward(path string) (float64, error) {
 		return 0, fail.New(fail.VerifierBad, "reward out of range: "+strconv.FormatFloat(v, 'f', -1, 64))
 	}
 	return v, nil
+}
+
+func sortedKeys(m map[string]string) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
 }
 
 func writeFile(path, content string) error {

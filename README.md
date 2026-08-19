@@ -168,13 +168,27 @@ ours, and counting it would quietly mark every agent down for our bad day.
 
 | executor | how it runs a trial |
 |---|---|
-| `docker` | builds the case's `environment/Dockerfile`, runs agent and verifier in containers |
+| `docker` | builds the case's `environment/Dockerfile`, then keeps **one container alive for the whole trial** and runs the agent and the verifier in it with `docker exec` |
 | `local` | runs the same case scripts inside a private mount namespace with `/app`, `/logs`, `/solution` and `/tests` bind-mounted from a per-trial sandbox |
+
+One container per trial, not one per step. The Harbor contract splits a trial
+in two — the agent leaves a deliverable in `/app`, the verifier reads it back
+and writes the score to `/logs/verifier/reward.txt` — so the two steps have to
+see the same filesystem. Two `docker run --rm` invocations would throw the
+deliverable away in between and score every agent zero, plausibly and silently.
+
+The agent runs as `agent` and the verifier as `root` (whatever `task.toml`
+says); `/solution` and `/tests` are mounted read-only; the network is off
+unless the case asks for it. Step timeouts are enforced by `timeout(1)`
+*inside* the container, because killing the `docker exec` client on the host
+leaves the process running — and that process would keep writing into the next
+step.
 
 `local` exists so the pipeline can be exercised without a daemon. The absolute
 paths cases hardcode still resolve, and the host environment is deliberately
 **not** inherited — case scripts are untrusted and their output becomes an
-artifact.
+artifact. Its timeouts kill the whole process group, so an agent that outruns
+its clock releases the slot then, not when it happens to finish.
 
 ## Credentials
 
@@ -187,11 +201,26 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 28 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 46 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 
-Both need `CAP_SYS_ADMIN` for the local executor. Neither needs Docker.
+`run.sh` covers the four verbs, the admission gate, the redaction tiers, and
+two things worth naming:
+
+- **every failure code, on purpose** — an agent that exits non-zero, an agent
+  that outruns its clock, a case that cannot be staged, a verifier that
+  produces no number, and a retryable failure that succeeds on the second
+  attempt. The check that matters is the last line: only the agent's own
+  failures land in the denominator.
+- **the docker executor**, against a case shaped exactly like the real Harbor
+  ones. It needs a daemon and a base image; with no registry reachable,
+  `test/smoke/make-base-image.sh` builds one from the host's own bash and
+  coreutils so the step runs instead of being skipped and counted as green.
+  Without a daemon the step reports `SKIP`, and the summary counts skips
+  separately.
+
+Both need `CAP_SYS_ADMIN` for the local executor. Only step 9 needs Docker.
 
 ## Scope
 

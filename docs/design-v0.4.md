@@ -45,7 +45,7 @@
 - **要评审设计** → 先看 §2 总体架构 与 §15 优先级分级，再按需展开
 - **要排期** → §15.1 分级总表 + §15.3 Phase 计划，两张表就够
 - **行内 [MVP] / [P1] / [P2]** 标记的是交付批次，无标记即 MVP（§0.1）
-- **本文是目标架构**。已实现的 MVP 比它小得多——按第一性原理砍掉了什么、为什么、什么时候加回来，见 **§15.0**；实现与用法见 `README.md`
+- **本文是目标架构**。已实现的 MVP 比它小得多——按第一性原理砍掉了什么、为什么、什么时候加回来，见 **§15.0**，第二波补了什么见 **§15.0.1**；实现与用法见 `README.md`
 
 ## 目录
 
@@ -1836,6 +1836,22 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 - **placement 落地时加回 Temporal** —— 那时才真的出现 lease / orphan / 选主，才轮到它替代最难写对的代码。在此之前它是在解决一个不存在的问题
 - **多人共享结果时加回数据库** —— 一个人看 `results.jsonl` 够用，十个人并发查不够
 - **产物要发给团队外时加回 bundle / 批量上传** —— 那时才会撞上远端后端的按次限流
+
+### 15.0.1 第二波：先补能出正确数字的路径
+
+瘦身之后从 smoke test 找不足，找到的三条都不在编排层：
+
+| 缺口 | 事实 | 处置 |
+|---|---|---|
+| **docker executor 从未被执行过** | agent 与 verifier 是两次 `docker run --rm`，中间容器连同 `/app/crash.bin` 一起被丢掉；reward 又从宿主机的 `workdir/state/reward.txt` 读，而真实 case 写的是容器内的 `/logs/verifier/reward.txt`。两个 bug 叠加的表现是**每个 agent 都得 0 分**，而且看不出异常 | 已修：**一个 trial 一个容器**，agent 与 verifier 都用 `docker exec` 进同一个容器；分数从容器内的合同路径读出 |
+| **六个失败码在测试里出现次数为 0**，`max_attempts` 的重试分支从未执行 | 分类法唯一的作用是护住分母，而这件事没有任何测试证明 | 已补：五个合成 case 各制造一种失败，外加一个"第一次失败第二次成功"的 case；断言直接落在 `1/3 = 33%` 这个分母上 |
+| **超时只结束等待，不结束 agent** | `CommandContext` 只杀 `unshare` 自己，子进程还在写管道，`CombinedOutput` 于是一直等到 agent 自然结束 —— 2 秒的 agent timeout 实际花了 30 秒 | 已修：local 走 `Setpgid` + `kill(-pgid)`；docker 走容器内的 `timeout(1)`（杀宿主机上的 `docker exec` 客户端不会动容器里的进程） |
+
+**为什么这一波不是 Temporal。** Temporal 能保证的是"崩溃后从断点续跑"，而现在的断点粒度是**整个 trial**：worker 一死，前台起的容器跟着没了，续跑只能从头再跑这个 trial。真实 case 的 `agent_timeout=1h`、`build_timeout=90min`，代价是最多一个半小时。要把这个代价降下来，需要的是**容器重连**。容器现在已经是 `docker run -d` 起的（一个 trial 一个容器的直接后果），剩下的只是把容器名记进检查点、重启后先认领再决定跑不跑 —— 那是 executor 的能力，几十行，和用什么编排器无关。在 detach 之前引入 Temporal，是给一条还不能续跑的执行链套一个能续跑的编排器。
+
+§15.0 里"placement 落地时加回 Temporal"的判据不变。下一步是 **detach + 重连**，之后才轮到它。
+
+这一波的代价：Go 代码 +125 行，依赖不变（仍是 yaml + toml），smoke test 从 28 条断言涨到 46 条。
 
 ### 15.1 分级总表（目标架构）
 

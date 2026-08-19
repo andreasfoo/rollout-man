@@ -267,13 +267,6 @@ func (r *Runner) once(ctx context.Context, t *trial) Result {
 		Agent: t.Agent, LLMSpec: t.LLMSpec, Index: t.Index, Attempts: 1,
 		At: time.Now().UTC().Format(time.RFC3339),
 	}
-	finish := func(err error) Result {
-		code := fail.Of(err)
-		res.Code, res.Category, res.Message = code, string(code.Category()), err.Error()
-		res.Seconds = time.Since(start).Seconds()
-		return res
-	}
-
 	env := &rexec.CaseEnv{
 		CaseDir: t.Case.Dir,
 		WorkDir: filepath.Join(r.Dir, "trials", t.ID),
@@ -281,8 +274,27 @@ func (r *Runner) once(ctx context.Context, t *trial) Result {
 	}
 	defer r.Exec.Cleanup(ctx, env)
 
-	as := rexec.AgentSpec{Kind: t.Kind, Name: t.Agent}
+	prepared := false
 	var secrets []string
+	// A failed trial is the one you most need to read, and its logs are the
+	// ones most likely to hold a key: collect and scrub on every exit, not
+	// just the happy one.
+	finish := func(err error) Result {
+		if prepared {
+			r.Exec.Collect(ctx, env)
+			if rc := r.File.Experiment.Pipeline.PerTrial.Redact; rc != nil {
+				if hits, serr := r.scrub(env.OutDir(), rc, secrets); serr == nil {
+					res.Redaction = &hits
+				}
+			}
+		}
+		code := fail.Of(err)
+		res.Code, res.Category, res.Message = code, string(code.Category()), err.Error()
+		res.Seconds = time.Since(start).Seconds()
+		return res
+	}
+
+	as := rexec.AgentSpec{Kind: t.Kind, Name: t.Agent}
 	if t.Kind == rexec.LLM {
 		if c, ok := r.File.Commands.Cmds["agent_"+t.Agent]; ok {
 			as.Command = commandArgv(c)
@@ -302,6 +314,7 @@ func (r *Runner) once(ctx context.Context, t *trial) Result {
 	if err := r.Exec.Prepare(ctx, env); err != nil {
 		return finish(err)
 	}
+	prepared = true
 	if err := r.Exec.RunAgent(ctx, env, as); err != nil {
 		return finish(err)
 	}
