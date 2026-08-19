@@ -37,6 +37,11 @@ var categoryOf = map[Code]Category{
 
 func (c Code) Category() Category { return categoryOf[c] }
 
+// Known reports whether this is a code the taxonomy defines. An adapter that
+// reports something else has a bug or a typo, and guessing what it meant would
+// put an unmeasured trial in the agent's denominator.
+func (c Code) Known() bool { _, ok := categoryOf[c]; return ok }
+
 // CountsAgainstAgent reports whether a trial with this outcome belongs in the
 // denominator when judging an agent. Infrastructure trouble does not.
 func (c Code) CountsAgainstAgent() bool { return c.Category() == Agent }

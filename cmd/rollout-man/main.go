@@ -43,7 +43,7 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `rollout-man
 
-  run    <file.yaml> [--runs DIR] [--id NAME] [--executor docker|local|auto]
+  run    <file.yaml> [--runs DIR] [--id NAME] [--executor harbor|local|auto]
          orchestrate, execute, record. Re-running the same id resumes: trials
          already in results.jsonl are not repeated.
 
@@ -88,15 +88,44 @@ func runsRoot(v string) string {
 func build(f *config.File, executor string) (*cmdrun.Runner, rexec.Executor, error) {
 	cmds := cmdrun.New(f.Commands)
 	cmds.Log = logf
-	ex, err := rexec.Pick(executor)
+	ex, err := pick(executor, cmds)
 	return cmds, ex, err
+}
+
+// pick resolves --executor. Anything other than "local" names a configured
+// command, because running a case is Harbor's job and reaching it is a command
+// like any other external system. "auto" prefers the command named "harbor"
+// when the submission declares one.
+func pick(name string, cmds *cmdrun.Runner) (rexec.Executor, error) {
+	switch name {
+	case "local":
+		return &rexec.Local{}, nil
+	case "", "auto":
+		if cmds.Has("harbor") {
+			return harbor("harbor", cmds), nil
+		}
+		return &rexec.Local{}, nil
+	}
+	if !cmds.Has(name) {
+		return nil, fmt.Errorf("--executor %s: no command named %q is configured "+
+			"(declare it under `kind: Commands`, or use --executor local)", name, name)
+	}
+	return harbor(name, cmds), nil
+}
+
+func harbor(name string, cmds *cmdrun.Runner) rexec.Executor {
+	return &rexec.Harbor{Cmd: name, Run: func(ctx context.Context, n string,
+		vars map[string]string, timeout time.Duration) error {
+		_, err := cmds.RunOnce(ctx, n, vars, timeout)
+		return err
+	}}
 }
 
 func cmdRun(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	runs := fs.String("runs", "", "directory holding runs (default ./runs)")
 	id := fs.String("id", "", "run id (default: experiment name + timestamp)")
-	executor := fs.String("executor", "auto", "docker | local | auto")
+	executor := fs.String("executor", "auto", "name of the configured trial command (e.g. harbor) | local | auto")
 	if len(args) == 0 {
 		usage()
 	}

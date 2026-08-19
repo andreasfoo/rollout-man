@@ -1,0 +1,41 @@
+# Running a case is Harbor's job. rollout-man reaches it the same way it reaches
+# every other external system: a command the operator configures.
+#
+# Here that command is a stand-in (test/smoke/fake-harbor.sh) so the smoke test
+# needs no Harbor and no daemon. Swap in the real invocation and nothing else in
+# this file changes.
+---
+kind: Commands
+timeout: 10m
+
+harbor:
+  script: test/smoke/fake-harbor.sh
+
+---
+kind: Experiment
+name: harbor
+
+case_defaults:
+  source: local
+
+cases:
+  - path: test/smoke/harbor-case
+
+matrix:
+  agents: [oracle, nop]
+  trials: 1
+
+concurrency: 2
+max_attempts: 1
+
+pipeline:
+  per_case:
+    admission:
+      require: admitted
+      oracle_min_reward: 1.0
+      nop_max_reward: 0.0
+      trials: 1
+  per_trial:
+    redact:
+      keys: required
+      ips: {traj: true, logs: false}

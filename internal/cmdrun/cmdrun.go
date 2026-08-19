@@ -56,7 +56,7 @@ func (r *Runner) Run(ctx context.Context, name string, vars map[string]string) (
 	}
 	var last error
 	for attempt := 1; attempt <= r.MaxAttempts; attempt++ {
-		res, err := r.once(ctx, name, c, vars)
+		res, err := r.once(ctx, name, c, vars, r.Timeout)
 		if err == nil {
 			return res, nil
 		}
@@ -72,8 +72,23 @@ func (r *Runner) Run(ctx context.Context, name string, vars map[string]string) (
 	return Result{}, fmt.Errorf("command %s failed after %d attempts: %w", name, r.MaxAttempts, last)
 }
 
-func (r *Runner) once(ctx context.Context, name string, c config.Command, vars map[string]string) (Result, error) {
-	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
+// RunOnce executes the named command exactly once, with its own timeout. A
+// trial goes through here rather than Run: retrying is the runner's decision,
+// made from the failure code, and a silent retry inside the adapter would run
+// the agent twice and report it once.
+func (r *Runner) RunOnce(ctx context.Context, name string, vars map[string]string, timeout time.Duration) (Result, error) {
+	c, ok := r.Cmds[name]
+	if !ok || c.Empty() {
+		return Result{}, fmt.Errorf("command %q is not configured", name)
+	}
+	if timeout <= 0 {
+		timeout = r.Timeout
+	}
+	return r.once(ctx, name, c, vars, timeout)
+}
+
+func (r *Runner) once(ctx context.Context, name string, c config.Command, vars map[string]string, timeout time.Duration) (Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var cmd *exec.Cmd
@@ -91,6 +106,10 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 	default:
 		cmd = exec.CommandContext(ctx, shell(), "-c", c.Script)
 	}
+	// The host environment is inherited on purpose: this is the operator's own
+	// command (harbor, rclone, git) and it needs DOCKER_HOST, HOME, PATH and
+	// its own credentials. Untrusted case scripts are the ones that must not
+	// see it, and those never run here.
 	cmd.Env = append(os.Environ(), envPairs(vars)...)
 
 	var out, errb bytes.Buffer

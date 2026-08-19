@@ -113,46 +113,40 @@ echo "$FRES" | sed 's/^/    /'
 # 1 scored + 2 agent failures = 3. The environment and the verifier are ours.
 check "only the agent's own failures are in the denominator" 'echo "$FRES" | grep -q "1/3 = 33%"'
 
-step "9. the docker executor: one container per trial"
-# The Harbor contract splits the trial in two -- the agent leaves a file in
-# /app, the verifier reads it back -- so the two steps have to see the same
-# filesystem. Running them as two `docker run --rm` invocations scores every
-# agent zero, silently and plausibly. This step exists to catch that.
-if ! docker info >/dev/null 2>&1; then
-  skip "docker executor (no docker daemon on this host)"
-else
-  BASE=${RM_SMOKE_BASE:-}
-  if [ -z "$BASE" ]; then
-    if docker pull -q debian:bookworm-slim >/dev/null 2>&1; then
-      BASE=debian:bookworm-slim
-    else
-      # No registry reachable: build a base out of the host's own bash and
-      # coreutils rather than skip the step and call the run green.
-      BASE=$(bash test/smoke/make-base-image.sh) || BASE=""
-    fi
-  fi
-  if [ -z "$BASE" ]; then
-    skip "docker executor (no usable base image)"
-  else
-    CASE_DIR="$RUNS/docker-case"
-    rm -rf "$CASE_DIR"; mkdir -p "$RUNS"; cp -r test/smoke/docker-case "$CASE_DIR"
-    sed -i "s|^FROM .*|FROM $BASE|" "$CASE_DIR/environment/Dockerfile"
-    sed "s|path: test/smoke/docker-case|path: $CASE_DIR|" test/smoke/docker.yaml > "$RUNS/docker.yaml"
-    DOUT=$("$BIN" run "$RUNS/docker.yaml" --runs "$RUNS" --id docker --executor docker 2>&1)
-    DDIR="$RUNS/docker"
-    echo "$DOUT" | grep -E 'want|matrix|reward' | sed 's/^/    /'
-    # the trial id is a slug of the case path, so match on it rather than spell it
-    DT=$(ls -d "$DDIR"/trials/*docker-case-oracle-1/out)
-    check "the gate ran both probes in containers" '[ "$(echo "$DOUT" | grep -c "want.*-> PASS")" -eq 2 ]'
-    check "oracle scores 1.00 under docker"        'echo "$DOUT" | grep -q "oracle \[1\] want >= 1.00 -> PASS"'
-    check "nop scores 0.00 under docker"           'echo "$DOUT" | grep -q "nop \[0\] want <= 0.00 -> PASS"'
-    check "the deliverable survived into the verifier" 'grep -q "deliverable survived" "$DT/verifier.stdout.log"'
-    check "the score came from inside the container"   '[ "$(cat "$DT/reward.txt")" = "1.0" ]'
-    check "agent and verifier ran as different users"  'grep -q "verifier ran as root" "$DT/verifier.log"'
-    check "no container was left behind" '[ -z "$(docker ps -aq --filter name=^rm-)" ]'
-    check "no case image was left behind" '[ -z "$(docker images -q "rollout-man/case")" ]'
-  fi
-fi
+step "9. the trial adapter: rollout-man asks for a number, it does not run containers"
+# Building the image, starting it, running the agent inside it and running the
+# verifier are Harbor's job. rollout-man reaches Harbor the way it reaches every
+# other external system -- a configured command -- so this step runs against a
+# stand-in adapter and needs no Harbor and no daemon.
+HOUT=$("$BIN" run test/smoke/harbor.yaml --runs "$RUNS" --id harbor 2>&1)
+HDIR="$RUNS/harbor"
+echo "$HOUT" | grep -E 'want|matrix|reward' | sed 's/^/    /'
+HT="$HDIR/trials/test-smoke-harbor-case-oracle-1/out"
+check "--executor auto found the configured command" 'echo "$HOUT" | grep -q "(harbor executor)"'
+check "the gate ran both probes through the adapter" '[ "$(echo "$HOUT" | grep -c "want.*-> PASS")" -eq 2 ]'
+check "oracle scores 1.00 through the adapter" 'echo "$HOUT" | grep -q "oracle \[1\] want >= 1.00 -> PASS"'
+check "nop scores 0.00 through the adapter"    'echo "$HOUT" | grep -q "nop \[0\] want <= 0.00 -> PASS"'
+check "the score came from the adapter, not from us" '[ "$(cat "$HT/reward.txt")" = "1.0" ]'
+check "artifacts came back from the adapter"    'grep -q "deliverable survived" "$HT/verifier.stdout.log"'
+# Every limit task.toml declares has to reach the adapter: it is the only thing
+# that can actually enforce them, because it is the thing that started the case.
+check "the case's limits reached the adapter" \
+  'grep -q "^AGENT_TIMEOUT_SEC=120$" "$HT/adapter-env.txt" &&
+   grep -q "^VERIFIER_USER=root$"    "$HT/adapter-env.txt" &&
+   grep -q "^MEMORY_MB=512$"         "$HT/adapter-env.txt" &&
+   grep -q "^ALLOW_INTERNET=0$"      "$HT/adapter-env.txt"'
+
+# An adapter that knows why it failed says so, and the code passes through.
+HF=$(FAKE_HARBOR_FAIL=declared "$BIN" run test/smoke/harbor.yaml --runs "$RUNS" --id harbor-f1 2>&1)
+echo "$HF" | grep -E 'could not run' | sed 's/^/    /'
+check "a declared failure code passes through" 'echo "$HF" | grep -q "AGENT_TIMEOUT: the agent outran its clock"'
+# An adapter that just dies must not be read as the agent failing. "Could not
+# measure" is ours, and putting it in the agent's denominator corrupts the number.
+HS=$(FAKE_HARBOR_FAIL=silent "$BIN" run test/smoke/harbor.yaml --runs "$RUNS" --id harbor-f2 2>&1)
+echo "$HS" | grep -E 'could not run' | sed 's/^/    /'
+check "an adapter that dies silently is ENV_FAILED, not AGENT_*" \
+  'echo "$HS" | grep -q "ENV_FAILED" && ! echo "$HS" | grep -q "AGENT_"'
+check "the gate refused rather than scoring the case" '[ ! -f "$RUNS/harbor-f1/results.jsonl" ]'
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

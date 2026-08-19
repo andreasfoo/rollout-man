@@ -1837,21 +1837,40 @@ Temporal Web UI 直接提供 per-trial timeline，[P2] 自建 UI 的范围相应
 - **多人共享结果时加回数据库** —— 一个人看 `results.jsonl` 够用，十个人并发查不够
 - **产物要发给团队外时加回 bundle / 批量上传** —— 那时才会撞上远端后端的按次限流
 
-### 15.0.1 第二波：先补能出正确数字的路径
+### 15.0.1 第二波：把「怎么运行」还给 Harbor，并补齐失败路径
 
-瘦身之后从 smoke test 找不足，找到的三条都不在编排层：
+瘦身之后从 smoke test 找不足，找到的最大一条不是缺功能，是**越界**：MVP 里手写了一个 docker executor（build / run / exec / cp / rmi），而 §1.3 写得很清楚 —— **不重新实现 Docker runtime**，§1.2 也写着 **Harbor 回答「怎么运行」**。手写的那份不但越界，还从来没被执行过，藏着两个叠加的 bug（agent 与 verifier 是两次 `docker run --rm`，容器连同 `/app` 里的交付物一起被丢掉；reward 又从宿主机路径读，而真实 case 写的是容器内的 `/logs/verifier/reward.txt`），表现是**每个 agent 都得 0 分且没有报错**。
 
-| 缺口 | 事实 | 处置 |
-|---|---|---|
-| **docker executor 从未被执行过** | agent 与 verifier 是两次 `docker run --rm`，中间容器连同 `/app/crash.bin` 一起被丢掉；reward 又从宿主机的 `workdir/state/reward.txt` 读，而真实 case 写的是容器内的 `/logs/verifier/reward.txt`。两个 bug 叠加的表现是**每个 agent 都得 0 分**，而且看不出异常 | 已修：**一个 trial 一个容器**，agent 与 verifier 都用 `docker exec` 进同一个容器；分数从容器内的合同路径读出 |
-| **六个失败码在测试里出现次数为 0**，`max_attempts` 的重试分支从未执行 | 分类法唯一的作用是护住分母，而这件事没有任何测试证明 | 已补：五个合成 case 各制造一种失败，外加一个"第一次失败第二次成功"的 case；断言直接落在 `1/3 = 33%` 这个分母上 |
-| **超时只结束等待，不结束 agent** | `CommandContext` 只杀 `unshare` 自己，子进程还在写管道，`CombinedOutput` 于是一直等到 agent 自然结束 —— 2 秒的 agent timeout 实际花了 30 秒 | 已修：local 走 `Setpgid` + `kill(-pgid)`；docker 走容器内的 `timeout(1)`（杀宿主机上的 `docker exec` 客户端不会动容器里的进程） |
+处置：删掉整个 docker executor，执行改成**一条可配置的命令**，和 §9.4 的存储适配器同一个模式 —— 我们不管理外部系统，只声明契约。
 
-**为什么这一波不是 Temporal。** Temporal 能保证的是"崩溃后从断点续跑"，而现在的断点粒度是**整个 trial**：worker 一死，前台起的容器跟着没了，续跑只能从头再跑这个 trial。真实 case 的 `agent_timeout=1h`、`build_timeout=90min`，代价是最多一个半小时。要把这个代价降下来，需要的是**容器重连**。容器现在已经是 `docker run -d` 起的（一个 trial 一个容器的直接后果），剩下的只是把容器名记进检查点、重启后先认领再决定跑不跑 —— 那是 executor 的能力，几十行，和用什么编排器无关。在 detach 之前引入 Temporal，是给一条还不能续跑的执行链套一个能续跑的编排器。
+```
+in    CASE_DIR OUT_DIR TRIAL_ID AGENT_KIND AGENT_NAME AGENT_COMMAND
+      AGENT_USER VERIFIER_USER AGENT_TIMEOUT_SEC VERIFIER_TIMEOUT_SEC
+      BUILD_TIMEOUT_SEC CPUS MEMORY_MB STORAGE_MB GPUS ALLOW_INTERNET
+      LLM_BASE_URL LLM_MODEL LLM_API_KEY
+out   $OUT_DIR/reward.txt    分数，也是「测出来了」的唯一含义
+      $OUT_DIR/failure.txt   首行失败码，其余为说明
+      $OUT_DIR/*             要留下的产物
+```
 
-§15.0 里"placement 落地时加回 Temporal"的判据不变。下一步是 **detach + 重连**，之后才轮到它。
+三条设计决定值得记下来：
 
-这一波的代价：Go 代码 +125 行，依赖不变（仍是 yaml + toml），smoke test 从 28 条断言涨到 46 条。
+1. **task.toml 声明的每一个限额都要交出去**。能真正停住一个跑起来的 agent 的，只有启动它的那个东西 —— 超时必须由适配器执行，我们这边的时钟只做兜底（`build + agent + verifier + 5min`）。上一版 local executor 的 bug 正是这条的反例：`CommandContext` 只杀 `unshare` 自己，子进程还在写管道，2 秒的 agent timeout 实际花了 30 秒（已改为 `Setpgid` + `kill(-pgid)`）。
+2. **回读按证据的具体程度排序**：声明的失败码 > 一个数 > 退出码。
+3. **适配器死了又没说为什么，判 `ENV_FAILED`，绝不判成 agent 的失败**。「没测出来」是我们的问题，混进 agent 的分母会安静地把数字弄脏 —— 这正是分类法存在的唯一理由。
+
+另外补齐的两块：
+
+| 缺口 | 处置 |
+|---|---|
+| 六个失败码在测试里出现次数为 0，`max_attempts` 的重试分支从未执行 | 五个合成 case 各制造一种失败，外加一个「第一次失败第二次成功」的 case；断言直接落在分母上（`1/3 = 33%`） |
+| 产物只在成功路径上收集与清洗 | 移到每一条退出路径 —— 失败的 trial 最需要能读，也最可能带着 key |
+
+`local` executor 保留，但定位写清楚了：它是**测试夹具，不是运行时**，存在的理由是让编排层在没有 Harbor、没有 daemon 的机器上也能被完整跑一遍。
+
+**为什么这一波仍然不是 Temporal。** Temporal 保证的是「崩溃后从断点续跑」，而现在的断点粒度是**整个 trial**。而且执行已经不在我们进程里了 —— 容器由 Harbor 起，续跑要靠的是**向 Harbor 认领一个还活着的 trial**（把适配器返回的 trial 句柄记进检查点，重启后先问一句再决定跑不跑），那是**契约问题**，不是编排器问题。§15.0 里"placement 落地时加回 Temporal"的判据不变。
+
+这一波的净效果：删掉手写的 docker runtime，Go 代码基本持平，依赖不变（yaml + toml），smoke test 从 28 条断言涨到 48 条。
 
 ### 15.1 分级总表（目标架构）
 
