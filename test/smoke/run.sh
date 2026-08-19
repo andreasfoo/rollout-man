@@ -148,5 +148,26 @@ check "an adapter that dies silently is ENV_FAILED, not AGENT_*" \
   'echo "$HS" | grep -q "ENV_FAILED" && ! echo "$HS" | grep -q "AGENT_"'
 check "the gate refused rather than scoring the case" '[ ! -f "$RUNS/harbor-f1/results.jsonl" ]'
 
+step "10. the real thing: rollout-man orchestrating, Harbor executing"
+# Everything above proves the orchestration. This proves the seam: the same
+# submission, the same gate, the same numbers -- but the trial actually runs
+# through `harbor run`, in a container Harbor built.
+if ! command -v harbor >/dev/null 2>&1; then
+  skip "Harbor executor (harbor not installed -- pip install harbor)"
+elif ! docker info >/dev/null 2>&1; then
+  skip "Harbor executor (no docker daemon on this host)"
+else
+  ROUT=$("$BIN" run test/smoke/harbor-real.yaml --runs "$RUNS" --id harbor-real 2>&1)
+  RDIR="$RUNS/harbor-real"
+  echo "$ROUT" | grep -E 'want|matrix|reward' | sed 's/^/    /'
+  RT="$RDIR/trials/test-smoke-harbor-case-oracle-1/out"
+  check "the gate ran both probes through Harbor" '[ "$(echo "$ROUT" | grep -c "want.*-> PASS")" -eq 2 ]'
+  check "oracle scores 1.00 through Harbor" 'echo "$ROUT" | grep -q "oracle \[1\] want >= 1.00 -> PASS"'
+  check "nop scores 0.00 through Harbor"    'echo "$ROUT" | grep -q "nop \[0\] want <= 0.00 -> PASS"'
+  check "two trials recorded"               '[ "$(wc -l < "$RDIR/results.jsonl")" -eq 2 ]'
+  check "the score came out of Harbor's own reward file" '[ "$(cat "$RT/reward.txt")" = "1.0" ]'
+  check "Harbor's trial log came back"      '[ -s "$RT/trial.log" ]'
+fi
+
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
