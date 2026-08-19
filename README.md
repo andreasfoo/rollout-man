@@ -237,7 +237,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 54 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 61 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 
@@ -254,11 +254,16 @@ two things worth naming:
   through, and an adapter that dies silently is `ENV_FAILED` rather than
   anything that would count against the agent.
 - **the real seam** — the same submission and the same gate, but the trial runs
-  through `harbor run` in a container Harbor built. Reports `SKIP` when `harbor`
-  or the daemon is missing, and the summary counts skips separately.
+  through `harbor run` in a container Harbor built.
+- **a real Harbor security case** — libaom's AV1 entropy-decoder
+  heap-buffer-overflow, oracle to 1.0 and nop to 0.0, asserted down to the ASan
+  report and the crashing frame the case names. Nothing here can be satisfied by
+  a plausible-looking artifact: the verifier scores from its own gdb backtrace,
+  so the deliverable has to actually crash the target.
 
-Steps 1–9 need `CAP_SYS_ADMIN` for the mount namespace and nothing else. Step 10
-needs `harbor` and Docker.
+Steps 1–9 need `CAP_SYS_ADMIN` for the mount namespace and nothing else. Steps
+10–11 need `harbor` and Docker, and report `SKIP` without them — the summary
+counts skips separately, so a skipped step never reads as a passing one.
 
 ## Scope
 

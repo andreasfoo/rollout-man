@@ -3,14 +3,11 @@
 # Docker daemon; without them the oracle cannot score and the admission gate
 # must refuse the case rather than emit numbers.
 #
-# Neither case is admissible as it stands, and both refusals are correct:
-#
-#   libaom        solution/testcase.bin is a Git LFS pointer (size 194) whose
-#                 object 404s on the server. The oracle gets 128 bytes of
-#                 pointer text instead of the PoC, the target exits normally,
-#                 and the case scores 0. Fix: push the LFS object.
-#   spidermonkey  its base images (cyborgzero/sm-srcbase + sm-base) are tens of
-#                 GB; a machine that cannot hold them cannot measure this case.
+# libaom is measurable: its oracle reproduces the ASan heap-buffer-overflow in
+# od_ec_dec_refill and scores 1.0. spidermonkey needs tens of GB of base image,
+# so a machine that cannot hold them cannot measure it -- and the admission gate
+# will refuse the case rather than report the oracle's 0 as a measurement.
+# test/smoke/libaom.yaml runs only the first one.
 ---
 kind: Commands
 timeout: 120m

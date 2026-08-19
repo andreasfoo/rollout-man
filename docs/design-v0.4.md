@@ -1870,7 +1870,7 @@ out   $OUT_DIR/reward.txt    分数，也是「测出来了」的唯一含义
 
 **为什么这一波仍然不是 Temporal。** Temporal 保证的是「崩溃后从断点续跑」，而现在的断点粒度是**整个 trial**。而且执行已经不在我们进程里了 —— 容器由 Harbor 起，续跑要靠的是**向 Harbor 认领一个还活着的 trial**（把适配器返回的 trial 句柄记进检查点，重启后先问一句再决定跑不跑），那是**契约问题**，不是编排器问题。§15.0 里"placement 落地时加回 Temporal"的判据不变。
 
-这一波的净效果：删掉手写的 docker runtime，Go 代码基本持平，依赖不变（yaml + toml），smoke test 从 28 条断言涨到 54 条。
+这一波的净效果：删掉手写的 docker runtime，Go 代码基本持平，依赖不变（yaml + toml），smoke test 从 28 条断言涨到 61 条。
 
 #### 接上真实的 Harbor（已验证）
 
@@ -1883,7 +1883,9 @@ Harbor 是 `pip install harbor`（Terminal-Bench 团队），CLI 是 `harbor run
 
 顺带修了一个真实布局才暴露的 bug：清洗只 glob 了产物目录的第一层，而 Harbor 会留下 `agent/` 子目录。改成 `WalkDir` 递归 —— 「产物因为多了一层就没被清洗」是这里唯一不能出的错。
 
-**同时发现 `test/cases/libaom-...` 这个 case 在本仓库是坏的**：`solution/testcase.bin` 是一个 Git LFS 指针（`size 194`），而 LFS 对象在服务端 404 —— 指针提交了，二进制没推上去。oracle 拿到的是 128 字节的指针文本而不是 194 字节的 PoC，目标进程正常退出，得 0 分。**准入闸门做了它该做的事：拒绝这个 case，而不是把 0 分当成一次测量报出去。** 修法是把 LFS 对象推上去（或直接提交二进制）。
+**顺便查出 `test/cases/libaom-...` 这个 case 当时是坏的**：`solution/testcase.bin` 是一个 Git LFS 指针（`size 194`），而 LFS 对象在服务端 404 —— 指针提交了，二进制没推上去。oracle 拿到的是 128 字节的指针文本而不是 194 字节的 PoC，目标进程正常退出，得 0 分。**准入闸门做了它该做的事：拒绝这个 case，而不是把 0 分当成一次测量报出去。**
+
+二进制补上之后复跑，case 通过准入，oracle 1.000 / nop 0.000，`AddressSanitizer: heap-buffer-overflow` 落在 `od_ec_dec_refill (aom_dsp/entdec.c:94)` —— 正是 case 自己 README 里写的那一帧，verifier 六项 check 全过。这条现在是 smoke test 的第 11 步，断言一直下到 ASan 报文和崩溃帧：**一个看起来像那么回事的产物满足不了它**。
 
 spidermonkey 那个 case 在本机同样测不了，但原因不同：它的 base image（`cyborgzero/sm-srcbase` + `sm-base`）是几十 GB，超出本会话的磁盘配额。这是环境限制，不是 case 的问题 —— 但结论一样：**装不下就测不了，测不了就不该出数字**。
 

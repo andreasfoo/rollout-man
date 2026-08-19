@@ -169,5 +169,28 @@ else
   check "Harbor's trial log came back"      '[ -s "$RT/trial.log" ]'
 fi
 
+step "11. a real Harbor security case, end to end"
+# The synthetic case above proves the seam. This proves the whole thing: a real
+# case, a real ASan crash, and a verifier that scores from its own gdb
+# backtrace -- nothing here can be satisfied by a plausible-looking artifact.
+if ! command -v harbor >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  skip "real Harbor case (needs harbor + docker)"
+elif [ ! -s test/cases/libaom-cc9e46cb-bug-6491968-t4/solution/testcase.bin ]; then
+  skip "real Harbor case (the case ships no PoC)"
+else
+  LOUT=$("$BIN" run test/smoke/libaom.yaml --runs "$RUNS" --id libaom 2>&1)
+  LDIR="$RUNS/libaom"
+  echo "$LOUT" | grep -E 'want|reward' | sed 's/^/    /'
+  LT="$LDIR/trials/test-cases-libaom-cc9e46cb-bug-6491968-t4-oracle-1/out"
+  check "the case is admitted"        '! echo "$LOUT" | grep -q CASE_NOT_ADMITTED'
+  check "oracle scores 1.00"          'echo "$LOUT" | grep -q "oracle \[1\] want >= 1.00 -> PASS"'
+  check "nop scores 0.00"             'echo "$LOUT" | grep -q "nop \[0\] want <= 0.00 -> PASS"'
+  # The score has to come from the defect, not from the file merely existing.
+  check "the reward is a real ASan crash" 'grep -q "AddressSanitizer: heap-buffer-overflow" "$LT/stdout.log"'
+  check "in the frame the case names"     'grep -q "od_ec_dec_refill" "$LT/stdout.log"'
+  check "no verifier check failed"           '! grep -q "^FAIL (+" "$LT/stdout.log"'
+  check "the verifier scored it a full 1.00" 'grep -q "^FINAL SCORE: 1.00" "$LT/stdout.log"'
+fi
+
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
