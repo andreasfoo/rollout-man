@@ -1,10 +1,23 @@
-# The two shipped Harbor cases. Their environments are prebuilt ASan images on
-# DockerHub, so measuring them needs a Docker daemon; without one the oracle
-# cannot score and the admission gate must refuse the case.
+# The two shipped Harbor cases, run through Harbor itself. Their environments
+# are prebuilt ASan images on DockerHub, so measuring them needs `harbor` and a
+# Docker daemon; without them the oracle cannot score and the admission gate
+# must refuse the case rather than emit numbers.
+#
+# Neither case is admissible as it stands, and both refusals are correct:
+#
+#   libaom        solution/testcase.bin is a Git LFS pointer (size 194) whose
+#                 object 404s on the server. The oracle gets 128 bytes of
+#                 pointer text instead of the PoC, the target exits normally,
+#                 and the case scores 0. Fix: push the LFS object.
+#   spidermonkey  its base images (cyborgzero/sm-srcbase + sm-base) are tens of
+#                 GB; a machine that cannot hold them cannot measure this case.
 ---
 kind: Commands
-timeout: 30m
+timeout: 120m
 max_attempts: 1
+
+harbor:
+  script: adapters/harbor.sh
 
 ---
 kind: Experiment

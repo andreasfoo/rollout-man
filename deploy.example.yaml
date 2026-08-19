@@ -18,21 +18,13 @@ max_attempts: 3
 #        $OUT_DIR/*            artifacts to keep (traj.jsonl, agent.log, ...)
 #
 # Exit non-zero without failure.txt and the trial is ENV_FAILED: "could not
-# measure" is ours, and it must never land in the agent's denominator. Fill in
-# your own Harbor invocation; the flags below are a sketch, not a contract.
+# measure" is ours, and it must never land in the agent's denominator.
+#
+# adapters/harbor.sh is a working implementation over `harbor run`. It maps
+# Harbor's exception types onto the taxonomy and lets Harbor enforce every
+# timeout and resource limit the case's task.toml declares.
 harbor:
-  script: |
-    set -uo pipefail
-    harbor run \
-      --case      "$CASE_DIR" \
-      --agent     "$AGENT_NAME" \
-      --output    "$OUT_DIR" \
-      --timeout   "$AGENT_TIMEOUT_SEC" \
-      --cpus      "$CPUS" \
-      --memory-mb "$MEMORY_MB"
-    rc=$?
-    [ "$rc" -eq 0 ] || printf 'ENV_FAILED\nharbor run exited %s\n' "$rc" > "$OUT_DIR/failure.txt"
-    exit "$rc"
+  script: adapters/harbor.sh
 
 source_git:
   script: |

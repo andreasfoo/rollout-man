@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -341,19 +342,29 @@ func (r *Runner) scrub(dir string, rc *config.Redact, secrets []string) (redact.
 		redact.Debug:         rc.IPs["logs"],
 	})
 	var total redact.Hits
-	files, _ := filepath.Glob(filepath.Join(dir, "*"))
-	for _, p := range files {
+	// Walk, not glob: an adapter is free to leave a directory of trajectories,
+	// and the one thing that must not happen is artifacts shipping unscrubbed
+	// because they were one level deeper than we looked.
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
 		class := redact.Debug
-		if c, ok := distributable[filepath.Base(p)]; ok {
+		if c, ok := distributable[d.Name()]; ok {
 			class = c
 		}
-		h, err := s.ScrubFile(p, class)
-		if err != nil {
-			return total, fail.Wrap(fail.RedactFailed, "scrub "+filepath.Base(p), err)
+		h, serr := s.ScrubFile(p, class)
+		if serr != nil {
+			rel, _ := filepath.Rel(dir, p)
+			return fail.Wrap(fail.RedactFailed, "scrub "+rel, serr)
 		}
 		total.Exact += h.Exact
 		total.Pattern += h.Pattern
 		total.IP += h.IP
+		return nil
+	})
+	if err != nil {
+		return total, err
 	}
 	return total, nil
 }

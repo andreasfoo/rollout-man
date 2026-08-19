@@ -1,0 +1,41 @@
+# The real thing: rollout-man orchestrating, Harbor executing.
+#
+# Needs `harbor` (pip install harbor) and a working Docker daemon. Everything
+# about how a trial runs -- the image, the container, the agent, the verifier,
+# every timeout in task.toml -- belongs to Harbor. This file only says what to
+# run and what has to be true of the numbers.
+---
+kind: Commands
+timeout: 60m
+
+harbor:
+  script: adapters/harbor.sh
+
+---
+kind: Experiment
+name: harbor-real
+
+case_defaults:
+  source: local
+
+cases:
+  - path: test/smoke/harbor-case
+
+matrix:
+  agents: [oracle, nop]
+  trials: 1
+
+concurrency: 2
+max_attempts: 1
+
+pipeline:
+  per_case:
+    admission:
+      require: admitted
+      oracle_min_reward: 1.0
+      nop_max_reward: 0.0
+      trials: 1
+  per_trial:
+    redact:
+      keys: required
+      ips: {traj: true, logs: false}

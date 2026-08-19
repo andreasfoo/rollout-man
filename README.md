@@ -202,8 +202,19 @@ in the agent's denominator corrupts the number quietly.
 `--executor` names the command (`--executor harbor`); `auto` picks up a command
 named `harbor` if the submission declares one.
 
-`test/smoke/fake-harbor.sh` is a working stand-in and doubles as the reference
-adapter — it is what the contract looks like when you write it out.
+```bash
+pip install harbor        # or: uv tool install harbor
+rollout-man run experiment.yaml     # --executor auto finds the harbor command
+```
+
+`adapters/harbor.sh` is the real one, over `harbor run`. It lets Harbor enforce
+every timeout and resource limit `task.toml` declares, and maps Harbor's
+exception types onto the taxonomy — `AgentTimeoutError` and
+`NonZeroAgentExitCodeError` are the agent's, a sandbox that would not build or a
+verifier that produced no number are not.
+
+`test/smoke/fake-harbor.sh` is a stand-in used by the smoke test so it can run
+with no Harbor and no daemon.
 
 ## The local executor
 
@@ -226,7 +237,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 48 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 54 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 
@@ -242,9 +253,12 @@ two things worth naming:
   the score and artifacts come back from it, a declared failure code passes
   through, and an adapter that dies silently is `ENV_FAILED` rather than
   anything that would count against the agent.
+- **the real seam** — the same submission and the same gate, but the trial runs
+  through `harbor run` in a container Harbor built. Reports `SKIP` when `harbor`
+  or the daemon is missing, and the summary counts skips separately.
 
-Both need `CAP_SYS_ADMIN` for the mount namespace. Neither needs Harbor or
-Docker.
+Steps 1–9 need `CAP_SYS_ADMIN` for the mount namespace and nothing else. Step 10
+needs `harbor` and Docker.
 
 ## Scope
 
