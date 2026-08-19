@@ -459,20 +459,27 @@ func (r *Runner) resolveLLM(ctx context.Context, name string) (*rexec.LLMEnv, er
 	if !ok {
 		return nil, fail.New(fail.Host, "unknown llm_spec "+name)
 	}
-	env := &rexec.LLMEnv{BaseURL: s.BaseURL, Model: s.Model}
+	env := &rexec.LLMEnv{Provider: s.Provider, BaseURL: s.BaseURL, Model: s.Model}
 	switch {
 	case s.APIKeyEnv != "":
 		env.APIKey = os.Getenv(s.APIKeyEnv)
 		if env.APIKey == "" {
-			return nil, fail.New(fail.Host,
+			// Not HOST_ERROR: an unset variable is a setup mistake, and
+			// HOST_ERROR is retryable -- retrying would burn every attempt
+			// waiting for an environment that is not going to change.
+			return nil, fail.New(fail.EnvFailed,
 				"llm_spec "+name+": "+s.APIKeyEnv+" is not set here")
 		}
 	case len(s.APIKeyCmd) > 0:
 		out, err := rexec.Command(ctx, s.APIKeyCmd).Output()
 		if err != nil {
-			return nil, fail.Wrap(fail.Host, "llm_spec "+name+": api_key_cmd", err)
+			return nil, fail.Wrap(fail.EnvFailed, "llm_spec "+name+": api_key_cmd", err)
 		}
 		env.APIKey = strings.TrimSpace(string(out))
+		if env.APIKey == "" {
+			return nil, fail.New(fail.EnvFailed,
+				"llm_spec "+name+": api_key_cmd produced an empty key")
+		}
 	}
 	return env, nil
 }

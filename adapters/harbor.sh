@@ -25,10 +25,23 @@ case "$AGENT_KIND" in
   oracle) agent=(-a oracle) ;;
   nop)    agent=(-a nop) ;;
   llm)
+    # AGENT_NAME is a Harbor agent id (claude-code, codex, openhands, ...).
     agent=(-a "$AGENT_NAME")
-    [ -n "${LLM_MODEL:-}" ]    && agent+=(-m "$LLM_MODEL")
-    [ -n "${LLM_BASE_URL:-}" ] && agent+=(--ae "OPENAI_BASE_URL=$LLM_BASE_URL")
-    [ -n "${LLM_API_KEY:-}" ]  && agent+=(--ae "OPENAI_API_KEY=$LLM_API_KEY") ;;
+    [ -n "${LLM_MODEL:-}" ] && agent+=(-m "$LLM_MODEL")
+    # Which env var the key belongs in is the provider's business, not ours.
+    case "${LLM_PROVIDER:-openai}" in
+      anthropic) key_var=ANTHROPIC_API_KEY; url_var=ANTHROPIC_BASE_URL ;;
+      google|gemini) key_var=GEMINI_API_KEY; url_var=GOOGLE_GEMINI_BASE_URL ;;
+      *) key_var=OPENAI_API_KEY; url_var=OPENAI_BASE_URL ;;
+    esac
+    [ -n "${LLM_BASE_URL:-}" ] && agent+=(--ae "$url_var=$LLM_BASE_URL")
+    if [ -n "${LLM_API_KEY:-}" ]; then
+      agent+=(--ae "$key_var=$LLM_API_KEY")
+    else
+      # Fail here rather than let Harbor start a container that cannot talk to
+      # anything: an agent with no key is a setup mistake, not a measurement.
+      fail ENV_FAILED "no API key for $AGENT_NAME (llm_spec resolved to an empty key)"
+    fi ;;
   *) fail HOST_ERROR "unknown agent kind $AGENT_KIND" ;;
 esac
 

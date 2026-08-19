@@ -1,0 +1,8 @@
+{
+  "agent": "oracle",
+  "case": "test/cases/libaom-cc9e46cb-bug-6491968-t4",
+  "case_sha256": "3ab3f15bb1967ccf351c2c95d040c12c02ec4fa2c52898d6832c22e4f586602a",
+  "llm_spec": "",
+  "reward": 1,
+  "trial_id": "test-cases-libaom-cc9e46cb-bug-6491968-t4-oracle-1"
+}

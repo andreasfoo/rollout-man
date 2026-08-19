@@ -64,11 +64,13 @@ func (h *Harbor) Trial(ctx context.Context, env *CaseEnv, a AgentSpec) (float64,
 		"Gpus":               strconv.Itoa(c.Resources.GPUs),
 		"AllowInternet":      boolStr(c.AllowInternet),
 
-		"LlmBaseUrl": "",
-		"LlmModel":   "",
-		"LlmApiKey":  "",
+		"LlmProvider": "",
+		"LlmBaseUrl":  "",
+		"LlmModel":    "",
+		"LlmApiKey":   "",
 	}
 	if a.LLM != nil {
+		vars["LlmProvider"] = a.LLM.Provider
 		vars["LlmBaseUrl"], vars["LlmModel"], vars["LlmApiKey"] = a.LLM.BaseURL, a.LLM.Model, a.LLM.APIKey
 	}
 
