@@ -15,7 +15,13 @@ cases:
   - path: test/smoke/slow-case
 
 matrix:
-  agents: [oracle]
+  # Two rollouts of a deterministic agent, on purpose: this test needs a second
+  # trial to be interrupted during, and the identical result is the point --
+  # resuming must not re-run the first one. Deterministic agents run once by
+  # default, so it says so explicitly rather than relying on the old behaviour.
+  agents:
+    - name: oracle
+      trials: 2
   trials: 2
 
 concurrency: 1

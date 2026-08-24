@@ -26,11 +26,14 @@ cases:
   - path: security/libaom-cc9e46cb-bug-6491968-t4
 
 matrix:
+  # Only the stochastic agent is here. oracle's job -- proving the case scores
+  # 1.0 -- belongs to the admission gate below, which already runs it; listing
+  # it here as well would re-run a deterministic script and put a column of
+  # 1.000 in the results table that says nothing.
   agents:
     - name: claude-code
       llm_spec: sonnet
-    - name: oracle
-  trials: 8                            # several rollouts per case: the point is the spread
+  trials: 8                            # rollouts per case: the point is the spread
 
 concurrency: 4
 max_attempts: 2

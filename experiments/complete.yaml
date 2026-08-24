@@ -117,12 +117,18 @@ cases:
 # resuming free.
 matrix:
   agents:
+    # trials applies to stochastic agents. The built-ins are not stochastic --
+    # oracle runs the case's own solve script, nop does nothing -- so they run
+    # once each however high trials goes, and the log says so. If all you want
+    # from oracle is "this case scores 1.0", drop it from here entirely: that
+    # is the admission gate's job and the gate already runs it.
     - name: oracle                   # built-in: runs solution/solve.sh
     - name: nop                      # built-in: does nothing
+      # trials: 3                    # per-agent override, if you really mean it
     - name: claude-code              # a Harbor agent id, passed through
       llm_spec: sonnet
   # llm_specs: [sonnet, opus]        # applies to every non-built-in agent
-  trials: 4                          # rollouts per combination
+  trials: 4                          # rollouts per stochastic agent, per case
 
 concurrency: 4                       # how many trials run at once
 max_attempts: 2                      # retry a trial only if it could differ
