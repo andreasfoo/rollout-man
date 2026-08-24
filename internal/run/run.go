@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andreasfoo/rollout-man/internal/actions"
 	"github.com/andreasfoo/rollout-man/internal/casesrc"
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
 	"github.com/andreasfoo/rollout-man/internal/config"
@@ -43,6 +43,19 @@ type Result struct {
 	Redaction *redact.Hits `json:"redaction,omitempty"`
 	Seconds   float64      `json:"seconds"`
 	At        string       `json:"at"`
+
+	// Dropped means a guard decided this trial's artifacts should not be
+	// published. The measurement above still stands: dropping is about what
+	// leaves the machine, never about what was observed.
+	Dropped bool           `json:"dropped,omitempty"`
+	Notes   map[string]any `json:"notes,omitempty"`
+}
+
+func (r *Result) note(k string, v any) {
+	if r.Notes == nil {
+		r.Notes = map[string]any{}
+	}
+	r.Notes[k] = v
 }
 
 func (r Result) OK() bool { return r.Reward != nil }
@@ -67,6 +80,7 @@ type Runner struct {
 	mu      sync.Mutex
 	results []Result
 	done    map[string]bool
+	dropped map[string]bool
 }
 
 func (r *Runner) logf(f string, a ...any) {
@@ -77,6 +91,9 @@ func (r *Runner) logf(f string, a ...any) {
 
 func (r *Runner) Run(ctx context.Context) error {
 	if err := os.MkdirAll(r.Dir, 0o755); err != nil {
+		return err
+	}
+	if err := r.Validate(); err != nil {
 		return err
 	}
 	if err := r.loadDone(); err != nil {
@@ -98,10 +115,8 @@ func (r *Runner) Run(ctx context.Context) error {
 
 	r.runAll(ctx, trials)
 
-	if r.File.Experiment.Pipeline.PerExperiment.Ship != nil {
-		if err := r.Ship(ctx); err != nil {
-			return err
-		}
+	if err := r.Finish(ctx); err != nil {
+		return err
 	}
 	return nil
 }
@@ -182,61 +197,35 @@ func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 		}
 		r.logf("case %s -> %s (pinned %s)", c.Label, c.SHA256[:12], c.PinnedAt)
 
-		if a := ex.Pipeline.PerCase.Admission; a != nil {
-			if err := r.admit(ctx, c, a); err != nil {
-				return nil, err
-			}
+		actx := r.actionCtx(actions.PerCase)
+		actx.CaseLabel, actx.CaseDir, actx.CaseSHA = c.Label, c.Dir, c.SHA256
+		actx.Probe = func(ctx context.Context, kind string, n int) ([]float64, error) {
+			return r.probe(ctx, c, rexec.AgentKind(kind), n)
+		}
+		if err := actions.RunList(ctx, actx, ex.Pipeline.PerCase, r.Cmds); err != nil {
+			return nil, err
 		}
 		out = append(out, c)
 	}
 	return out, nil
 }
 
-// admit refuses to measure a case whose oracle cannot score and whose nop can.
-// A broken case produces numbers that look exactly like a weak agent, so the
-// gate is the only place that difference can still be seen.
-func (r *Runner) admit(ctx context.Context, c *casesrc.Case, a *config.Admission) error {
-	if a.Require == "any" {
-		r.logf("case %s: admission skipped (require: any)", c.Label)
-		return nil
-	}
-	probes := []struct {
-		kind rexec.AgentKind
-		ok   func(float64) bool
-		want string
-	}{
-		{rexec.Oracle, func(v float64) bool { return v >= a.OracleMin-1e-9 },
-			fmt.Sprintf(">= %.2f", a.OracleMin)},
-		{rexec.Nop, func(v float64) bool { return v <= a.NopMax+1e-9 },
-			fmt.Sprintf("<= %.2f", a.NopMax)},
-	}
-	for _, p := range probes {
-		var got []float64
-		for i := 1; i <= a.Trials; i++ {
-			t := &trial{ID: fmt.Sprintf("admit-%s-%s-%d", c.SHA256[:12], p.kind, i),
-				Case: c, Agent: string(p.kind), Kind: p.kind, Index: i}
-			res := r.once(ctx, t)
-			if !res.OK() {
-				// a probe that could not run is not a verdict
-				// res.Message already carries the code.
-				return fmt.Errorf("admission %s for %s could not run: %s",
-					p.kind, c.Label, res.Message)
-			}
-			got = append(got, *res.Reward)
+// probe runs an admission probe through the ordinary execution path. Going the
+// long way round is the point: passing the gate also proves the whole chain
+// works on this machine.
+func (r *Runner) probe(ctx context.Context, c *casesrc.Case, kind rexec.AgentKind, n int) ([]float64, error) {
+	var got []float64
+	for i := 1; i <= n; i++ {
+		t := &trial{ID: fmt.Sprintf("admit-%s-%s-%d", c.SHA256[:12], kind, i),
+			Case: c, Agent: string(kind), Kind: kind, Index: i}
+		res := r.once(ctx, t)
+		if !res.OK() {
+			// res.Message already carries the code.
+			return nil, fmt.Errorf("%s", res.Message)
 		}
-		pass := true
-		for _, v := range got {
-			if !p.ok(v) {
-				pass = false
-			}
-		}
-		r.logf("case %s: %s %v want %s -> %s", c.Label, p.kind, got, p.want, verdict(pass))
-		if !pass {
-			return fmt.Errorf("CASE_NOT_ADMITTED: %s (%s scored %v, wanted %s)",
-				c.Label, p.kind, got, p.want)
-		}
+		got = append(got, *res.Reward)
 	}
-	return nil
+	return got, nil
 }
 
 // --------------------------------------------------------------- matrix ---
@@ -285,8 +274,14 @@ func trialID(c *casesrc.Case, agent, spec string, i int) string {
 
 // --------------------------------------------------------------- trials ---
 
+// runAll uses two separate widths on purpose. Running a trial is bounded by how
+// many containers the machine can hold; processing one afterwards -- scrub,
+// guard, pack -- is bounded by nothing of the sort. Holding a container slot
+// while zipping a directory wastes the scarce resource on the cheap work, so
+// the executor slot is released before the post-trial steps begin.
 func (r *Runner) runAll(ctx context.Context, trials []*trial) {
-	sem := make(chan struct{}, r.File.Experiment.Concurrency)
+	exec := make(chan struct{}, r.File.Experiment.Concurrency)
+	post := make(chan struct{}, r.File.Experiment.Pipeline.Concurrency)
 	var wg sync.WaitGroup
 	for _, t := range trials {
 		if r.done[t.ID] {
@@ -295,21 +290,55 @@ func (r *Runner) runAll(ctx context.Context, trials []*trial) {
 		wg.Add(1)
 		go func(t *trial) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 			if ctx.Err() != nil {
 				return
 			}
+			exec <- struct{}{}
 			res := r.attempts(ctx, t)
+			<-exec
+
+			post <- struct{}{}
+			outDir := filepath.Join(r.Dir, "trials", t.ID, "out")
+			if err := r.postTrial(ctx, t, &res, outDir, r.secretsFor(ctx, t)); err != nil {
+				if res.OK() {
+					// A post step that fails on a measured trial is a real
+					// failure: it is what stands between the artifacts and
+					// whoever receives them.
+					code := fail.Of(err)
+					res.Reward = nil
+					res.Code, res.Category, res.Message = code, string(code.Category()), err.Error()
+				} else {
+					r.logf("%s: post-trial steps on a failed trial: %v", t.ID, err)
+				}
+			}
+			<-post
+
 			r.append(res)
-			if res.OK() {
+			switch {
+			case res.OK() && res.Dropped:
+				r.logf("%s: reward %.3f (%.1fs, dropped)", t.ID, *res.Reward, res.Seconds)
+			case res.OK():
 				r.logf("%s: reward %.3f (%.1fs)", t.ID, *res.Reward, res.Seconds)
-			} else {
+			default:
 				r.logf("%s: %s %s", t.ID, res.Code, firstLine(res.Message))
 			}
 		}(t)
 	}
 	wg.Wait()
+}
+
+// secretsFor re-resolves the values that must not survive into an artifact.
+// Resolving again rather than threading them out of the executor keeps the key
+// out of every intermediate struct it would otherwise pass through.
+func (r *Runner) secretsFor(ctx context.Context, t *trial) []string {
+	if t.Kind != rexec.LLM || t.LLMSpec == "" {
+		return nil
+	}
+	llm, err := r.resolveLLM(ctx, t.LLMSpec)
+	if err != nil || llm.APIKey == "" {
+		return nil
+	}
+	return []string{llm.APIKey}
 }
 
 // attempts retries only what could plausibly succeed on a second run. An agent
@@ -340,16 +369,7 @@ func (r *Runner) once(ctx context.Context, t *trial) Result {
 		WorkDir: filepath.Join(r.Dir, "trials", t.ID),
 		Cfg:     t.Case.Config,
 	}
-	var secrets []string
-	// A failed trial is the one you most need to read, and its logs are the
-	// ones most likely to hold a key: scrub on every exit, not just the happy
-	// one.
 	finish := func(err error) Result {
-		if rc := r.File.Experiment.Pipeline.PerTrial.Redact; rc != nil {
-			if hits, serr := r.scrub(env.OutDir(), rc, secrets); serr == nil {
-				res.Redaction = &hits
-			}
-		}
 		code := fail.Of(err)
 		res.Code, res.Category, res.Message = code, string(code.Category()), err.Error()
 		res.Seconds = time.Since(start).Seconds()
@@ -367,9 +387,6 @@ func (r *Runner) once(ctx context.Context, t *trial) Result {
 				return finish(err)
 			}
 			as.LLM = llm
-			if llm.APIKey != "" {
-				secrets = append(secrets, llm.APIKey)
-			}
 		}
 	}
 
@@ -378,93 +395,133 @@ func (r *Runner) once(ctx context.Context, t *trial) Result {
 		return finish(err)
 	}
 	writeResultJSON(env.OutDir(), t, reward)
-
-	if rc := r.File.Experiment.Pipeline.PerTrial.Redact; rc != nil {
-		hits, err := r.scrub(env.OutDir(), rc, secrets)
-		if err != nil {
-			return finish(err)
-		}
-		res.Redaction = &hits
-	}
-
 	res.Reward = &reward
 	res.Seconds = time.Since(start).Seconds()
 	return res
 }
 
-// ------------------------------------------------------------ per_trial ---
-
-var distributable = map[string]redact.Class{
-	"traj.jsonl":  redact.Distributable,
-	"result.json": redact.Distributable,
+// postTrial runs everything in per_trial after the executor: scrub, guard,
+// pack, whatever the submission asked for. It is where a trial stops being a
+// number and becomes an artifact somebody else can read.
+func (r *Runner) postTrial(ctx context.Context, t *trial, res *Result, outDir string, secrets []string) error {
+	steps := r.File.Experiment.Pipeline.PostTrial()
+	if len(steps) == 0 {
+		return nil
+	}
+	c := r.actionCtx(actions.PerTrial)
+	c.Secrets = secrets
+	c.Trial = &actions.Trial{
+		ID: t.ID, Case: t.Case.Label, CaseSHA: t.Case.SHA256, Agent: t.Agent,
+		LLMSpec: t.LLMSpec, Index: t.Index, Reward: res.Reward, Code: string(res.Code),
+		Seconds: res.Seconds, OutDir: outDir,
+	}
+	err := actions.RunList(ctx, c, steps, r.Cmds)
+	if c.Drop {
+		res.Dropped = true
+		r.markDropped(t.ID)
+	}
+	for k, v := range c.Notes {
+		if k == "redaction" {
+			if h, ok := v.(redact.Hits); ok {
+				res.Redaction = &h
+				continue
+			}
+		}
+		res.note(k, v)
+	}
+	return err
 }
 
-// scrub is mandatory for keys and tiered for IPs: what ships out gets its
-// addresses removed, what you debug with keeps them. A scrub that fails blocks
-// the artifacts entirely -- shipping an unscrubbed trajectory cannot be undone.
-func (r *Runner) scrub(dir string, rc *config.Redact, secrets []string) (redact.Hits, error) {
-	s := redact.New(secrets, rc.Extra, map[redact.Class]bool{
-		redact.Distributable: rc.IPs["traj"],
-		redact.Debug:         rc.IPs["logs"],
-	})
-	var total redact.Hits
-	// Walk, not glob: an adapter is free to leave a directory of trajectories,
-	// and the one thing that must not happen is artifacts shipping unscrubbed
-	// because they were one level deeper than we looked.
-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		class := redact.Debug
-		if c, ok := distributable[d.Name()]; ok {
-			class = c
-		}
-		h, serr := s.ScrubFile(p, class)
-		if serr != nil {
-			rel, _ := filepath.Rel(dir, p)
-			return fail.Wrap(fail.RedactFailed, "scrub "+rel, serr)
-		}
-		total.Exact += h.Exact
-		total.Pattern += h.Pattern
-		total.IP += h.IP
-		return nil
-	})
-	if err != nil {
-		return total, err
+// ------------------------------------------------------------- actions ---
+
+func (r *Runner) actionCtx(scope actions.Scope) *actions.Ctx {
+	return &actions.Ctx{
+		Scope: scope, Experiment: r.File.Experiment.Name,
+		RunID: filepath.Base(r.Dir), RunDir: r.Dir,
+		Cmds: r.Cmds, Log: r.Log,
+		Trials:  r.snapshot,
+		Dropped: r.isDropped,
 	}
-	return total, nil
+}
+
+func (r *Runner) markDropped(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.dropped == nil {
+		r.dropped = map[string]bool{}
+	}
+	r.dropped[id] = true
+}
+
+func (r *Runner) isDropped(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.dropped[id]
+}
+
+// snapshot is what a per_experiment action sees: every trial the run recorded,
+// including the ones resumed from a previous attempt.
+func (r *Runner) snapshot() []actions.Trial {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]actions.Trial, 0, len(r.results))
+	for _, res := range r.results {
+		out = append(out, actions.Trial{
+			ID: res.TrialID, Case: res.Case, CaseSHA: res.CaseSHA, Agent: res.Agent,
+			LLMSpec: res.LLMSpec, Index: res.Index, Reward: res.Reward,
+			Code: string(res.Code), Seconds: res.Seconds,
+			OutDir: filepath.Join(r.Dir, "trials", res.TrialID, "out"),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // ------------------------------------------------------- per_experiment ---
 
-// ship hands the whole run directory to a command. What "shipping" means is the
-// operator's business, so it is one configured command and nothing more.
-func (r *Runner) Ship(ctx context.Context) error {
-	s := r.File.Experiment.Pipeline.PerExperiment.Ship
-	if s == nil {
-		return fail.New(fail.Host, "the experiment declares no pipeline.per_experiment.ship")
+// Finish runs the per_experiment steps: whatever turns a directory of trials
+// into something worth handing to someone else.
+func (r *Runner) Finish(ctx context.Context) error {
+	steps := r.File.Experiment.Pipeline.PerExperiment
+	if len(steps) == 0 {
+		return nil
 	}
-	using := s.Using
-	if using == "" {
-		using = "ship"
+	return actions.RunList(ctx, r.actionCtx(actions.PerExperiment), steps, r.Cmds)
+}
+
+func (r *Runner) resultsPath() string { return filepath.Join(r.Dir, "results.jsonl") }
+
+// Validate checks every pipeline step before the batch starts. A submission
+// with a misspelled input should be rejected now, not three hours in when the
+// only step that would have scrubbed the keys turns out to be a no-op.
+func (r *Runner) Validate() error {
+	p := &r.File.Experiment.Pipeline
+	// per_trial[0] is the executor, which --executor may override, so it is not
+	// resolved here. Everything after it starts at index 1, and says so.
+	for _, u := range []struct {
+		scope actions.Scope
+		list  []config.Action
+		from  int
+	}{
+		{actions.PerCase, p.PerCase, 0},
+		{actions.PerTrial, p.PostTrial(), 1},
+		{actions.PerExperiment, p.PerExperiment, 0},
+	} {
+		if err := actions.ValidateList(u.scope, u.list, u.from, r.Cmds); err != nil {
+			return err
+		}
 	}
-	if !r.Cmds.Has(using) {
-		return fail.New(fail.Host, "pipeline.per_experiment.ship needs a command named "+using)
-	}
-	dest := strings.ReplaceAll(s.Dest, "{{.Experiment}}", r.File.Experiment.Name)
-	dest = strings.ReplaceAll(dest, "{{.RunID}}", filepath.Base(r.Dir))
-	if _, err := r.Cmds.Run(ctx, using, map[string]string{
-		"LocalPath": r.Dir, "Key": dest,
-	}); err != nil {
-		return fail.Wrap(fail.Host, "ship", err)
-	}
-	r.logf("shipped %s -> %s", r.Dir, dest)
 	return nil
 }
 
-// ---------------------------------------------------------------- state ---
-
-func (r *Runner) resultsPath() string { return filepath.Join(r.Dir, "results.jsonl") }
+// Restore reloads a finished run so its per_experiment steps can be run again
+// against what is already on disk.
+func (r *Runner) Restore() error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	return r.loadDone()
+}
 
 func (r *Runner) loadDone() error {
 	r.done = map[string]bool{}
@@ -475,6 +532,9 @@ func (r *Runner) loadDone() error {
 	for _, x := range res {
 		r.done[x.TrialID] = true
 		r.results = append(r.results, x)
+		if x.Dropped {
+			r.markDropped(x.TrialID)
+		}
 	}
 	return nil
 }

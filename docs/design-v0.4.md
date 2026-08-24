@@ -45,7 +45,7 @@
 - **要评审设计** → 先看 §2 总体架构 与 §15 优先级分级，再按需展开
 - **要排期** → §15.1 分级总表 + §15.3 Phase 计划，两张表就够
 - **行内 [MVP] / [P1] / [P2]** 标记的是交付批次，无标记即 MVP（§0.1）
-- **本文是目标架构**。已实现的 MVP 比它小得多——按第一性原理砍掉了什么、为什么、什么时候加回来，见 **§15.0**，第二波补了什么见 **§15.0.1**；实现与用法见 `README.md`
+- **本文是目标架构**。已实现的 MVP 比它小得多——按第一性原理砍掉了什么、为什么、什么时候加回来，见 **§15.0**；第二波见 **§15.0.1**；第三波（pipeline 回到 action 列表、guard、数据集发布）见 **§15.0.2**；实现与用法见 `README.md`
 
 ## 目录
 
@@ -1519,59 +1519,44 @@ concurrency: 8                          # 在途上限（排队 + 执行），�
 priority: normal                        # critical | high | normal | low
 queue_timeout: 24h                      # 排队超时 → UNPLACED，见 §5.6
 
-# ── pipeline：三个不同单位的钩子，键名即单位 ─────────────────────────
+# ── pipeline：三个列表，键名即单位（§15.0.2）──────────────────────────
 pipeline:
+  concurrency: 16                       # 加工的宽度，与"能塞下几个容器"分开
 
-  per_case:                             # ← 每个 case 跑一次，confirm 时，在 Runner 上
-    - step: resolve                     # 取内容 → sha256 → 入 CAS → 解析 task.toml（§3.1）
-      on_unchanged: skip                # sha256 已在 CAS 中则跳过（默认）
-
-    - step: admission                   # 准入闸门（§3.5）
-      require: admitted                 # admitted（默认）| any（调试，结果打 ⚠ UNADMITTED）
-      auto_admit: false
-      criteria:
-        oracle: {min_reward: 1.0}
-        nop:    {max_reward: 0.0}
+  per_case:                             # ← 每个 case 一次
+    - uses: admission                   # 准入闸门（§3.5）
+      with:
+        require: admitted               # admitted（默认）| any
+        oracle_min_reward: 1.0
+        nop_max_reward: 0.0
         trials: 2
 
-  # ─────────────────────────────────────────────────────────────────
-  #  per_case 全部通过后，matrix 展开成 N 个 trial。每个 trial 的主链
-  #  fetch → prepare → run → verify → collect 是系统内置的，不可配置；
-  #  下面 per_trial 的步骤紧接主链，在同一台 Runner 上执行。
-  # ─────────────────────────────────────────────────────────────────
+  per_trial:                            # ← 每个 trial 一次
+    - uses: harbor                      # 第一步执行 trial：没跑过的没法加工
 
-  per_trial:                            # ← 每个 trial 跑一次，在该 trial 所在的 Runner 上
-    - step: redact                      # 清洗（§6.4）；key 强制，IP 分档
-      keys: required
-      ips: {traj: true, logs: false}
-      extra_patterns: []
+    - uses: redact                      # 清洗（§6.4）；key 强制，IP 分档
+      with:
+        keys: required
+        ips: {traj: true, logs: false}
 
-    - step: bundle
-      format: tar.zst
-      include: [traj, logs, result]
+    - uses: guard                       # 只留值得发布的（§15.0.2）
+      name: only-hard
+      with: {max_reward: 0.6, min_steps: 30}
+      on_violation: drop                # drop 保留测量、不发布产物
 
-    - step: stage                       # 暂存本机，等 per_experiment 成批传（§6.5）
-      max_pending: 20Gi                 # 每 Runner 暂存上限，超了就地提前传一次
-      on_cancel: upload                 # upload（默认）| discard
-    # 想逐 trial 就传的话，把上面这步换成 upload 即可：
-    #   - step: upload
-    #     using: storage_upload
-    #     dest: "evals/{{.ExperimentName}}/{{.CasePath}}/{{.TrialID}}/"
-    #     objects: [bundle, result]
+    - uses: archive
+      with: {format: tar}               # tar | tar.gz | zip
 
-  per_experiment:                       # ← 整个 experiment 跑一次，全部 trial 到终态后
-    - step: upload                      # 各 Runner 把自己暂存的产物成批传走
-      using: storage_upload
-      dest: "evals/{{.ExperimentName}}/"
-      objects: [bundle, result]
+  per_experiment:                       # ← 整批一次，全部 trial 到终态后
+    - uses: guard
+      name: enough-to-publish
+      with: {min_shipped: 4}
 
-    - step: report                      # [P1] 聚合结果文件
-      formats: [json, csv]
-      dest: "evals/{{.ExperimentName}}/report/"
+    - uses: dataset                     # 行 + card，而不是目录树
+      with: {title: "…", license: apache-2.0}
 
-    - step: deploy                      # [P1] 任意外部投递：发布、通知、进下游流水线
-      run: ["./scripts/publish.sh", "{{.ExperimentID}}", "{{.ReportURL}}"]
-      on_failure: warn                  # warn（默认，只记 event）| fail（experiment 标失败）
+    - uses: ship
+      with: {using: ship_hf, path: dataset, dest: my-org/rollout-libaom}
 
 # ── 其余 ──────────────────────────────────────────────────────────
 retry_policy:
@@ -1587,7 +1572,7 @@ scheduling:                             # [P1]
   affinity: {enabled: false, max_wait: 10m}
 ```
 
-**pipeline 的单位就是键名**，三个块跑在三个不同的量级上：
+**pipeline 的单位就是键名**，三个列表跑在三个不同的量级上。`uses` 认不出来的名字回落到 `kind: Commands` 里的命令——自定义步骤不需要新语法，也就继承了命令已有的哈希 pin 与 env 白名单：
 
 ```text
 experiment                                              ← 提交一次
@@ -1888,6 +1873,37 @@ Harbor 是 `pip install harbor`（Terminal-Bench 团队），CLI 是 `harbor run
 二进制补上之后复跑，case 通过准入，oracle 1.000 / nop 0.000，`AddressSanitizer: heap-buffer-overflow` 落在 `od_ec_dec_refill (aom_dsp/entdec.c:94)` —— 正是 case 自己 README 里写的那一帧，verifier 六项 check 全过。这条现在是 smoke test 的第 11 步，断言一直下到 ASan 报文和崩溃帧：**一个看起来像那么回事的产物满足不了它**。
 
 spidermonkey 那个 case 在本机同样测不了，但原因不同：它的 base image（`cyborgzero/sm-srcbase` + `sm-base`）是几十 GB，超出本会话的磁盘配额。这是环境限制，不是 case 的问题 —— 但结论一样：**装不下就测不了，测不了就不该出数字**。
+
+### 15.0.2 第三波：pipeline 回到文档原本的样子（action 列表）
+
+这一波起因是一次文档 review，找到八处不合适，其中第一条最要紧：
+
+**§6.4/§6.5 本来就把 pipeline 写成 action 列表**（`- step: redact` / `- step: bundle` / `- step: stage|upload`，per_experiment 还有 `report` / `deploy`），而 MVP 瘦身时退化成了三个写死的键。**文档是对的，实现落后于文档。** 这一波把它实现回来，并补上文档里也没有的东西。
+
+| review 发现 | 处置 |
+|---|---|
+| pipeline 是 action 列表，实现是固定键 | 实现为列表；`uses` + `with` + `on_failure` / `on_violation` |
+| `- step: resolve` 被写成可配置的 per_case 第一步 | 不做。resolve 决定 trial 列表怎么来，它可配置就等于确定性可协商 |
+| **完全没有 guard 这个概念** | 新增。admission 问「这个 case 能不能测」，guard 问「这个结果值不值得留」——不同单位上的不同问题 |
+| §6.5 的 stage / `max_pending` / housekeeper 钉住 / placement 磁盘记账 | 不做。那四条的前提是多 Runner 各自堆产物；单机上「批量上传」就是 ship 写在 per_experiment 而不是 per_trial，**位置即时机** |
+| §6.3 主链、§7.2 Temporal 错误映射已不成立 | 已在 §15.0.1 按 Harbor 重写 |
+| §3.1 的 source 没有 hf | 新增 `source: hf` |
+| §9.4 只有 upload/download/link/delete，没有「发布一个数据集」 | 新增 `dataset` action：产出行 + card，而不是目录树 |
+| §6.4 的 bundle 写死 tar.zst | `archive` action 的 `format` 是参数（tar / tar.gz / zip） |
+
+**关于 guard 的语义，值得单独写下来。** `on_violation: drop` **保留测量、不发布产物**：reward 照常记进 `results.jsonl`、照常进结果表，变的只是它的产物不离开这台机器。**丢弃决定的是什么被发布，从不改变什么被观测到。** 这条边界必须硬——否则「筛掉难度不够的 rollout」会悄悄变成「筛掉不好看的分数」，而那是另一回事。
+
+**关于数据集：能直接用 HF 的吗？分三层，答案不一样。**
+
+- **存储 / 版本 / 发布：能，而且应该。** Hub 的 git+LFS revision 已经是内容寻址 + 版本 + 访问控制，没有理由在旁边再造一套 CAS 或 artifact registry。它需要我们提供的是**形状**——行 + card，也就是 `dataset` action 干的事。倒一棵目录树上去，得到的是服务器上的一个文件夹，不是数据集。
+- **下游加工（dedup / quality filtering / 跨批统计）：能，而且不该我们做。** 那是 `datasets` / `datatrove` 的地盘，跑在整个语料上、在集群上，不是跑在 eval runner 上、在一个批次上。**rollout-man 不长 dedup action。**
+- **批内加工（redact / guard）：不能，必须留在生产端。** traj 里的 key 一旦进了 Hub 就撤不回来（git 历史、LFS、镜像、viewer 缓存）；guard 决定的是「要不要 ship」，按定义在 ship 之前；而 `map()` 作用在已经 load 的 dataset 上——到那时东西已经发布了。
+
+**关于归档格式，实测结论，不要凭印象：** `datasets` 里 `.zip` **没有对应的 builder**，一目录 zip 发上去就是一堆不透明 blob，只能靠 `zip://inner::outer.zip` 显式寻址读；`.tar` 映射到 webdataset builder，**但前提是一个 tar 装多个样本、条目名为 `<key>.<ext>`**——一个 trial 一个 tar 是附件，不是 shard。两种都提供，但**让它成为数据集的是行，不是归档**。数据量大时一 trial 一归档还意味着一 trial 一个 LFS 对象，分片才是答案，`archive` 不做分片。
+
+**两个并发宽度。** `concurrency` 管同时跑几个 trial（这台机器能塞下几个容器），`pipeline.concurrency` 管同时加工几个 trial（和容器毫无关系）。执行槽在后处理开始前就释放——拿着稀缺资源去 zip 一个目录是浪费。
+
+**未知键在跑之前就拒绝。** `with:` 里的错别字和 step 顶层的错别字都报错并终止。这不是洁癖：`redact` 少认一个键的后果是把 key 发出去，而它看起来会像成功。
 
 ### 15.1 分级总表（目标架构）
 

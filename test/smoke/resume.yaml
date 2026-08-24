@@ -23,9 +23,9 @@ max_attempts: 1
 
 pipeline:
   per_case:
-    admission:
-      require: any
+    - uses: admission
+      with: {require: any}
   per_trial:
-    redact:
-      keys: required
-      ips: {traj: true, logs: false}
+    - uses: local
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: false}}

@@ -1,0 +1,96 @@
+# Route 3 of 3 — cases from the Hub, curated rollouts published back to it.
+#
+#   export HF_TOKEN=...
+#   rollout-man run experiments/hf.yaml --commands experiments/commands.yaml
+#
+# This is the route the data actually lives on, so it is the one with the
+# curation in it. Two things are worth reading closely: the guard, and why the
+# publishing step produces rows rather than a directory tree.
+---
+kind: LLMSpec
+name: sonnet
+provider: anthropic
+model: anthropic/claude-sonnet-4-5
+api_key_env: ANTHROPIC_API_KEY
+
+---
+kind: Experiment
+name: libaom-hf
+
+case_defaults:
+  source: hf
+  repo: my-org/agent-eval-cases        # a dataset repo
+  ref: main
+
+cases:
+  - path: security/libaom-cc9e46cb-bug-6491968-t4
+
+matrix:
+  agents:
+    - name: claude-code
+      llm_spec: sonnet
+    - name: oracle
+  trials: 8                            # several rollouts per case: the point is the spread
+
+concurrency: 4
+max_attempts: 2
+
+pipeline:
+  # Post-processing is bounded separately from execution. Once every trial is
+  # being scrubbed, packed and published, that work is the batch -- and it has
+  # nothing to do with how many containers the machine can hold.
+  concurrency: 16
+
+  per_case:
+    - uses: admission
+      with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
+
+  per_trial:
+    - uses: harbor
+
+    # Before anything else looks at the artifacts. A key that reaches the Hub is
+    # in the git history, in LFS, in every mirror and in the viewer's cache --
+    # there is no unpublishing it. That is why this is here and not a map() on
+    # the consumer side.
+    - uses: redact
+      with:
+        keys: required
+        ips: {traj: true, logs: false}
+
+    # Curation: keep the rollouts that were actually hard. A trial the agent
+    # solved in three steps teaches nothing, and neither does one that scored
+    # full marks. Dropped trials are still measured and still recorded -- the
+    # guard decides what gets published, never what was observed.
+    - uses: guard
+      name: keep-only-hard
+      with:
+        max_reward: 0.6
+        min_steps: 30
+      on_violation: drop
+
+    - uses: archive
+      with:
+        format: tar                    # WebDataset; zip would not load as a dataset
+        include: ["traj.jsonl", "*.log", "result.json"]
+
+  per_experiment:
+    # Refuse to publish a batch that is too thin to be worth anyone's time.
+    # Cheaper to catch here than after it is on the Hub under a version number.
+    - uses: guard
+      name: batch-worth-publishing
+      with: {min_shipped: 4}
+
+    # One row per surviving trial plus a dataset card. This is what makes it a
+    # dataset instead of a folder: load_dataset() opens it, the viewer renders
+    # it, and the card carries the provenance -- every case's content hash, the
+    # admission verdict, the adapter that produced the trials.
+    - uses: dataset
+      with:
+        title: "libaom rollouts — hard cases only"
+        license: apache-2.0
+
+    - uses: ship
+      with:
+        using: ship_hf
+        path: dataset                  # publish the dataset, not the whole run dir
+        dest: my-org/rollout-libaom

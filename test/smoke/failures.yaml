@@ -34,6 +34,6 @@ max_attempts: 2
 
 pipeline:
   per_trial:
-    redact:
-      keys: required
-      ips: {traj: true, logs: false}
+    - uses: local
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: false}}
