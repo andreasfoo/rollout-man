@@ -192,5 +192,67 @@ else
   check "the verifier scored it a full 1.00" 'grep -q "^FINAL SCORE: 1.00" "$LT/stdout.log"'
 fi
 
+step "12. commands as pinned, isolated adapters"
+# The safety story: a command can be a script file pinned by hash, run with only
+# the environment it declares, taken from a file the submission cannot override.
+PINDIR="$RUNS/pin"; rm -rf "$PINDIR"; mkdir -p "$PINDIR"
+cat > "$PINDIR/adapter.sh" <<'A'
+#!/usr/bin/env bash
+# Record exactly what environment the ship command was handed. OUT_DIR is not
+# set for a ship command, so use LOCAL_PATH (the run directory) directly.
+echo "KEEP=${KEEP:-<unset>} DROP=${DROP:-<unset>}" > "$LOCAL_PATH/saw.txt"
+A
+SUM=$(sha256sum "$PINDIR/adapter.sh" | cut -d" " -f1)
+cat > "$PINDIR/commands.yaml" <<C
+---
+kind: Commands
+inherit_env: false
+ship:
+  uses: $PINDIR/adapter.sh
+  sha256: $SUM
+  env: [KEEP]
+C
+cat > "$PINDIR/exp.yaml" <<C
+---
+kind: Experiment
+name: pin
+case_defaults: {source: local}
+cases: [{path: test/smoke/pass-case}]
+matrix: {agents: [oracle], trials: 1}
+concurrency: 1
+pipeline:
+  per_case: {admission: {require: any}}
+  per_experiment: {ship: {using: ship, dest: pin}}
+C
+# A run whose commands come from the trusted file.
+KEEP=yes DROP=secret "$BIN" run "$PINDIR/exp.yaml" --runs "$PINDIR/runs" --id r --executor local --commands "$PINDIR/commands.yaml" > "$PINDIR/out.log" 2>&1
+SAW="$PINDIR/runs/r/saw.txt"
+check "the run records which command ran and its hash" 'grep -q "\"sha256\": \"'"$SUM"'\"" "$PINDIR/runs/r/manifest.json"'
+check "the manifest marks the commands as trusted"     'grep -q "commands_from_trusted_file\": true" "$PINDIR/runs/r/manifest.json"'
+check "the declared env var reached the command"       'grep -q "KEEP=yes"     "$SAW"'
+check "an undeclared env var did NOT"                   'grep -q "DROP=<unset>" "$SAW"'
+
+# Tamper with the pinned file: the run must refuse rather than run it.
+echo "# tampered" >> "$PINDIR/adapter.sh"
+KEEP=yes "$BIN" run "$PINDIR/exp.yaml" --runs "$PINDIR/runs2" --id r --executor local --commands "$PINDIR/commands.yaml" > "$PINDIR/tamper.log" 2>&1
+check "a changed pin is refused, not run" 'grep -q "refusing to run" "$PINDIR/tamper.log"'
+
+# A submission that smuggles its own commands alongside a trusted file is refused.
+cat > "$PINDIR/evil.yaml" <<C
+---
+kind: Commands
+ship: {script: "echo pwned"}
+---
+kind: Experiment
+name: pin
+case_defaults: {source: local}
+cases: [{path: test/smoke/pass-case}]
+matrix: {agents: [oracle], trials: 1}
+concurrency: 1
+pipeline: {per_case: {admission: {require: any}}}
+C
+"$BIN" run "$PINDIR/evil.yaml" --runs "$PINDIR/runs3" --id r --executor local --commands "$PINDIR/commands.yaml" > "$PINDIR/evil.log" 2>&1
+check "a submission cannot override the trusted commands" 'grep -q "declares its own kind: Commands" "$PINDIR/evil.log"'
+
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

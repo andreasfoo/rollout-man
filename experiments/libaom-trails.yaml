@@ -10,6 +10,10 @@
 # Run it:
 #   export ANTHROPIC_API_KEY=...          # only the claude-code agent needs it
 #   rollout-man run experiments/libaom-trails.yaml
+#
+# On a shared runner the operator keeps the commands out of the submission:
+#   rollout-man run experiments/libaom-trails.yaml --commands commands.example.yaml
+# and this file's own kind: Commands document is then refused, not merged.
 
 ---
 kind: Commands
@@ -17,13 +21,16 @@ timeout: 120m
 max_attempts: 1
 
 # Executing a trial is Harbor's job (harbor run), reached as a command.
+# uses: + sha256: pins the adapter -- if the file changes, the run is refused.
 harbor:
-  script: adapters/harbor.sh
+  uses: adapters/harbor.sh
+  sha256: d822f0cf2ea49988a32766b479ee679d5869272b38e2b466fe7c756a81bfb04f
 
 # Uploading is a command too, and it is what "batch upload" means here: it runs
 # once, after every trial in the batch has finished.
 ship:
-  script: adapters/ship-github.sh
+  uses: adapters/ship-github.sh
+  sha256: 61b73aac154b7246d2cb12be1baafee0b4c759ac362f274816f6e657b9e0e749
 
 ---
 kind: LLMSpec

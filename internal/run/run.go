@@ -82,6 +82,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.loadDone(); err != nil {
 		return err
 	}
+	if err := r.writeManifest(); err != nil {
+		return err
+	}
 	if len(r.done) > 0 {
 		r.logf("resuming: %d trials already recorded", len(r.done))
 	}
@@ -101,6 +104,69 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// writeManifest records what this run was actually made of: which commands
+// were in play, where their code lives, and its hash. A result you cannot trace
+// back to the code that produced it is a number without a provenance -- and the
+// hash is also what makes "the adapter changed under us" visible afterwards
+// rather than only at the moment it happened.
+func (r *Runner) writeManifest() error {
+	type cmd struct {
+		Name    string `json:"name"`
+		Form    string `json:"form"` // uses | run | script
+		Uses    string `json:"uses,omitempty"`
+		SHA256  string `json:"sha256,omitempty"`
+		Pinned  bool   `json:"pinned,omitempty"`
+		Problem string `json:"problem,omitempty"`
+	}
+	m := struct {
+		Experiment string `json:"experiment"`
+		RunID      string `json:"run_id"`
+		Executor   string `json:"executor"`
+		Trusted    bool   `json:"commands_from_trusted_file"`
+		At         string `json:"at"`
+		Commands   []cmd  `json:"commands"`
+	}{
+		Experiment: r.File.Experiment.Name,
+		RunID:      filepath.Base(r.Dir),
+		Trusted:    r.File.Commands.Trusted,
+		At:         time.Now().UTC().Format(time.RFC3339),
+	}
+	if r.Exec != nil {
+		m.Executor = r.Exec.Name()
+	}
+	for _, name := range sortedCmdNames(r.File.Commands.Cmds) {
+		c := r.File.Commands.Cmds[name]
+		e := cmd{Name: name, Form: "script"}
+		switch {
+		case c.Uses != "":
+			e.Form, e.Uses, e.Pinned = "uses", c.Uses, c.SHA256 != ""
+			sum, err := cmdrun.Pin(c)
+			if err != nil {
+				e.Problem = err.Error()
+			} else {
+				e.SHA256 = sum
+			}
+		case len(c.Run) > 0:
+			e.Form = "run"
+		}
+		m.Commands = append(m.Commands, e)
+	}
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(r.Dir, "manifest.json"), append(b, '\n'), 0o644)
+}
+
+func sortedCmdNames(m map[string]config.Command) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ------------------------------------------------------------- per_case ---
@@ -485,7 +551,10 @@ func (r *Runner) resolveLLM(ctx context.Context, name string) (*rexec.LLMEnv, er
 }
 
 func commandArgv(c config.Command) []string {
-	if len(c.Run) > 0 {
+	switch {
+	case c.Uses != "":
+		return []string{c.Uses}
+	case len(c.Run) > 0:
 		return c.Run
 	}
 	return rexec.ScriptCommand(c.Script)
