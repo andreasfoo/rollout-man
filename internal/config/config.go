@@ -11,18 +11,46 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Command is one external step. Three forms, in increasing order of how much
+// you can say about what actually ran:
+//
+//	run:     argv, rendered from {{.Vars}}
+//	script:  inline shell
+//	uses:    a script file, optionally pinned by sha256
+//
+// `uses` is the one to reach for when the command is a real adapter: the code
+// lives in a file you can review, and the pin makes "the thing that ran is the
+// thing I reviewed" checkable instead of assumed.
 type Command struct {
 	Run    []string `yaml:"run"`
 	Script string   `yaml:"script"`
+	Uses   string   `yaml:"uses"`
+	SHA256 string   `yaml:"sha256"`
+	// Env names this command may read from the host, when inherit_env is off.
+	Env []string `yaml:"env"`
 }
 
-func (c Command) Empty() bool { return len(c.Run) == 0 && strings.TrimSpace(c.Script) == "" }
+func (c Command) Empty() bool {
+	return len(c.Run) == 0 && strings.TrimSpace(c.Script) == "" && c.Uses == ""
+}
 
 type Commands struct {
 	Timeout     Duration
 	MaxAttempts int
-	Cmds        map[string]Command
+	// InheritEnv decides whether commands see the host environment. Default
+	// true, because an operator running their own submissions on their own
+	// machine is the common case. A shared runner should set it false and let
+	// each command declare the names it needs -- an adapter has no business
+	// reading the credentials of the systems it is not talking to.
+	InheritEnv *bool
+	Cmds       map[string]Command
+
+	// Trusted marks commands that came from the runner's own config rather
+	// than from a submission. Set by LoadCommands, never by YAML.
+	Trusted bool `yaml:"-"`
 }
+
+func (c Commands) Inherits() bool { return c.InheritEnv == nil || *c.InheritEnv }
 
 // UnmarshalYAML walks the mapping: every mapping-valued key is a command, the
 // few scalar keys are settings.
@@ -43,16 +71,22 @@ func (c *Commands) UnmarshalYAML(n *yaml.Node) error {
 			if err := val.Decode(&c.MaxAttempts); err != nil {
 				return err
 			}
+		case "inherit_env":
+			var b bool
+			if err := val.Decode(&b); err != nil {
+				return err
+			}
+			c.InheritEnv = &b
 		default:
 			if val.Kind != yaml.MappingNode {
-				return fmt.Errorf("command %q must be a mapping with run: or script:", key)
+				return fmt.Errorf("command %q must be a mapping with run:, script: or uses:", key)
 			}
 			var cmd Command
 			if err := val.Decode(&cmd); err != nil {
 				return fmt.Errorf("command %q: %w", key, err)
 			}
 			if cmd.Empty() {
-				return fmt.Errorf("command %q has neither run nor script", key)
+				return fmt.Errorf("command %q has none of run, script or uses", key)
 			}
 			c.Cmds[key] = cmd
 		}
@@ -172,6 +206,11 @@ type File struct {
 	Commands   Commands
 	LLMSpecs   map[string]LLMSpec
 	Experiment Experiment
+
+	// DeclaresCommands records that the submission carried its own kind:
+	// Commands document. With a trusted commands file in play that is a
+	// refusal, not something to merge or quietly drop.
+	DeclaresCommands bool `yaml:"-"`
 }
 
 type Duration time.Duration
@@ -189,6 +228,48 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 }
 
 func (d Duration) D() time.Duration { return time.Duration(d) }
+
+// LoadCommands reads a commands-only file that belongs to the runner, not to
+// the submission. Pointing at one is what separates "who decides what a step
+// runs" from "who decides which steps run" -- without it, anyone who can hand
+// you a submission can run code on your machine, because a submission may
+// define its own commands.
+func LoadCommands(path string) (Commands, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Commands{}, err
+	}
+	var out Commands
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	found := false
+	for {
+		var node yaml.Node
+		if err := dec.Decode(&node); err != nil {
+			break
+		}
+		var probe struct {
+			Kind string `yaml:"kind"`
+		}
+		if err := node.Decode(&probe); err != nil {
+			return Commands{}, err
+		}
+		if probe.Kind != "Commands" {
+			return Commands{}, fmt.Errorf("%s: a commands file holds only kind: Commands, found %q", path, probe.Kind)
+		}
+		if found {
+			return Commands{}, fmt.Errorf("%s: more than one kind: Commands", path)
+		}
+		if err := node.Decode(&out); err != nil {
+			return Commands{}, err
+		}
+		found = true
+	}
+	if !found {
+		return Commands{}, fmt.Errorf("%s: no kind: Commands", path)
+	}
+	out.Trusted = true
+	return out, nil
+}
 
 func Load(path string) (*File, error) {
 	raw, err := os.ReadFile(path)
@@ -214,6 +295,7 @@ func Load(path string) (*File, error) {
 			if err := node.Decode(&f.Commands); err != nil {
 				return nil, err
 			}
+			f.DeclaresCommands = true
 		case "LLMSpec":
 			var s LLMSpec
 			if err := node.Decode(&s); err != nil {

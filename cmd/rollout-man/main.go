@@ -44,13 +44,14 @@ func usage() {
 	fmt.Fprint(os.Stderr, `rollout-man
 
   run    <file.yaml> [--runs DIR] [--id NAME] [--executor harbor|local|auto]
+         [--commands FILE]
          orchestrate, execute, record. Re-running the same id resumes: trials
          already in results.jsonl are not repeated.
 
   status <run-dir> [--pass-at F] [--failures]
          what happened.
 
-  ship   <run-dir> <file.yaml>
+  ship   <run-dir> <file.yaml> [--commands FILE]
          hand the run directory to the configured ship command.
 
   cases  <file.yaml>
@@ -85,7 +86,23 @@ func runsRoot(v string) string {
 	return "runs"
 }
 
-func build(f *config.File, executor string) (*cmdrun.Runner, rexec.Executor, error) {
+// build resolves the commands and the executor. When --commands names a file,
+// that file is the only place commands may come from: a submission that also
+// declares its own is refused rather than merged or ignored. Merging would let
+// a submitter redefine `ship`; ignoring would let them think theirs ran.
+func build(f *config.File, executor, commandsFile string) (*cmdrun.Runner, rexec.Executor, error) {
+	if commandsFile != "" {
+		trusted, err := config.LoadCommands(commandsFile)
+		if err != nil {
+			return nil, nil, err
+		}
+		if f.DeclaresCommands {
+			return nil, nil, fmt.Errorf(
+				"the submission declares its own kind: Commands, but commands are taken from %s -- "+
+					"remove the Commands document from the submission", commandsFile)
+		}
+		f.Commands = trusted
+	}
 	cmds := cmdrun.New(f.Commands)
 	cmds.Log = logf
 	ex, err := pick(executor, cmds)
@@ -126,6 +143,7 @@ func cmdRun(args []string) int {
 	runs := fs.String("runs", "", "directory holding runs (default ./runs)")
 	id := fs.String("id", "", "run id (default: experiment name + timestamp)")
 	executor := fs.String("executor", "auto", "name of the configured trial command (e.g. harbor) | local | auto")
+	commandsFile := fs.String("commands", "", "take commands from this file instead of the submission")
 	if len(args) == 0 {
 		usage()
 	}
@@ -137,7 +155,7 @@ func cmdRun(args []string) int {
 		fmt.Fprintln(os.Stderr, "load:", err)
 		return 1
 	}
-	cmds, ex, err := build(f, *executor)
+	cmds, ex, err := build(f, *executor, *commandsFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -189,13 +207,16 @@ func cmdShip(args []string) int {
 	if len(args) < 2 {
 		usage()
 	}
+	fs := flag.NewFlagSet("ship", flag.ExitOnError)
+	commandsFile := fs.String("commands", "", "take commands from this file instead of the submission")
 	dir, file := args[0], args[1]
+	fs.Parse(args[2:])
 	f, err := config.Load(file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	cmds, ex, err := build(f, "local")
+	cmds, ex, err := build(f, "local", *commandsFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -217,7 +238,7 @@ func cmdCases(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	cmds, _, err := build(f, "local")
+	cmds, _, err := build(f, "local", "")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

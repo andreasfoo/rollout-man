@@ -250,6 +250,44 @@ case, `oracle` and `claude-code`, trails back into `test/cases/jobs/`.
 Nothing about the upload is manual, and no credential belongs to rollout-man:
 the command uses whatever git identity and remote auth the machine already has.
 
+## Commands, and keeping them safe
+
+Every external system — running a trial, cloning a case, shipping a batch — is a
+command you configure. A command has three forms:
+
+```yaml
+harbor:
+  run: ["harbor", "run", "--case", "{{.CaseDir}}", "..."]   # argv
+
+ship:
+  script: |                                                  # inline shell
+    ...
+
+trial:
+  uses: adapters/harbor.sh                                   # a file, pinned
+  sha256: d822f0cf2ea4...
+```
+
+`uses:` is the one that makes commands safer, and it does so through three
+things that Actions-style plugins also rely on — none of which is the plugin
+packaging itself:
+
+- **The code lives in a file you can review**, not inline in a submission. It is
+  a normal script under `adapters/`, diffable and testable on its own.
+- **`sha256:` pins it.** If the file on disk stops matching the hash, the run is
+  *refused* — not warned about. A control nobody has to notice is not a control.
+  Every run also writes a `manifest.json` recording which command ran and its
+  hash, so a result traces back to the exact code that produced it.
+- **`inherit_env: false` plus `env:`** hands each command only the variables it
+  declares. A `ship` command that talks to git does not also get the model
+  provider's key; the trial adapter does not get your git credentials.
+
+And the trust boundary itself: `--commands <file>` takes the commands from a
+file **the submission cannot override**. A submission that ships its own
+`kind: Commands` is refused, not merged. The submitter chooses which steps run
+(`using: ship`); the operator chooses what a step *is*. See
+`commands.example.yaml`.
+
 ## Credentials
 
 rollout-man manages none. `api_key_env` and `api_key_cmd` say *where to find* a
@@ -261,7 +299,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 61 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 67 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

@@ -6,6 +6,7 @@ package cmdrun
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,11 +21,13 @@ type Runner struct {
 	Cmds        map[string]config.Command
 	Timeout     time.Duration
 	MaxAttempts int
+	InheritEnv  bool
 	Log         func(format string, args ...any)
 }
 
 func New(c config.Commands) *Runner {
-	r := &Runner{Cmds: c.Cmds, Timeout: c.Timeout.D(), MaxAttempts: c.MaxAttempts}
+	r := &Runner{Cmds: c.Cmds, Timeout: c.Timeout.D(), MaxAttempts: c.MaxAttempts,
+		InheritEnv: c.Inherits()}
 	if r.Timeout <= 0 {
 		r.Timeout = 30 * time.Minute
 	}
@@ -93,6 +96,13 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 
 	var cmd *exec.Cmd
 	switch {
+	case c.Uses != "":
+		sum, err := verify(c)
+		if err != nil {
+			return Result{}, err
+		}
+		r.logf("command %s -> %s (sha256 %s)", name, c.Uses, sum[:12])
+		cmd = exec.CommandContext(ctx, shell(), c.Uses)
 	case len(c.Run) > 0:
 		argv := make([]string, 0, len(c.Run))
 		for _, a := range c.Run {
@@ -106,11 +116,7 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 	default:
 		cmd = exec.CommandContext(ctx, shell(), "-c", c.Script)
 	}
-	// The host environment is inherited on purpose: this is the operator's own
-	// command (harbor, rclone, git) and it needs DOCKER_HOST, HOME, PATH and
-	// its own credentials. Untrusted case scripts are the ones that must not
-	// see it, and those never run here.
-	cmd.Env = append(os.Environ(), envPairs(vars)...)
+	cmd.Env = append(r.hostEnv(c), envPairs(vars)...)
 
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -119,6 +125,49 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 	}
 	return Result{Stdout: out.String(), Stderr: errb.String()}, nil
 }
+
+// hostEnv decides what of the machine the command gets to see. Inheriting
+// everything is the default because the usual case is an operator running their
+// own submission on their own machine, where the command needs DOCKER_HOST,
+// HOME and its own credentials anyway. With inherit_env: false the command sees
+// only what it declared -- so a ship command that talks to git does not also
+// get handed the keys for the model provider.
+func (r *Runner) hostEnv(c config.Command) []string {
+	if r.InheritEnv {
+		return os.Environ()
+	}
+	out := []string{
+		"HOME=" + os.Getenv("HOME"),
+		"PATH=" + os.Getenv("PATH"),
+		"LANG=C.UTF-8",
+		"TERM=dumb",
+	}
+	for _, k := range c.Env {
+		if v, ok := os.LookupEnv(k); ok {
+			out = append(out, k+"="+v)
+		}
+	}
+	return out
+}
+
+// verify reads the script named by uses: and checks the pin. A pin that does
+// not match is a refusal, not a warning: the whole value of writing the hash
+// down is that nobody has to notice a warning for it to work.
+func verify(c config.Command) (string, error) {
+	b, err := os.ReadFile(c.Uses)
+	if err != nil {
+		return "", fmt.Errorf("uses %s: %w", c.Uses, err)
+	}
+	sum := fmt.Sprintf("%x", sha256.Sum256(b))
+	if c.SHA256 != "" && !strings.EqualFold(c.SHA256, sum) {
+		return "", fmt.Errorf("uses %s: sha256 is %s, pinned to %s -- refusing to run",
+			c.Uses, sum[:12], strings.ToLower(c.SHA256)[:min(12, len(c.SHA256))])
+	}
+	return sum, nil
+}
+
+// Pin returns the sha256 of a uses: script, for the run manifest.
+func Pin(c config.Command) (string, error) { return verify(c) }
 
 // shell prefers bash: scripts in the wild are written with bashisms
 // (set -o pipefail, [[ ]]), and dash fails them in ways that read as a
