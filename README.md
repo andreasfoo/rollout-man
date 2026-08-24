@@ -106,26 +106,98 @@ matrix:
 concurrency: 4
 max_attempts: 2                         # retries only what could plausibly differ
 
-# the key names the unit: per_case runs once per case, per_trial once per
-# trial, per_experiment once at the end
+# The pipeline is a list of steps, one list per unit of work. The key names
+# the unit -- which is also the whole answer to "when does the upload happen".
 pipeline:
-  per_case:
-    admission:                          # is this case even measurable?
-      require: admitted                 # admitted (default) | any
-      oracle_min_reward: 1.0            # the reference solution must score full marks
-      nop_max_reward: 0.0               # doing nothing must score zero
-      trials: 2
+  concurrency: 16                       # how wide post-processing runs
 
-  per_trial:
-    redact:
-      keys: required                    # not optional, no switch
-      ips: {traj: true, logs: false}    # scrub what ships, keep what you debug with
+  per_case:                             # once per case
+    - uses: admission                   # is this case even measurable?
+      with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 2}
 
-  per_experiment:
-    ship:
-      using: ship
-      dest: "evals/{{.Experiment}}/{{.RunID}}"
+  per_trial:                            # once per trial
+    - uses: harbor                      # first step runs the trial
+
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: false}}
+
+    - uses: guard                       # keep only what is worth publishing
+      name: only-hard
+      with: {max_reward: 0.6, min_steps: 30}
+      on_violation: drop
+
+    - uses: archive
+      with: {format: tar}
+
+  per_experiment:                       # once, when the batch is done
+    - uses: dataset                     # one row per trial + a card
+    - uses: ship
+      with: {using: ship_hf, path: dataset, dest: my-org/rollout-libaom}
 ```
+
+### Actions
+
+A step is `uses` plus its inputs. Six are built in; a `uses` that names none of
+them falls back to a configured command, which is how a custom step is written —
+no plugin registry, no new syntax, and it inherits the hash pin and env
+allowlist that commands already have.
+
+| action | unit | what it does |
+|---|---|---|
+| `admission` | per_case | refuses a case whose oracle cannot score or whose nop can |
+| `redact` | per_trial | keys always, addresses only in what leaves the machine |
+| `guard` | per_trial, per_experiment | asserts on `reward` / `steps` / `seconds`, or on `trials` / `shipped` / `mean_reward` |
+| `archive` | per_trial | one archive per trial (`tar`, `tar.gz`, `zip`) |
+| `dataset` | per_experiment | turns the run into rows plus a card |
+| `ship` | per_trial, per_experiment | hands a path to a configured command |
+
+Every action declares the inputs it understands, and one it does not is an error
+**before the batch starts**. A misspelled key would otherwise run the step with
+its defaults and look like success — which for `redact` means publishing keys.
+
+Two widths, on purpose: `concurrency` bounds how many trials run at once (how
+many containers fit on this machine), `pipeline.concurrency` bounds how many are
+being scrubbed, packed and shipped (nothing to do with containers). The executor
+slot is released before post-processing starts, so zipping a directory never
+holds the scarce resource.
+
+### Guards, and what dropping means
+
+`guard` asks a different question from `admission`. Admission asks whether a case
+can be measured at all; a guard asks whether *this* measurement belongs in what
+you publish — "keep only the rollouts the agent found hard" is curation, not
+quality control.
+
+`on_violation: drop` keeps the measurement and publishes nothing from it. The
+reward is still recorded, still in `results.jsonl`, still in the table; what
+changes is that its artifacts do not leave the machine. Dropping decides what
+ships, never what was observed. `fail` and `warn` are there for the other case,
+where a violation means something is wrong rather than uninteresting.
+
+### Publishing: rows, not a directory tree
+
+`dataset` writes one row per trial (`data/trials.jsonl`) plus a card. That is the
+difference between a folder on a server and something `load_dataset()` can open
+and a viewer can render. The card carries the provenance the numbers are
+worthless without: every case's content hash, the admission verdict, the adapter
+that produced the trials.
+
+A note on archive formats, because it is easy to believe more than is true.
+`.zip` has **no builder in the `datasets` library at all** — a directory of zips
+publishes as opaque blobs, readable only by addressing them explicitly
+(`zip://inner::outer.zip`). `.tar` maps to the WebDataset builder, but only when
+one tar holds many samples named `<key>.<ext>`; one tar per trial is an
+attachment, not a shard. Either way it is the rows, not the archives, that make
+this a dataset. At batch sizes where the data is the problem, one archive per
+trial is also one LFS object per trial — sharding is the answer there, and
+`archive` does not do it.
+
+Dedup, quality filtering and cross-batch statistics are deliberately **not**
+actions. That work belongs to `datasets` / `datatrove` running over the whole
+corpus, not to an eval runner over one batch. What cannot move downstream is
+redaction and guards: a key that reaches a hub is in the git history, in LFS, in
+every mirror and in the viewer's cache, and `map()` runs on a dataset that is
+already published.
 
 ### Why a gate before, and a scrub after
 
@@ -299,7 +371,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 67 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 78 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

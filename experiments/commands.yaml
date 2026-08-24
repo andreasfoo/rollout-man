@@ -1,0 +1,58 @@
+# The runner's commands: what a step *is*. Kept apart from the submissions,
+# which only choose which steps run.
+#
+#   rollout-man run experiments/local.yaml --commands experiments/commands.yaml
+#
+# Every adapter is pinned by content hash. If a file on disk stops matching, the
+# run is refused rather than warned about. Regenerate the hashes with:
+#   sha256sum adapters/*.sh
+---
+kind: Commands
+timeout: 120m
+max_attempts: 3
+
+# Each command sees only the variables it declares. A shipper that talks to git
+# has no business holding the model provider's key.
+inherit_env: false
+
+# ── execute ────────────────────────────────────────────────────────────────
+# Running a trial is Harbor's job. This is the only way in.
+harbor:
+  uses: adapters/harbor.sh
+  sha256: d822f0cf2ea49988a32766b479ee679d5869272b38e2b466fe7c756a81bfb04f
+  env: [DOCKER_HOST, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, PATH, HOME]
+
+# ── where cases come from ──────────────────────────────────────────────────
+source_git:
+  script: |
+    set -euo pipefail
+    git clone --quiet --depth 1 --branch "${GIT_REF:-main}" "${GIT_REPO}" "${LOCAL_PATH}"
+  env: [SSH_AUTH_SOCK, HOME, PATH]
+
+source_hf:
+  uses: adapters/source-hf.sh
+  sha256: 7307102f5ad3a5f29a4f7c175cb419ff36fc27338cfda0b3a702512f5748ee52
+  env: [HF_TOKEN, HF_HOME, HOME, PATH]
+
+# ── where results go ───────────────────────────────────────────────────────
+ship_local:
+  uses: adapters/ship-local.sh
+  sha256: bab134e61f7465add7f9536dbbe64d3edb4cd1b14a51a66e19d9e3e8f7fa1899
+  env: [SHIP_ROOT, HOME, PATH]
+
+ship_github:
+  uses: adapters/ship-github.sh
+  sha256: 61b73aac154b7246d2cb12be1baafee0b4c759ac362f274816f6e657b9e0e749
+  env: [SHIP_REPO, SHIP_BRANCH, SSH_AUTH_SOCK, HOME, PATH,
+        GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL]
+
+ship_hf:
+  uses: adapters/ship-hf.sh
+  sha256: 7bf57edebf474fe96eebd485a18c9c2f5e9b34d60e295f7574c9452d0468f70f
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HF_PATH_IN_REPO, HOME, PATH]
+
+# OneDrive, S3, WebDAV, sftp -- whatever the operator's rclone.conf reaches.
+ship_rclone:
+  uses: adapters/ship-rclone.sh
+  sha256: f5ae5e1786894a016bb4a365f10a9b9cd50a4643e7cfa8678607db4d5a35bcef
+  env: [RCLONE_REMOTE, RCLONE_CONFIG, HOME, PATH]

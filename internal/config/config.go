@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -105,7 +106,7 @@ type LLMSpec struct {
 }
 
 type CaseRef struct {
-	Source string `yaml:"source"` // git | local
+	Source string `yaml:"source"` // local | git | hf
 	Repo   string `yaml:"repo"`
 	Ref    string `yaml:"ref"`
 	Path   string `yaml:"path"`
@@ -159,37 +160,159 @@ type Matrix struct {
 	Trials   int        `yaml:"trials"`
 }
 
-type Admission struct {
-	Require   string  `yaml:"require"` // admitted (default) | any
-	OracleMin float64 `yaml:"oracle_min_reward"`
-	NopMax    float64 `yaml:"nop_max_reward"`
-	Trials    int     `yaml:"trials"`
+// Action is one step in a pipeline. The shape is the one people already know
+// from CI: a name, its inputs, and what a failure means.
+//
+//   - uses: redact
+//     with: {keys: required}
+//     on_failure: fail
+//
+// `uses` names either a built-in action or a command from kind: Commands, so a
+// custom step needs no new syntax -- it is a command like every other external
+// thing this system touches, pin and all.
+type Action struct {
+	Uses string         `yaml:"uses"`
+	Name string         `yaml:"name"` // optional label for the log
+	With map[string]any `yaml:"with"`
+	// OnFailure decides what a failing step means for the unit it runs on:
+	// "fail" (default) stops that unit, "warn" records it and continues.
+	OnFailure string `yaml:"on_failure"`
+	// OnViolation is the guard's verdict: "fail" (default), "warn", or "drop"
+	// -- keep the measurement, publish nothing from it.
+	OnViolation string `yaml:"on_violation"`
 }
 
-type Redact struct {
-	Keys  string          `yaml:"keys"` // must be "required"
-	IPs   map[string]bool `yaml:"ips"`  // traj: true, logs: false
-	Extra []string        `yaml:"extra_patterns"`
+// UnmarshalYAML rejects keys this struct does not have. Plain struct decoding
+// ignores them, which means a step written with `on_violation:` one level too
+// high runs with its default and looks like it worked -- the exact failure the
+// `with:` checks exist to prevent, one level up.
+func (a *Action) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("a pipeline step must be a mapping with uses:")
+	}
+	type plain Action
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		switch k := n.Content[i].Value; k {
+		case "uses", "name", "with", "on_failure", "on_violation":
+		default:
+			return fmt.Errorf("unknown key %q in a pipeline step; "+
+				"a step takes uses, name, with, on_failure, on_violation", k)
+		}
+	}
+	return n.Decode((*plain)(a))
 }
 
-type Ship struct {
-	Using string `yaml:"using"` // a command name
-	Dest  string `yaml:"dest"`
+func (a Action) Label() string {
+	if a.Name != "" {
+		return a.Name
+	}
+	return a.Uses
 }
 
-// Pipeline keeps the three scopes from the design, with one setting each. The
-// key still names the unit: per_case runs once per case, per_trial once per
-// trial, per_experiment once at the end.
+func (a Action) Warns() bool { return a.OnFailure == "warn" }
+
+func (a Action) Has(k string) bool { _, ok := a.With[k]; return ok }
+
+func (a Action) Str(k, def string) string {
+	if s, ok := a.With[k].(string); ok {
+		return s
+	}
+	return def
+}
+
+func (a Action) Num(k string, def float64) float64 {
+	switch v := a.With[k].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	}
+	return def
+}
+
+func (a Action) Bool(k string, def bool) bool {
+	if b, ok := a.With[k].(bool); ok {
+		return b
+	}
+	return def
+}
+
+func (a Action) Strs(k string) []string {
+	raw, ok := a.With[k].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (a Action) Flags(k string) map[string]bool {
+	m, _ := a.With[k].(map[string]any)
+	out := map[string]bool{}
+	for k, v := range m {
+		if b, ok := v.(bool); ok {
+			out[k] = b
+		}
+	}
+	return out
+}
+
+// Unknown reports inputs this action was not expecting. A typo in `with:` is
+// otherwise invisible: the step runs, quietly does the default thing, and the
+// batch looks fine until someone reads the artifacts three days later.
+func (a Action) Unknown(known ...string) []string {
+	set := map[string]bool{}
+	for _, k := range known {
+		set[k] = true
+	}
+	var out []string
+	for k := range a.With {
+		if !set[k] {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Pipeline is three lists, one per unit of work. The key names the unit, and
+// that is also the whole answer to "when does the upload happen": ship under
+// per_trial runs per trial, ship under per_experiment runs once when the batch
+// is done. Position is timing; there is no separate switch.
 type Pipeline struct {
-	PerCase struct {
-		Admission *Admission `yaml:"admission"`
-	} `yaml:"per_case"`
-	PerTrial struct {
-		Redact *Redact `yaml:"redact"`
-	} `yaml:"per_trial"`
-	PerExperiment struct {
-		Ship *Ship `yaml:"ship"`
-	} `yaml:"per_experiment"`
+	// Concurrency bounds post-trial processing. It is deliberately not the
+	// same number as Experiment.Concurrency: that one answers "how many
+	// containers fit on this machine", this one answers "how many trials can
+	// be scrubbed, packed and shipped at once", and at batch sizes where the
+	// data is the problem those are different questions.
+	Concurrency int `yaml:"concurrency"`
+
+	PerCase       []Action `yaml:"per_case"`
+	PerTrial      []Action `yaml:"per_trial"`
+	PerExperiment []Action `yaml:"per_experiment"`
+}
+
+// Executor is the action that runs the trial. It must be the first entry in
+// per_trial, because nothing can post-process a trial that has not run.
+func (p Pipeline) Executor() (Action, error) {
+	if len(p.PerTrial) == 0 {
+		return Action{}, fmt.Errorf(
+			"pipeline.per_trial is empty: it must begin with the action that runs the trial, e.g. `- uses: harbor`")
+	}
+	return p.PerTrial[0], nil
+}
+
+// PostTrial is everything after the executor.
+func (p Pipeline) PostTrial() []Action {
+	if len(p.PerTrial) == 0 {
+		return nil
+	}
+	return p.PerTrial[1:]
 }
 
 type Experiment struct {
@@ -342,16 +465,30 @@ func (f *File) validate() error {
 	if e.MaxAttempts <= 0 {
 		e.MaxAttempts = 1
 	}
-	if a := e.Pipeline.PerCase.Admission; a != nil {
-		if a.Trials <= 0 {
-			a.Trials = 2
-		}
-		if a.Require == "" {
-			a.Require = "admitted"
-		}
+	if e.Pipeline.Concurrency <= 0 {
+		e.Pipeline.Concurrency = e.Concurrency
 	}
-	if r := e.Pipeline.PerTrial.Redact; r != nil && r.Keys != "" && r.Keys != "required" {
-		return fmt.Errorf(`pipeline.per_trial.redact.keys must be "required", got %q`, r.Keys)
+	if _, err := e.Pipeline.Executor(); err != nil {
+		return err
+	}
+	units := []struct {
+		name string
+		list []Action
+	}{
+		{"per_case", e.Pipeline.PerCase},
+		{"per_trial", e.Pipeline.PerTrial},
+		{"per_experiment", e.Pipeline.PerExperiment},
+	}
+	for _, u := range units {
+		for i, a := range u.list {
+			if a.Uses == "" {
+				return fmt.Errorf("pipeline.%s[%d] has no uses:", u.name, i)
+			}
+			if a.OnFailure != "" && a.OnFailure != "fail" && a.OnFailure != "warn" {
+				return fmt.Errorf("pipeline.%s[%d] (%s): on_failure must be fail or warn, got %q",
+					u.name, i, a.Label(), a.OnFailure)
+			}
+		}
 	}
 	for _, n := range e.Matrix.LLMSpecs {
 		if _, ok := f.LLMSpecs[n]; !ok {

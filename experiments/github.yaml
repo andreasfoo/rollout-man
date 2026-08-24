@@ -1,0 +1,55 @@
+# Route 2 of 3 — cases from a git repo, trails committed back to one.
+#
+#   export SHIP_REPO=/path/to/checkout SHIP_BRANCH=main
+#   rollout-man run experiments/github.yaml --commands experiments/commands.yaml
+#
+# Same middle as experiments/local.yaml. Only the ends move.
+---
+kind: LLMSpec
+name: sonnet
+provider: anthropic
+model: anthropic/claude-sonnet-4-5
+api_key_env: ANTHROPIC_API_KEY
+
+---
+kind: Experiment
+name: libaom-github
+
+case_defaults:
+  source: git
+  repo: https://github.com/andreasfoo/rollout-man
+  ref: main                             # allowed to move; pinned in the run's records
+
+cases:
+  - path: test/cases/libaom-cc9e46cb-bug-6491968-t4
+
+matrix:
+  agents:
+    - name: oracle
+    - name: claude-code
+      llm_spec: sonnet
+  trials: 1
+
+concurrency: 2
+
+pipeline:
+  concurrency: 8
+
+  per_case:
+    - uses: admission
+      with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
+
+  per_trial:
+    - uses: harbor
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: false}}
+    - uses: archive
+      with: {format: tar}
+
+  per_experiment:
+    - uses: dataset
+    - uses: ship
+      with:
+        using: ship_github
+        path: dataset
+        dest: "test/cases/jobs/{{.Experiment}}/{{.RunID}}"

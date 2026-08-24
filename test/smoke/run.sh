@@ -221,8 +221,9 @@ cases: [{path: test/smoke/pass-case}]
 matrix: {agents: [oracle], trials: 1}
 concurrency: 1
 pipeline:
-  per_case: {admission: {require: any}}
-  per_experiment: {ship: {using: ship, dest: pin}}
+  per_case: [{uses: admission, with: {require: any}}]
+  per_trial: [{uses: local}]
+  per_experiment: [{uses: ship, with: {using: ship, dest: pin}}]
 C
 # A run whose commands come from the trusted file.
 KEEP=yes DROP=secret "$BIN" run "$PINDIR/exp.yaml" --runs "$PINDIR/runs" --id r --executor local --commands "$PINDIR/commands.yaml" > "$PINDIR/out.log" 2>&1
@@ -249,10 +250,57 @@ case_defaults: {source: local}
 cases: [{path: test/smoke/pass-case}]
 matrix: {agents: [oracle], trials: 1}
 concurrency: 1
-pipeline: {per_case: {admission: {require: any}}}
+pipeline:
+  per_case: [{uses: admission, with: {require: any}}]
+  per_trial: [{uses: local}]
 C
 "$BIN" run "$PINDIR/evil.yaml" --runs "$PINDIR/runs3" --id r --executor local --commands "$PINDIR/commands.yaml" > "$PINDIR/evil.log" 2>&1
 check "a submission cannot override the trusted commands" 'grep -q "declares its own kind: Commands" "$PINDIR/evil.log"'
+
+step "13. the pipeline is a list of actions"
+# Curation is the point: run it, scrub it, keep only what is worth keeping,
+# pack it, publish rows rather than a directory. Each of those is a step, and a
+# step that decides nothing gets published still records what was measured.
+ADIR="$RUNS/actions"; rm -rf "$ADIR"; mkdir -p "$ADIR"
+cat > "$ADIR/exp.yaml" <<C
+---
+kind: Experiment
+name: actions
+case_defaults: {source: local}
+cases: [{path: test/smoke/pass-case}, {path: test/smoke/leaky-case}]
+matrix: {agents: [oracle, nop], trials: 1}
+concurrency: 2
+pipeline:
+  concurrency: 4
+  per_case: [{uses: admission, with: {require: any}}]
+  per_trial:
+    - uses: local
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: false}}
+    - {uses: guard, name: only-hard, with: {max_reward: 0.5}, on_violation: drop}
+    - {uses: archive, with: {format: zip}}
+  per_experiment:
+    - {uses: dataset, with: {title: "smoke rollouts"}}
+    - {uses: guard, name: enough, with: {min_shipped: 2}}
+C
+AOUT=$("$BIN" run "$ADIR/exp.yaml" --runs "$ADIR/runs" --id a --executor local 2>&1)
+echo "$AOUT" | grep -E "dropped|dataset:" | sed 's/^/    /'
+ADR="$ADIR/runs/a"
+check "the guard dropped what the oracle solved" 'echo "$AOUT" | grep -q "dropped by only-hard: reward = 1"'
+check "a dropped trial is still measured"        'grep dropped "$ADR/results.jsonl" | grep -q \"reward\":1'
+check "nop survived the guard"                   '! grep "nop" "$ADR/results.jsonl" | grep -q dropped'
+check "one archive per surviving trial"          '[ "$(ls "$ADR/archives" | wc -l)" -eq 2 ]'
+check "archives are zip because it asked for zip" 'ls "$ADR/archives" | grep -q "\.zip$"'
+check "the dataset has a row per survivor"       '[ "$(wc -l < "$ADR/dataset/data/trials.jsonl")" -eq 2 ]'
+check "dropped trials are not in the dataset"    '! grep -q oracle "$ADR/dataset/data/trials.jsonl"'
+check "the card records each case's bytes"       'grep -q "$("$BIN" cases "$ADIR/exp.yaml" | head -1 | awk "{print \$2}")" "$ADR/dataset/README.md"'
+check "the batch guard let it through"           '! echo "$AOUT" | grep -q "guard enough"'
+
+# A step that is not spelled right must be caught before anything runs.
+sed 's/max_reward/max_rewrad/' "$ADIR/exp.yaml" > "$ADIR/typo.yaml"
+"$BIN" run "$ADIR/typo.yaml" --runs "$ADIR/runs2" --id a --executor local > "$ADIR/typo.log" 2>&1
+check "a misspelled input is refused before the run" 'grep -q "unknown input" "$ADIR/typo.log"'
+check "and nothing ran"                              '[ ! -f "$ADIR/runs2/a/results.jsonl" ]'
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

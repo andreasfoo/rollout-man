@@ -52,9 +52,9 @@ func usage() {
          what happened.
 
   ship   <run-dir> <file.yaml> [--commands FILE]
-         hand the run directory to the configured ship command.
+         re-run the per_experiment steps against an existing run directory.
 
-  cases  <file.yaml>
+  cases  <file.yaml> [--commands FILE]
          resolve every case and print its content hash.
 `)
 	os.Exit(2)
@@ -222,7 +222,11 @@ func cmdShip(args []string) int {
 		return 1
 	}
 	r := &run.Runner{File: f, Cmds: cmds, Exec: ex, Dir: dir, Log: logf}
-	if err := r.Ship(context.Background()); err != nil {
+	if err := r.Restore(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := r.Finish(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -233,12 +237,15 @@ func cmdCases(args []string) int {
 	if len(args) == 0 {
 		usage()
 	}
+	fs := flag.NewFlagSet("cases", flag.ExitOnError)
+	commandsFile := fs.String("commands", "", "take commands from this file instead of the submission")
+	fs.Parse(args[1:])
 	f, err := config.Load(args[0])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	cmds, _, err := build(f, "local", "")
+	cmds, _, err := build(f, "local", *commandsFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1

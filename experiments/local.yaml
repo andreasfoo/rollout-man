@@ -1,0 +1,71 @@
+# Route 1 of 3 — a case from the working tree, results onto this machine.
+#
+# This is the shape to develop against: no credentials, no network, nothing to
+# clean up if it goes wrong. The other two routes differ only in where the case
+# comes from and where the results go; the middle is identical.
+#
+#   rollout-man run experiments/local.yaml --commands experiments/commands.yaml
+#
+# The pipeline reads top to bottom, and the key names the unit it runs on.
+---
+kind: LLMSpec
+name: sonnet
+provider: anthropic
+model: anthropic/claude-sonnet-4-5
+api_key_env: ANTHROPIC_API_KEY
+
+---
+kind: Experiment
+name: libaom-local
+
+case_defaults:
+  source: local
+
+cases:
+  - path: test/cases/libaom-cc9e46cb-bug-6491968-t4
+
+matrix:
+  agents:
+    - name: oracle                      # the reference: its trail is the ground truth
+    - name: claude-code
+      llm_spec: sonnet
+  trials: 1
+
+concurrency: 2                          # how many containers fit on this machine
+
+pipeline:
+  concurrency: 8                        # how many trials can be processed at once
+
+  per_case:
+    # Is this case measurable at all? A broken environment produces numbers that
+    # look exactly like a weak agent once they are in the table.
+    - uses: admission
+      with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
+
+  per_trial:
+    # The first step runs the trial. Nothing can post-process a trial that has
+    # not run, so this position is not a convention -- it is the only one.
+    - uses: harbor
+
+    # Keys always, addresses only in what leaves the machine. This has to happen
+    # here and not downstream: a key that reaches a published dataset cannot be
+    # taken back.
+    - uses: redact
+      with:
+        keys: required
+        ips: {traj: true, logs: false}
+
+    # One archive per trial. tar, because that is what a dataset hub reads as
+    # WebDataset; zip would publish as opaque blobs.
+    - uses: archive
+      with: {format: tar}
+
+  per_experiment:
+    # Rows plus a card: the difference between a folder and a dataset.
+    - uses: dataset
+      with: {title: "libaom rollouts (local)"}
+
+    - uses: ship
+      with:
+        using: ship_local
+        dest: "{{.Experiment}}/{{.RunID}}"

@@ -38,12 +38,9 @@ max_attempts: 1
 
 pipeline:
   per_case:
-    admission:
-      require: admitted
-      oracle_min_reward: 1.0
-      nop_max_reward: 0.0
-      trials: 1
+    - uses: admission
+      with: {require: admitted, oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
   per_trial:
-    redact:
-      keys: required
-      ips: {traj: true, logs: false}
+    - uses: harbor
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: false}}

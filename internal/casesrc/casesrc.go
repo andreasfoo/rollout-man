@@ -92,8 +92,39 @@ func (r *Resolver) fetch(ctx context.Context, ref config.CaseRef) (dir, pinned s
 			}
 		}
 		return sub, pinGit(dst, ref.Ref), nil
+
+	case "hf":
+		// A dataset repo on a hub is a git repo with a download command in
+		// front of it, so it is the same shape as git: a command fetches it,
+		// and the content hash -- not the ref -- is still the version.
+		cmd := ref.Fetch
+		if cmd == "" {
+			cmd = "source_hf"
+		}
+		dst, err := os.MkdirTemp(r.TempDir, "case-*")
+		if err != nil {
+			return "", "", err
+		}
+		rev := ref.Ref
+		if rev == "" {
+			rev = "main"
+		}
+		if _, err := r.Cmds.Run(ctx, cmd, map[string]string{
+			"HfRepo": ref.Repo, "HfRevision": rev, "LocalPath": dst, "HfPath": ref.Path,
+		}); err != nil {
+			return "", "", fail.Wrap(fail.Host, "hf fetch", err)
+		}
+		sub := dst
+		if ref.Path != "" {
+			sub = filepath.Join(dst, ref.Path)
+			if fi, err := os.Stat(sub); err != nil || !fi.IsDir() {
+				return "", "", fail.New(fail.Host, "path not found in dataset repo: "+ref.Path)
+			}
+		}
+		return sub, "hf:" + ref.Repo + "@" + rev, nil
 	}
-	return "", "", fail.New(fail.Host, "unknown case source "+ref.Source)
+	return "", "", fail.New(fail.Host,
+		"unknown case source "+ref.Source+" (local, git, hf)")
 }
 
 var zeroTime = time.Unix(0, 0).UTC()
