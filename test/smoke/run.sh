@@ -395,5 +395,55 @@ C
 "$BIN" run "$RUNS/noexec.yaml" --runs "$RUNS/noexec-run" --id n --executor local > "$RUNS/noexec.log" 2>&1
 check "a non-executable adapter names the fix" 'grep -q "chmod +x" "$RUNS/noexec.log"'
 
+step "15. progress: how many, how far, and what is happening right now"
+# A pipeline of five steps over hour-long trials used to say nothing between
+# "started" and "finished". These are the three questions that silence raised.
+PDIR="$RUNS/progress"; rm -rf "$PDIR"; mkdir -p "$PDIR"
+cat > "$PDIR/exp.yaml" <<C
+---
+kind: Commands
+timeout: 5m
+slowstep: {script: "sleep 20"}
+---
+kind: Experiment
+name: progress
+case_defaults: {source: local}
+cases: [{path: test/smoke/pass-case}, {path: test/smoke/leaky-case}]
+matrix: {agents: [oracle, nop], trials: 1}
+concurrency: 4
+pipeline:
+  concurrency: 4
+  per_case: [{uses: admission, with: {require: any}}]
+  per_trial:
+    - uses: local
+    - uses: slowstep
+C
+"$BIN" run "$PDIR/exp.yaml" --runs "$PDIR/runs" --id p --executor local > "$PDIR/out.log" 2>&1 &
+PPID_RUN=$!
+# Read the state from outside the process while it is still going -- the half
+# that results.jsonl cannot answer, because those trials have not finished.
+until [ -f "$PDIR/runs/p/progress.json" ]; do sleep 1; done
+sleep 6
+LIVE=$("$BIN" status "$PDIR/runs/p" 2>&1)
+ONECASE=$("$BIN" status "$PDIR/runs/p" --case pass-case 2>&1)
+wait $PPID_RUN
+OUT=$(cat "$PDIR/out.log")
+
+check "the total is known before anything finishes" 'echo "$LIVE" | grep -q "0/4 trials done"'
+check "the run reports itself as running"           'echo "$LIVE" | grep -q "(running)"'
+check "each case has its own denominator"           '[ "$(echo "$LIVE" | grep -cE "test/smoke/(pass|leaky)-case +[0-9]+ +2")" -eq 2 ]'
+check "in-flight trials name the step they are in"  'echo "$LIVE" | grep -qE "test-smoke-.*(local|slowstep) +[0-9]+s"'
+check "--case narrows to one case"                  '! echo "$ONECASE" | grep -q leaky-case'
+# The heartbeat is what makes a long step visible without asking.
+check "the log has a heartbeat while it waits"      'echo "$OUT" | grep -qE "[0-9]+/4 done · [0-9]+ running"'
+check "the heartbeat names the step"                'echo "$OUT" | grep -q "slowstep×"'
+check "and per-case progress"                       'echo "$OUT" | grep -qE "leaky-case [0-9]+/2 · pass-case [0-9]+/2"'
+check "every completion carries a counter"          '[ "$(echo "$OUT" | grep -cE "^[0-9:]+ +[[][0-9]/4[]]")" -eq 4 ]'
+check "cases are counted as they resolve"           'echo "$OUT" | grep -q "case 2/2 "'
+check "the finished run says so"                    '"$BIN" status "$PDIR/runs/p" | grep -q "(finished)"'
+# One line per command, not one per invocation: at batch scale the pin
+# announcement would otherwise outnumber the results.
+check "a command announces itself once"             '[ "$(echo "$OUT" | grep -c "command slowstep ->")" -le 1 ]'
+
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

@@ -241,6 +241,49 @@ anyway. IP scrubbing is tiered by destination — on for the trajectory and
 result, which leave the team; off for logs, which are what you debug with and
 where an IPv4 regex eats version numbers for breakfast.
 
+### Knowing where a batch is
+
+A pipeline of five steps over hour-long trials used to say nothing between
+"started" and "finished". Three questions came out of that silence — how much is
+there, how far along is it, and what is happening right now — and all three are
+answered while it runs:
+
+```
+09:11:02  case 2/2 test/cases/libaom-cc9e46cb-bug-6491968-t4 -> 3ab3f15bb196 (pinned git)
+09:11:04  matrix: 34 trials across 2 cases
+09:11:19  6/34 done · 4 running (harbor×2, archive×1, ship×1) · 1 dropped
+09:11:19     libaom 4/17 · spidermonkey 2/17
+09:11:19     slowest: libaom…-claude-code-sonnet-7 in harbor for 4m12s
+09:11:23  [7/34] libaom…-claude-code-sonnet-3: reward 0.420 (18.3s)
+```
+
+The heartbeat names **which step** each in-flight trial is in, so a long wait is
+distinguishable from a stuck one — that is what the `slowest:` line is for.
+
+The same state is written to `progress.json` as it changes, so another terminal
+can read it without parsing the log:
+
+```bash
+rollout-man status runs/nightly                    # works mid-run
+rollout-man status runs/nightly --case libaom      # follow one case
+```
+
+```
+libaom-hf  (running)
+  6/34 trials done · 1 dropped
+
+  Case                                          done       of  dropped   failed
+  test/cases/libaom-cc9e46cb-bug-6491968-t4        4       17        1        0
+
+  in flight
+    …-claude-code-sonnet-7                        harbor       4m12s
+    …-claude-code-sonnet-9                        archive         3s
+```
+
+It is written by rename, so a reader never catches a half-written file — which
+matters precisely because the expected use is one process reading while another
+writes.
+
 ### What the results look like
 
 rollout-man does not decide what counts as success. It records the reward each
@@ -427,7 +470,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 94 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 106 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

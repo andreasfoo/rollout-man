@@ -19,6 +19,7 @@ import (
 	"github.com/andreasfoo/rollout-man/internal/config"
 	rexec "github.com/andreasfoo/rollout-man/internal/exec"
 	"github.com/andreasfoo/rollout-man/internal/fail"
+	"github.com/andreasfoo/rollout-man/internal/progress"
 	"github.com/andreasfoo/rollout-man/internal/run"
 )
 
@@ -48,7 +49,7 @@ func usage() {
          orchestrate, execute, record. Re-running the same id resumes: trials
          already in results.jsonl are not repeated.
 
-  status <run-dir> [--pass-at F] [--failures]
+  status <run-dir> [--pass-at F] [--failures] [--case SUBSTR]
          what happened.
 
   ship   <run-dir> <file.yaml> [--commands FILE]
@@ -187,7 +188,7 @@ func cmdRun(args []string) int {
 		return 1
 	}
 	fmt.Println()
-	report(dir, -1, false)
+	report(dir, -1, false, "", false)
 	return 0
 }
 
@@ -195,12 +196,81 @@ func cmdStatus(args []string) int {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	passAt := fs.Float64("pass-at", -1, "also show the pass rate at this reward")
 	failures := fs.Bool("failures", false, "list the failed trials")
+	only := fs.String("case", "", "only this case (substring match)")
 	if len(args) == 0 {
 		usage()
 	}
 	dir := args[0]
 	fs.Parse(args[1:])
-	return report(dir, *passAt, *failures)
+	inFlight := live(dir, *only)
+	return report(dir, *passAt, *failures, *only, inFlight)
+}
+
+// live prints the run's current state, if it has one. A run that is still
+// going has nothing to say in results.jsonl about the trials still in flight,
+// which is exactly the half you want while waiting.
+// live prints the run's current state and reports whether it is still going.
+func live(dir, only string) bool {
+	snap, err := progress.Load(dir)
+	if err != nil {
+		return false
+	}
+	fmt.Printf("\n%s  %s\n", snap.Experiment, state(snap))
+	fmt.Printf("  %d/%d trials done", snap.Done, snap.Total)
+	if snap.Dropped > 0 {
+		fmt.Printf(" · %d dropped", snap.Dropped)
+	}
+	if snap.Failed > 0 {
+		fmt.Printf(" · %d not measured", snap.Failed)
+	}
+	fmt.Println()
+
+	names := make([]string, 0, len(snap.Cases))
+	for k := range snap.Cases {
+		if only == "" || strings.Contains(k, only) {
+			names = append(names, k)
+		}
+	}
+	sort.Strings(names)
+	if len(names) > 1 || only != "" {
+		fmt.Println()
+		fmt.Printf("  %-44s %5s %8s %8s %8s\n", "Case", "done", "of", "dropped", "failed")
+		for _, n := range names {
+			c := snap.Cases[n]
+			fmt.Printf("  %-44s %5d %8d %8d %8d\n", trim(n, 44), c.Done, c.Total, c.Dropped, c.Failed)
+		}
+	}
+
+	var running []progress.Entry
+	for _, e := range snap.Running {
+		if only == "" || strings.Contains(e.Case, only) {
+			running = append(running, e)
+		}
+	}
+	if len(running) > 0 {
+		fmt.Printf("\n  in flight\n")
+		now := time.Now()
+		for _, e := range running {
+			fmt.Printf("    %-52s %-12s %s\n", trim(e.TrialID, 52), e.Step,
+				now.Sub(e.Since).Round(time.Second))
+		}
+	}
+	fmt.Println()
+	return !snap.Finished
+}
+
+func state(s progress.Snapshot) string {
+	if s.Finished {
+		return "(finished)"
+	}
+	return "(running)"
+}
+
+func trim(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "…" + s[len(s)-n+1:]
 }
 
 func cmdShip(args []string) int {
@@ -275,14 +345,29 @@ type row struct {
 	fails       map[fail.Code]int
 }
 
-func report(dir string, passAt float64, listFailures bool) int {
+func report(dir string, passAt float64, listFailures bool, only string, inFlight bool) int {
 	results, err := run.Load(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	if only != "" {
+		kept := results[:0]
+		for _, r := range results {
+			if strings.Contains(r.Case, only) {
+				kept = append(kept, r)
+			}
+		}
+		results = kept
+	}
 	if len(results) == 0 {
-		fmt.Println("no trials recorded in", dir)
+		if inFlight {
+			// The live view above already said what is happening; saying
+			// "nothing recorded" after it reads as a contradiction.
+			fmt.Println("  no trial has finished yet")
+		} else {
+			fmt.Println("no trials recorded in", dir)
+		}
 		return 0
 	}
 	idx := map[string]*row{}

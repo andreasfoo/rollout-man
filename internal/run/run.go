@@ -24,6 +24,7 @@ import (
 	"github.com/andreasfoo/rollout-man/internal/config"
 	rexec "github.com/andreasfoo/rollout-man/internal/exec"
 	"github.com/andreasfoo/rollout-man/internal/fail"
+	"github.com/andreasfoo/rollout-man/internal/progress"
 	"github.com/andreasfoo/rollout-man/internal/redact"
 )
 
@@ -77,10 +78,11 @@ type Runner struct {
 	Dir  string // runs/<run-id>
 	Log  func(string, ...any)
 
-	mu      sync.Mutex
-	results []Result
-	done    map[string]bool
-	dropped map[string]bool
+	mu       sync.Mutex
+	results  []Result
+	done     map[string]bool
+	dropped  map[string]bool
+	progress *progress.Tracker
 }
 
 func (r *Runner) logf(f string, a ...any) {
@@ -113,7 +115,23 @@ func (r *Runner) Run(ctx context.Context) error {
 	trials := expand(&r.File.Experiment, cases)
 	r.logf("matrix: %d trials across %d cases%s", len(trials), len(cases), deterministicNote(&r.File.Experiment))
 
+	labels := make([]string, len(trials))
+	for i, t := range trials {
+		labels[i] = t.Case.Label
+	}
+	r.progress = progress.New(r.Dir, r.File.Experiment.Name, filepath.Base(r.Dir), labels)
+	var resumed []string
+	for _, t := range trials {
+		if r.done[t.ID] {
+			resumed = append(resumed, t.Case.Label)
+		}
+	}
+	r.progress.Resumed(resumed, r.dropped)
+
+	stop := r.heartbeat(ctx)
 	r.runAll(ctx, trials)
+	stop()
+	r.progress.Close()
 
 	if err := r.Finish(ctx); err != nil {
 		return err
@@ -189,13 +207,13 @@ func sortedCmdNames(m map[string]config.Command) []string {
 func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 	ex := &r.File.Experiment
 	var out []*casesrc.Case
-	for _, raw := range ex.Cases {
+	for i, raw := range ex.Cases {
 		ref := raw.Merge(ex.CaseDefaults)
 		c, err := r.Res.Resolve(ctx, ref)
 		if err != nil {
 			return nil, fmt.Errorf("resolve %s: %w", ref.Label(), err)
 		}
-		r.logf("case %s -> %s (pinned %s)", c.Label, c.SHA256[:12], c.PinnedAt)
+		r.logf("case %d/%d %s -> %s (pinned %s)", i+1, len(ex.Cases), c.Label, c.SHA256[:12], c.PinnedAt)
 
 		actx := r.actionCtx(actions.PerCase)
 		actx.CaseLabel, actx.CaseDir, actx.CaseSHA = c.Label, c.Dir, c.SHA256
@@ -289,6 +307,31 @@ func trialID(c *casesrc.Case, agent, spec string, i int) string {
 	return fmt.Sprintf("%s-%d", id, i)
 }
 
+// heartbeat speaks while trials are in flight. Without it the log goes quiet
+// for as long as the slowest step takes, which on a real case is an hour --
+// and a batch that says nothing is indistinguishable from one that is stuck.
+func (r *Runner) heartbeat(ctx context.Context) func() {
+	every := 15 * time.Second
+	done := make(chan struct{})
+	go func() {
+		tick := time.NewTicker(every)
+		defer tick.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case now := <-tick.C:
+				for _, line := range r.progress.Snapshot().Lines(time.Minute, now) {
+					r.logf("%s", line)
+				}
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
 // --------------------------------------------------------------- trials ---
 
 // runAll uses two separate widths on purpose. Running a trial is bounded by how
@@ -311,6 +354,7 @@ func (r *Runner) runAll(ctx context.Context, trials []*trial) {
 				return
 			}
 			exec <- struct{}{}
+			r.progress.Step(t.ID, t.Case.Label, r.executorName())
 			res := r.attempts(ctx, t)
 			<-exec
 
@@ -331,13 +375,16 @@ func (r *Runner) runAll(ctx context.Context, trials []*trial) {
 			<-post
 
 			r.append(res)
+			r.progress.Finish(t.ID, t.Case.Label, res.OK(), res.Dropped)
+			snap := r.progress.Snapshot()
+			at := fmt.Sprintf("[%d/%d]", snap.Done, snap.Total)
 			switch {
 			case res.OK() && res.Dropped:
-				r.logf("%s: reward %.3f (%.1fs, dropped)", t.ID, *res.Reward, res.Seconds)
+				r.logf("%s %s: reward %.3f (%.1fs, dropped)", at, t.ID, *res.Reward, res.Seconds)
 			case res.OK():
-				r.logf("%s: reward %.3f (%.1fs)", t.ID, *res.Reward, res.Seconds)
+				r.logf("%s %s: reward %.3f (%.1fs)", at, t.ID, *res.Reward, res.Seconds)
 			default:
-				r.logf("%s: %s %s", t.ID, res.Code, firstLine(res.Message))
+				r.logf("%s %s: %s %s", at, t.ID, res.Code, firstLine(res.Message))
 			}
 		}(t)
 	}
@@ -427,6 +474,7 @@ func (r *Runner) postTrial(ctx context.Context, t *trial, res *Result, outDir st
 	}
 	c := r.actionCtx(actions.PerTrial)
 	c.Secrets = secrets
+	c.Enter = func(step string) { r.progress.Step(t.ID, t.Case.Label, step) }
 	c.Trial = &actions.Trial{
 		ID: t.ID, Case: t.Case.Label, CaseSHA: t.Case.SHA256, Agent: t.Agent,
 		LLMSpec: t.LLMSpec, Index: t.Index, Reward: res.Reward, Code: string(res.Code),
@@ -450,6 +498,15 @@ func (r *Runner) postTrial(ctx context.Context, t *trial, res *Result, outDir st
 }
 
 // ------------------------------------------------------------- actions ---
+
+// executorName is what the first per_trial step is called, which is what a
+// trial is doing for most of its life.
+func (r *Runner) executorName() string {
+	if a, err := r.File.Experiment.Pipeline.Executor(); err == nil {
+		return a.Label()
+	}
+	return "run"
+}
 
 func (r *Runner) actionCtx(scope actions.Scope) *actions.Ctx {
 	return &actions.Ctx{

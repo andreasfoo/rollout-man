@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -23,6 +24,9 @@ type Runner struct {
 	MaxAttempts int
 	InheritEnv  bool
 	Log         func(format string, args ...any)
+
+	mu        sync.Mutex
+	announced map[string]bool
 }
 
 func New(c config.Commands) *Runner {
@@ -101,7 +105,11 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 		if err != nil {
 			return Result{}, err
 		}
-		r.logf("command %s -> %s (sha256 %s)", name, c.Uses, sum[:12])
+		if r.announce(name) {
+			// Once per command, not once per invocation: at batch scale this
+			// line would otherwise outnumber the results.
+			r.logf("command %s -> %s (sha256 %s)", name, c.Uses, sum[:12])
+		}
 		// Run the file, not a shell reading the file. The contract is
 		// "environment in, files out" -- nothing in it says shell -- so an
 		// adapter is free to be Python, a compiled binary, or anything else
@@ -237,6 +245,20 @@ func tail(s string, n int) string {
 		return s
 	}
 	return "..." + s[len(s)-n:]
+}
+
+// announce reports whether this command has not been named in the log yet.
+func (r *Runner) announce(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.announced == nil {
+		r.announced = map[string]bool{}
+	}
+	if r.announced[name] {
+		return false
+	}
+	r.announced[name] = true
+	return true
 }
 
 func (r *Runner) logf(f string, a ...any) {
