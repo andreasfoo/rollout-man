@@ -104,7 +104,7 @@ matrix:
     - name: oracle                      # builtin: no LLM, no cartesian product
     - name: nop
   llm_specs: [opus-prod]
-  trials: 10
+  trials: 10                            # rollouts per *stochastic* agent
 
 concurrency: 4
 max_attempts: 2                         # retries only what could plausibly differ
@@ -201,6 +201,27 @@ corpus, not to an eval runner over one batch. What cannot move downstream is
 redaction and guards: a key that reaches a hub is in the git history, in LFS, in
 every mirror and in the viewer's cache, and `map()` runs on a dataset that is
 already published.
+
+### `trials` counts rollouts, not repetitions
+
+`trials: 10` exists because agents are stochastic: the same agent on the same
+case produces a distribution, and one sample of it is not a measurement.
+
+The built-ins are not stochastic. `oracle` runs the case's own `solve.sh` and
+`nop` does nothing, so ten rollouts of either produce ten identical numbers and
+ten times the container cost. **They run once, however high `trials` goes**, and
+the run says so rather than quietly doing something the file did not ask for:
+
+```
+matrix: 8 trials across 2 cases (oracle, nop ran once: deterministic)
+```
+
+A per-agent `trials:` overrides it, for the rare case where you mean it.
+
+And if what you want from `oracle` is the guarantee that the case scores 1.0 —
+that is the **admission gate's** job, and the gate already runs it. Listing
+`oracle` in the matrix as well only makes sense when you want its *trail*: the
+reference rollout, as a worked example of what a correct one looks like.
 
 ### Why a gate before, and a scrub after
 
@@ -374,7 +395,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 82 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 83 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

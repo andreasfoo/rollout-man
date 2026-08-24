@@ -138,7 +138,32 @@ func (c CaseRef) Label() string {
 type AgentRef struct {
 	Name    string `yaml:"name"`
 	LLMSpec string `yaml:"llm_spec"`
+	// Trials overrides matrix.trials for this agent. Rarely needed: the
+	// default already distinguishes the two kinds of agent (see Rollouts).
+	Trials *int `yaml:"trials"`
 }
+
+// Rollouts says how many times to run this agent per case.
+//
+// matrix.trials exists because agents are stochastic -- the same agent on the
+// same case produces a distribution, and one sample of it is not a
+// measurement. The built-ins are not stochastic: `oracle` runs the case's own
+// solve script and `nop` does nothing, so running either eight times produces
+// eight identical numbers and eight times the container cost. They get one.
+//
+// If what you want from oracle is the guarantee that the case scores 1.0, that
+// is the admission gate's job, not the matrix's -- and the gate already runs it.
+func (a AgentRef) Rollouts(matrixTrials int) int {
+	if a.Trials != nil {
+		return *a.Trials
+	}
+	if a.Deterministic() {
+		return 1
+	}
+	return matrixTrials
+}
+
+func (a AgentRef) Deterministic() bool { return a.Name == "oracle" || a.Name == "nop" }
 
 func (a *AgentRef) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind == yaml.ScalarNode {

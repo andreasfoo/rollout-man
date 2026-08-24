@@ -111,7 +111,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 	trials := expand(&r.File.Experiment, cases)
-	r.logf("matrix: %d trials across %d cases", len(trials), len(cases))
+	r.logf("matrix: %d trials across %d cases%s", len(trials), len(cases), deterministicNote(&r.File.Experiment))
 
 	r.runAll(ctx, trials)
 
@@ -251,8 +251,9 @@ func expand(ex *config.Experiment, cases []*casesrc.Case) []*trial {
 					specs = []string{""}
 				}
 			}
+			n := a.Rollouts(ex.Matrix.Trials)
 			for _, s := range specs {
-				for i := 1; i <= ex.Matrix.Trials; i++ {
+				for i := 1; i <= n; i++ {
 					out = append(out, &trial{
 						ID: trialID(c, a.Name, s, i), Case: c,
 						Agent: a.Name, Kind: kind, LLMSpec: s, Index: i,
@@ -262,6 +263,22 @@ func expand(ex *config.Experiment, cases []*casesrc.Case) []*trial {
 		}
 	}
 	return out
+}
+
+// deterministicNote says out loud when an agent got fewer rollouts than
+// matrix.trials asked for. Quietly running something a different number of
+// times than the file says is worse than the cost it saves.
+func deterministicNote(ex *config.Experiment) string {
+	var names []string
+	for _, a := range ex.Matrix.Agents {
+		if a.Deterministic() && a.Trials == nil && ex.Matrix.Trials > 1 {
+			names = append(names, a.Name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%s ran once: deterministic)", strings.Join(names, ", "))
 }
 
 func trialID(c *casesrc.Case, agent, spec string, i int) string {

@@ -61,10 +61,14 @@ OUT=$("$BIN" run test/smoke/smoke.yaml --runs "$RUNS" --id smoke --executor loca
 echo "$OUT" | grep -E 'want|matrix|shipped' | sed 's/^/    /'
 DIR="$RUNS/smoke"
 check "admission passed four probes" '[ "$(echo "$OUT" | grep -c "want.*-> PASS")" -eq 4 ]'
-check "matrix expanded to 12 trials"  'echo "$OUT" | grep -q "matrix: 12 trials"'
+# 2 cases x (1 oracle + 1 nop + 2 leaky). The built-ins run once each however
+# high trials goes: oracle runs the case's own solve script and nop does
+# nothing, so a second rollout of either measures the same thing again.
+check "matrix expanded to 8 trials"   'echo "$OUT" | grep -q "matrix: 8 trials"'
+check "and said why it was not 12"    'echo "$OUT" | grep -q "oracle, nop ran once: deterministic"'
 check "oracle scores 1.00"            'echo "$OUT" | grep -q "oracle \[1\] want >= 1.00 -> PASS"'
 check "nop scores 0.00"               'echo "$OUT" | grep -q "nop \[0\] want <= 0.00 -> PASS"'
-check "every trial recorded once"     '[ "$(wc -l < "$DIR/results.jsonl")" -eq 12 ]'
+check "every trial recorded once"     '[ "$(wc -l < "$DIR/results.jsonl")" -eq 8 ]'
 check "the run shipped"               'echo "$OUT" | grep -q "^.*shipped "'
 check "shipped copy has the results"  '[ -f "$BUCKET/evals/smoke/smoke/results.jsonl" ]'
 check "scratch did not ship"          '[ ! -d "$BUCKET/evals/smoke/smoke/tmp" ]'
@@ -72,9 +76,9 @@ check "scratch did not ship"          '[ ! -d "$BUCKET/evals/smoke/smoke/tmp" ]'
 step "4. re-running the same id resumes instead of repeating"
 OUT2=$("$BIN" run test/smoke/smoke.yaml --runs "$RUNS" --id smoke --executor local 2>&1)
 echo "$OUT2" | grep -E 'resuming|reward' | head -3 | sed 's/^/    /'
-check "it noticed the finished trials" 'echo "$OUT2" | grep -q "resuming: 12 trials"'
+check "it noticed the finished trials" 'echo "$OUT2" | grep -q "resuming: 8 trials"'
 check "it re-ran nothing"              '! echo "$OUT2" | grep -q "reward"'
-check "results.jsonl did not grow"     '[ "$(wc -l < "$DIR/results.jsonl")" -eq 12 ]'
+check "results.jsonl did not grow"     '[ "$(wc -l < "$DIR/results.jsonl")" -eq 8 ]'
 
 step "5. redaction: keys always, IPs only in what ships"
 T="$DIR/trials/test-smoke-leaky-case-leaky-fake-prod-1/out"

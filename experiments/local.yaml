@@ -26,7 +26,10 @@ cases:
 
 matrix:
   agents:
-    - name: oracle                      # the reference: its trail is the ground truth
+    # oracle is here for its trail, not for a measurement: it is the reference
+    # solution, so its rollout is what a correct one looks like. It runs once
+    # no matter what trials says -- a deterministic script has no spread.
+    - name: oracle
     - name: claude-code
       llm_spec: sonnet
   trials: 1

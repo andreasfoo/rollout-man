@@ -25,7 +25,7 @@ cases:
 
 matrix:
   agents:
-    - name: oracle
+    - name: oracle                      # for its trail; runs once regardless
     - name: claude-code
       llm_spec: sonnet
   trials: 1
