@@ -102,7 +102,12 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 			return Result{}, err
 		}
 		r.logf("command %s -> %s (sha256 %s)", name, c.Uses, sum[:12])
-		cmd = exec.CommandContext(ctx, shell(), c.Uses)
+		// Run the file, not a shell reading the file. The contract is
+		// "environment in, files out" -- nothing in it says shell -- so an
+		// adapter is free to be Python, a compiled binary, or anything else
+		// with a shebang. Interpreting it here would force every adapter to
+		// be a shell script and silently ignore the one it declares.
+		cmd = exec.CommandContext(ctx, c.Uses)
 	case len(c.Run) > 0:
 		argv := make([]string, 0, len(c.Run))
 		for _, a := range c.Run {
@@ -150,13 +155,23 @@ func (r *Runner) hostEnv(c config.Command) []string {
 	return out
 }
 
-// verify reads the script named by uses: and checks the pin. A pin that does
-// not match is a refusal, not a warning: the whole value of writing the hash
-// down is that nobody has to notice a warning for it to work.
+// verify reads the file named by uses: and checks the pin. A pin that does not
+// match is a refusal, not a warning: the whole value of writing the hash down
+// is that nobody has to notice a warning for it to work.
 func verify(c config.Command) (string, error) {
 	b, err := os.ReadFile(c.Uses)
 	if err != nil {
 		return "", fmt.Errorf("uses %s: %w", c.Uses, err)
+	}
+	// The file is executed directly, so it has to be executable and say what
+	// runs it. Catching that here turns an opaque "exec format error" into the
+	// one-line fix it actually is.
+	if fi, err := os.Stat(c.Uses); err == nil && fi.Mode()&0o111 == 0 {
+		return "", fmt.Errorf("uses %s: not executable (chmod +x %s)", c.Uses, c.Uses)
+	}
+	if len(b) > 2 && b[0] == '#' && b[1] != '!' {
+		return "", fmt.Errorf("uses %s: no #! line; an adapter is run directly, "+
+			"so it must name its own interpreter", c.Uses)
 	}
 	sum := fmt.Sprintf("%x", sha256.Sum256(b))
 	if c.SHA256 != "" && !strings.EqualFold(c.SHA256, sum) {
