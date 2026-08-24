@@ -49,6 +49,9 @@ trials that are missing.
 
 ## The submission file
 
+`experiments/complete.yaml` is a worked example of everything below in one
+file, annotated. The smoke test loads it on every run, so it cannot rot.
+
 One file, several YAML documents. `Commands` says how external things are run,
 `LLMSpec` declares a model, `Experiment` is the run. Nothing here refers to an
 id you had to obtain from a previous command: cases name their location, models
@@ -371,7 +374,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 78 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 82 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

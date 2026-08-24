@@ -1,0 +1,212 @@
+# A complete submission: every document, every action, annotated.
+#
+#   rollout-man cases  experiments/complete.yaml
+#   rollout-man run    experiments/complete.yaml --id nightly
+#   rollout-man status runs/nightly --pass-at 0.8 --failures
+#
+# Three YAML documents in one file. On a shared runner the operator keeps the
+# Commands document in a file of its own and passes --commands; a submission
+# that also declares commands is then refused, not merged. Here they are
+# together because one person is writing both halves.
+
+# ===========================================================================
+#  Commands — what a step *is*. Everything that reaches outside the machine.
+# ===========================================================================
+---
+kind: Commands
+timeout: 120m          # per command invocation
+max_attempts: 3        # retries for commands, not for trials
+
+# Off means each command sees only what it declares below, plus HOME/PATH/
+# LANG/TERM. A shipper that talks to git has no business holding the model
+# provider's key.
+inherit_env: false
+
+# uses: + sha256: is the pin. If the file on disk stops matching, the run is
+# refused rather than warned about. Regenerate with: sha256sum adapters/*.sh
+harbor:
+  uses: adapters/harbor.sh
+  sha256: d822f0cf2ea49988a32766b479ee679d5869272b38e2b466fe7c756a81bfb04f
+  env: [DOCKER_HOST, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY]
+
+# Where cases come from. One command per source kind; the case picks by name.
+source_git:
+  script: |
+    set -euo pipefail
+    git clone --quiet --depth 1 --branch "${GIT_REF:-main}" "${GIT_REPO}" "${LOCAL_PATH}"
+  env: [SSH_AUTH_SOCK]
+
+source_hf:
+  uses: adapters/source-hf.sh
+  env: [HF_TOKEN, HF_HOME]
+
+# Where results go. Four destinations, same contract: LOCAL_PATH and KEY.
+ship_local:
+  uses: adapters/ship-local.sh
+  sha256: bab134e61f7465add7f9536dbbe64d3edb4cd1b14a51a66e19d9e3e8f7fa1899
+  env: [SHIP_ROOT]
+
+ship_hf:
+  uses: adapters/ship-hf.sh
+  sha256: 7bf57edebf474fe96eebd485a18c9c2f5e9b34d60e295f7574c9452d0468f70f
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HF_PATH_IN_REPO]
+
+ship_github:
+  uses: adapters/ship-github.sh
+  env: [SHIP_REPO, SHIP_BRANCH, SSH_AUTH_SOCK,
+        GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL]
+
+# rclone reaches OneDrive, S3, WebDAV, sftp — whichever the operator's
+# rclone.conf is set up for. No storage SDK is built in, and no credential
+# for any of these is read, stored or rotated by rollout-man.
+ship_rclone:
+  uses: adapters/ship-rclone.sh
+  env: [RCLONE_REMOTE, RCLONE_CONFIG]
+
+# A command used as a pipeline step needs nothing special: `uses: notify`
+# anywhere in the pipeline runs this, with the step's with: entries arriving
+# as environment variables (channel: -> CHANNEL).
+notify:
+  script: |
+    set -euo pipefail
+    echo "[${CHANNEL:-log}] ${EXPERIMENT} ${RUN_ID}: $(wc -l < "${RUN_DIR}/results.jsonl") trials"
+
+# ===========================================================================
+#  LLMSpec — a model. The key is named, never written down.
+# ===========================================================================
+---
+kind: LLMSpec
+name: sonnet
+provider: anthropic                  # decides which env var holds the key
+model: anthropic/claude-sonnet-4-5
+api_key_env: ANTHROPIC_API_KEY
+
+---
+kind: LLMSpec
+name: opus
+provider: anthropic
+model: anthropic/claude-opus-4-1
+api_key_cmd: ["pass", "show", "eval/anthropic"]   # or read it from a command
+
+# ===========================================================================
+#  Experiment — what runs, and what has to be true of the numbers.
+# ===========================================================================
+---
+kind: Experiment
+name: complete-example
+
+# Cases name a location, never an opaque id. Defaults apply to every case
+# below; a case may override any of them.
+case_defaults:
+  source: local                      # local | git | hf
+  # source: git
+  #   repo: https://github.com/org/eval-cases
+  #   ref: main                      # may move; pinned at resolve time
+  # source: hf
+  #   repo: my-org/agent-eval-cases  # a dataset repo
+  #   ref: main
+
+cases:
+  - path: test/cases/libaom-cc9e46cb-bug-6491968-t4
+  # - path: security/CVE-2026-1234
+  #   ref: v2.1                      # this one case pinned harder
+  #   sha256: 3ab3f15b...            # or pinned exactly; a mismatch is refused
+
+# cases x agents x llm_specs x trials, expanded once. The list is a pure
+# function of its inputs, which is what makes a run reproducible and makes
+# resuming free.
+matrix:
+  agents:
+    - name: oracle                   # built-in: runs solution/solve.sh
+    - name: nop                      # built-in: does nothing
+    - name: claude-code              # a Harbor agent id, passed through
+      llm_spec: sonnet
+  # llm_specs: [sonnet, opus]        # applies to every non-built-in agent
+  trials: 4                          # rollouts per combination
+
+concurrency: 4                       # how many trials run at once
+max_attempts: 2                      # retry a trial only if it could differ
+
+pipeline:
+  # A second, separate width: how many finished trials are being scrubbed,
+  # packed and shipped at once. Nothing to do with how many containers fit.
+  # The executor slot is released before post-processing begins.
+  concurrency: 16
+
+  # ── per_case: once for each case ────────────────────────────────────────
+  per_case:
+    # Is this case measurable at all? A broken environment, a rotted
+    # reference solution or a hole in the verifier produce numbers that look
+    # exactly like a weak agent once they are in the table.
+    - uses: admission
+      with:
+        require: admitted            # admitted (default) | any
+        oracle_min_reward: 1.0       # the reference solution must score full
+        nop_max_reward: 0.0          # doing nothing must score zero
+        trials: 2
+
+  # ── per_trial: once for each trial ──────────────────────────────────────
+  per_trial:
+    # The first step runs the trial. Nothing can post-process a trial that
+    # has not run, so this position is the only one it can occupy.
+    - uses: harbor
+
+    # Keys always, addresses only in what leaves the machine. This has to be
+    # here and not downstream: a key that reaches a published dataset is in
+    # the git history, in LFS, in every mirror and in the viewer's cache.
+    - uses: redact
+      with:
+        keys: required               # no switch; "required" is the only value
+        ips: {traj: true, logs: false}
+        extra_patterns: ["internal\\.corp\\.example"]
+
+    # Curation. A rollout the agent solved in three steps teaches nothing.
+    # on_violation: drop keeps the measurement and publishes nothing from it —
+    # the reward is still recorded and still in the table. Dropping decides
+    # what ships, never what was observed.
+    - uses: guard
+      name: only-hard
+      with:
+        max_reward: 0.6              # min_/max_ over: reward, steps, seconds
+        min_steps: 30
+        # require_measured: true     # also drop trials that produced no score
+      on_violation: drop             # drop | fail | warn
+
+    # One archive per trial, referenced by path from that trial's row.
+    - uses: archive
+      with:
+        format: tar                  # tar | tar.gz | zip
+        include: ["traj.jsonl", "*.log", "result.json"]
+        # name: "{{.TrialID}}"
+        # keep_files: true
+
+  # ── per_experiment: once, when every trial has finished ─────────────────
+  per_experiment:
+    # Cheaper to refuse here than after it is published under a version.
+    - uses: guard
+      name: worth-publishing
+      with: {min_shipped: 8, min_mean_reward: 0.05}   # trials, shipped, mean_reward
+
+    # Rows plus a card — the difference between a folder on a server and
+    # something load_dataset() opens and a viewer renders. The card carries
+    # every case's content hash, the admission verdict and the adapter that
+    # produced the trials.
+    - uses: dataset
+      with:
+        title: "libaom rollouts — hard cases only"
+        license: apache-2.0
+        # dir: dataset
+        # include_dropped: false
+        # include_infra_failures: false   # our bad day is not data
+
+    - uses: ship
+      with:
+        using: ship_hf               # ship_local | ship_github | ship_rclone
+        path: dataset                # publish the dataset, not the run dir
+        dest: my-org/rollout-libaom  # for ship_hf, the repo id
+
+    # Any configured command is a step. on_failure: warn means a broken
+    # notifier does not fail a batch that already succeeded.
+    - uses: notify
+      with: {channel: evals}
+      on_failure: warn
