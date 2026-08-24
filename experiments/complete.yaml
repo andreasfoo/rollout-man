@@ -22,8 +22,10 @@ max_attempts: 3        # retries for commands, not for trials
 # provider's key.
 inherit_env: false
 
-# uses: + sha256: is the pin. If the file on disk stops matching, the run is
-# refused rather than warned about. Regenerate with: sha256sum adapters/*.sh
+# uses: names an executable, not a shell script: the file is run directly and
+# its #! line decides what interprets it, so an adapter can be Python, a
+# compiled binary, or anything else. sha256: pins it -- if the file on disk
+# stops matching, the run is refused rather than warned about.
 harbor:
   uses: adapters/harbor.sh
   sha256: d822f0cf2ea49988a32766b479ee679d5869272b38e2b466fe7c756a81bfb04f

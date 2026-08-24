@@ -384,6 +384,38 @@ file **the submission cannot override**. A submission that ships its own
 (`using: ship`); the operator chooses what a step *is*. See
 `commands.example.yaml`.
 
+## Adapters are executable files, not shell scripts
+
+`uses:` names an **executable**, and the contract is *environment variables in,
+files out*. Nothing in it says shell — the runner executes the file directly and
+lets its `#!` line decide what runs it, so an adapter can be Python, a compiled
+binary, or anything else that can read `$OUT_DIR`.
+
+```yaml
+harbor:  {uses: adapters/harbor.sh,     sha256: d822f0cf...}
+notify:  {uses: tools/notify.py}
+publish: {uses: bin/publish-linux-amd64}
+```
+
+The ones shipped here are `sh` because they are thin wrappers around `harbor`,
+`hf`, `rclone` and `git` — a few flags and an exit code, which is what shell is
+actually good at. That is a choice about those six files, not about the format.
+
+**On portability**, three things are worth separating:
+
+- **What breaks across Linux and macOS is rarely the shell — it is the
+  utilities.** `readlink -f`, `sha256sum`, `stat -c`, `date -d`, `base64 -w`,
+  `grep -P`, `sed -i` with no argument: GNU spellings that fail or quietly do
+  something else on BSD userland. The smoke test greps for them, so an adapter
+  cannot pick one up unnoticed. (The shipped adapters use none.)
+- **Adapters are glue to one machine's tooling anyway.** `ship-rclone` needs a
+  configured `rclone.conf`; `harbor` needs `harbor` and a Docker daemon. The
+  script's language is far from the tightest coupling it has.
+- **Parts of this are Linux-only regardless of language.** The `local` executor
+  and `test/smoke/fake-harbor.sh` use `unshare --mount`; mount namespaces have
+  no macOS equivalent. The runner targets Linux, and saying so plainly is better
+  than implying the script language is what stands in the way.
+
 ## Credentials
 
 rollout-man manages none. `api_key_env` and `api_key_cmd` say *where to find* a
@@ -395,7 +427,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 83 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 94 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

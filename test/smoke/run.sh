@@ -220,6 +220,9 @@ cat > "$PINDIR/adapter.sh" <<'A'
 # set for a ship command, so use LOCAL_PATH (the run directory) directly.
 echo "KEEP=${KEEP:-<unset>} DROP=${DROP:-<unset>}" > "$LOCAL_PATH/saw.txt"
 A
+# Executed directly, so it has to be executable -- the same requirement any
+# adapter has, and the same one-line fix.
+chmod +x "$PINDIR/adapter.sh"
 SUM=$(sha256sum "$PINDIR/adapter.sh" | cut -d" " -f1)
 cat > "$PINDIR/commands.yaml" <<C
 ---
@@ -319,6 +322,78 @@ sed 's/max_reward/max_rewrad/' "$ADIR/exp.yaml" > "$ADIR/typo.yaml"
 "$BIN" run "$ADIR/typo.yaml" --runs "$ADIR/runs2" --id a --executor local > "$ADIR/typo.log" 2>&1
 check "a misspelled input is refused before the run" 'grep -q "unknown input" "$ADIR/typo.log"'
 check "and nothing ran"                              '[ ! -f "$ADIR/runs2/a/results.jsonl" ]'
+
+step "14. adapters are executable files, not necessarily shell scripts"
+# `uses:` names an executable and the contract is "environment in, files out".
+# Nothing in it says shell, so the runner executes the file directly and lets
+# its shebang decide what runs it. Interpreting it with a shell here would
+# force every adapter to be sh and silently ignore the one it declares.
+for a in adapters/*; do
+  b=$(basename "$a")
+  [ -x "$a" ] || { bad "$b is executable"; continue; }
+  head -1 "$a" | grep -q '^#!' || { bad "$b names its own interpreter"; continue; }
+  ok "$b is executable and names its own interpreter"
+done
+# The portability of a shell adapter is not about sh vs bash -- it is about the
+# utilities. These are the GNU-only spellings that silently do the wrong thing
+# or fail outright on macOS, which is where "works on my Linux box" comes from.
+NONPORTABLE='readlink -f|sha256sum|stat -c|date -d|base64 -w|grep -P|cp --parents|sort -h|sed -i +[^ ]'
+check "no GNU-only utility flags in adapters" \
+  '! grep -nEq "$NONPORTABLE" adapters/*'
+for a in adapters/*.sh; do :; done
+check "every shell adapter parses"  'for a in adapters/*.sh; do bash -n "$a" || exit 1; done'
+if command -v shellcheck >/dev/null 2>&1; then
+  check "shellcheck is clean" 'shellcheck -S warning adapters/*.sh'
+else
+  skip "shellcheck (not installed)"
+fi
+
+# And the proof that the format is not shell-shaped: a Python step.
+if command -v python3 >/dev/null 2>&1; then
+  NDIR="$RUNS/nonshell"; rm -rf "$NDIR"; mkdir -p "$NDIR"
+  cat > "$NDIR/exp.yaml" <<C
+---
+kind: Commands
+timeout: 5m
+notify:
+  uses: test/smoke/notify.py
+---
+kind: Experiment
+name: nonshell
+case_defaults: {source: local}
+cases: [{path: test/smoke/pass-case}]
+matrix: {agents: [oracle], trials: 1}
+pipeline:
+  per_trial: [{uses: local}]
+  per_experiment:
+    - {uses: notify, with: {channel: evals}}
+C
+  "$BIN" run "$NDIR/exp.yaml" --runs "$NDIR/runs" --id n --executor local > "$NDIR/out.log" 2>&1
+  check "a Python adapter runs as a pipeline step" '[ -f "$NDIR/runs/n/notify.json" ]'
+  check "and it was handed the run to read"        'grep -q "\"measured\": 1" "$NDIR/runs/n/notify.json"'
+else
+  skip "non-shell adapter (no python3)"
+fi
+
+# An adapter that cannot be executed should say which one-line fix it needs.
+cp adapters/ship-local.sh "$RUNS/noexec.sh" && chmod -x "$RUNS/noexec.sh"
+cat > "$RUNS/noexec.yaml" <<C
+---
+kind: Commands
+timeout: 1m
+ship: {uses: $RUNS/noexec.sh}
+---
+kind: Experiment
+name: noexec
+case_defaults: {source: local}
+cases: [{path: test/smoke/pass-case}]
+matrix: {agents: [oracle], trials: 1}
+pipeline:
+  per_trial: [{uses: local}]
+  per_experiment: [{uses: ship, with: {using: ship, dest: x}}]
+C
+"$BIN" run "$RUNS/noexec.yaml" --runs "$RUNS/noexec-run" --id n --executor local > "$RUNS/noexec.log" 2>&1
+check "a non-executable adapter names the fix" 'grep -q "chmod +x" "$RUNS/noexec.log"'
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
