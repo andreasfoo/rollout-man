@@ -81,6 +81,9 @@ type Ctx struct {
 	Trials func() []Trial
 	// Dropped reports whether a trial was dropped by a guard.
 	Dropped func(trialID string) bool
+	// Enter is called as each step begins, so the middle of a pipeline is
+	// visible while it is happening rather than only in hindsight.
+	Enter func(step string)
 }
 
 func (c *Ctx) Note(k string, v any) {
@@ -180,6 +183,9 @@ func RunList(ctx context.Context, c *Ctx, list []config.Action, cmds *cmdrun.Run
 		act, err := Resolve(a, cmds)
 		if err != nil {
 			return err
+		}
+		if c.Enter != nil {
+			c.Enter(a.Label())
 		}
 		if err := act.Run(ctx, c, a); err != nil {
 			if a.Warns() {
