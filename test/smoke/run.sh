@@ -36,6 +36,20 @@ echo "$A" | sed 's/^/    /'
 check "the same content hashes the same twice" '[ "$A" = "$B" ]'
 check "both smoke cases resolved" '[ "$(echo "$A" | grep -c cpus=)" -eq 2 ]'
 
+# The documented examples are documentation only for as long as they still
+# load. A worked example that no longer parses is worse than none.
+#
+# What is checked is the submission, not the network: the pipeline is
+# validated before any case is fetched, so an example pointing at a repo this
+# machine cannot reach is still checked for everything that is ours.
+for ex in experiments/*.yaml; do
+  case "$ex" in */commands.yaml) continue ;; esac
+  log=/tmp/rm-validate-$(basename "$ex" .yaml).log
+  "$BIN" run "$ex" --runs /tmp/rm-validate --id v --executor local > "$log" 2>&1
+  check "$(basename "$ex") still loads and validates" \
+    "! grep -qE 'unknown (input|action|key)|^load:|has no uses:|must be' $log"
+done
+
 step "2. the shipped Harbor cases parse"
 R=$("$BIN" cases test/smoke/real-cases.yaml 2>&1)
 echo "$R" | sed 's/^/    /'
