@@ -23,9 +23,16 @@ timeout: 30m
 max_attempts: 1
 inherit_env: false
 
-# Per-case pre-check 1: task.toml must carry a docker_image field.
+# Per-case pre-check 1: task.toml must carry a docker_image field, and the
+# case must have a top-level environment/ directory.
 # A missing or empty image is a packaging defect that blocks promotion before
-# wasting oracle/nop harbor runs.
+# wasting oracle/nop harbor runs. A missing environment/ is a packaging defect
+# too: Harbor's Task.is_valid_dir() requires task.toml *and* environment/ to
+# recognize `harbor run --path <dir>` as a single task; without it Harbor
+# silently falls through to dataset-mode, scans the dir, finds zero tasks, and
+# admission dies with "ValueError: Either datasets or tasks must be provided."
+# (first seen on dnsmasq-5b99eae-commit-a90f09db-t4, whose Dockerfile/seed/
+# tarballs sat at the case root instead of under environment/).
 check_toml_image:
   env: [PATH, HOME]
   script: |
@@ -37,6 +44,13 @@ check_toml_image:
     fi
     val=$(grep -E '^\s*docker_image\s*=' "$toml" | head -1 | sed 's/.*=\s*//' | tr -d '"'"'"' ')
     [ -n "$val" ] || { echo "check_toml_image: FAIL $CASE_LABEL -- docker_image is empty" >&2; exit 1; }
+    if [ ! -d "$CASE_DIR/environment" ]; then
+      echo "check_toml_image: FAIL $CASE_LABEL -- no environment/ directory (harbor run --path" \
+        "requires task.toml + environment/ to treat this dir as a single task, otherwise it" \
+        "falls through to dataset-mode and admission fails with 'Either datasets or tasks" \
+        "must be provided')" >&2
+      exit 1
+    fi
     echo "check_toml_image: ok $CASE_LABEL -- $val"
 
 # Per-case pre-check 2: cyber-gate acc-quality-audit (11-point verifier-trust-boundary).
