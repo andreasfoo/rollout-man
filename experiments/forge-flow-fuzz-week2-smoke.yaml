@@ -1,0 +1,124 @@
+# Drive every fuzz-harbor task through case-forge's forge-flow-fuzz skill and
+# publish only stage2 accepts (strictly reward < 0.6) to cyber-xianjin.
+# Cases go to task/week2; Harbor trajectories go to trajectory/<task>/jobs/.
+#
+# Preconditions:
+#   export FORGE_CASES_ROOT=/home/foo/project/casefactory-firefox
+#   export FORGE_TASKS_ROOT=/home/foo/project/fuzz-harbor-task/tasks
+#   export PROGRESS_FILE=/home/foo/project/casefactory-firefox/FIREFOX-PROGRESS.md
+#   export HF_TOKEN=...
+#
+# `cases:` is a frozen eligibility snapshot, not a glob. It excludes any task
+# with a terminal progress/task/casefactory state, all draft-pending-oracle-
+# validation tasks (never admit/drive drafts), and cases currently active in
+# casefactory. Refresh eligibility from all three state sources before a new
+# campaign; rollout-man itself makes resuming a given run idempotent.
+---
+kind: Commands
+timeout: 8h
+max_attempts: 1
+inherit_env: false
+
+# Ordinary Harbor is used solely by the admission builtin (oracle=1, nop=0).
+harbor:
+  uses: adapters/harbor.sh
+  sha256: c8c35c4905df03fb64650c8f1573a2487ab9da36e734e93972f113ef1481b7ae
+  env: [DOCKER_HOST, PATH, HOME]
+
+# LLM rollout = forge-flow-fuzz's entire stage1 -> stage2 lifecycle.
+forge_flow_fuzz:
+  uses: adapters/forge-flow-fuzz.sh
+  sha256: c716b5d1c490bd815b0ac6a26a066eb23cf9c4614c52a346379c5c6b8b04d5a6
+  env: [PATH, HOME, DOCKER_HOST, FORGE_CASES_ROOT, FORGE_TASKS_ROOT,
+        FORGE_BRIDGE, FORGE_PYTHON, ROLLOUT_MAN_HARBOR_ADAPTER]
+
+materialize_week2:
+  uses: adapters/materialize-forge-week2.sh
+  sha256: 22901dbeda38f4d59db290b9a1e176f8a1d9b08f9d8f5a1659a2de8b780a0831
+  env: [PATH, HOME]
+
+record_progress:
+  uses: adapters/record-forge-progress.sh
+  sha256: bcd9d57c18e824cc2e642470a3ada42ae9e74d0f3cc8d42ac98b349ae8ea8d48
+  env: [PATH, HOME, PROGRESS_FILE]
+
+ship_week2_cases:
+  uses: adapters/ship-hf-week2-cases.sh
+  sha256: 0b426ae8820135da5e4734f83f4103ebaebbfe15da40b7076ee5a1cd0a984c40
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
+        ROLLOUT_MAN_SHIP_HF_ADAPTER]
+
+ship_week2_trajectories:
+  uses: adapters/ship-hf-week2-trajectories.sh
+  sha256: 7d34fa91264fea31ccfda4e7429a0470ecddab05eb2c6511d5ada2bd42d75d6b
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
+        ROLLOUT_MAN_SHIP_HF_ADAPTER]
+
+---
+kind: Experiment
+name: forge-flow-fuzz-week2-smoke
+
+case_defaults:
+  source: local
+
+# Replace with the generated full list described above.  One sample is kept so
+# `rollout-man cases` can validate this file in a fresh checkout.
+cases:
+  # Already-accepted case (stage2 reward=0.0): exercises the accepted path
+  # through the guard, materialize, HF ship, and progress record without
+  # re-running the LLM -- forge-flow-fuzz.sh fast-paths to the cached verdict.
+  - path: /home/foo/project/casefactory-firefox/cases/clickhouse-166a63c-issue-48343-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 1
+
+# forge-flow-fuzz itself owns an expensive Harbor stage1 + stage2 lifecycle.
+# Start conservatively; casefactory memory says four concurrent slots is the
+# operating limit, but case-level locks still protect against duplicate work.
+concurrency: 4
+max_attempts: 1
+
+pipeline:
+  concurrency: 2
+  per_case:
+    # Gate *before* invoking the skill: a case with a broken oracle or a nop
+    # hole is not a valid accept/reject candidate.
+    - uses: admission
+      with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
+
+  per_trial:
+    - uses: forge_flow_fuzz
+
+    # The adapter maps forge terminal accepted/rejected to 0/1.  The strict
+    # comparison is intentional: 0.60 is rejected under historical policy.
+    # A rejected case stops here: no redaction, archive, dataset, or upload.
+    - uses: guard
+      name: terminal-acc-only
+      with: {max_reward_exclusive: 0.6, require_measured: true}
+      on_violation: drop
+
+    # Only terminal acc artifacts continue. IPs and credentials are scrubbed
+    # across every copied case/trial file before either HF upload.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+  per_experiment:
+    # Produce exactly two trees: complete accepted task cases and their trails.
+    - uses: materialize_week2
+
+    # Separate commits under the requested paths in the same dataset repo.
+    - uses: ship
+      with:
+        using: ship_week2_cases
+        path: accepted-cases
+        dest: tinglydev/cyber-xianjin
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: accepted-trajectories
+        dest: tinglydev/cyber-xianjin
+
+    # Append a run-idempotent terminal ledger after successful publication.
+    - uses: record_progress
