@@ -18,6 +18,7 @@ package actions
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -84,6 +85,11 @@ type Ctx struct {
 	// Enter is called as each step begins, so the middle of a pipeline is
 	// visible while it is happening rather than only in hindsight.
 	Enter func(step string)
+
+	// StepOutputs holds each prior step's $ROLLOUT_MAN_OUTPUT, keyed by the
+	// step's label (name: if set, else uses:). A later step in the same list
+	// reads ${{ steps.<label>.outputs.<key> }} in its with: values.
+	StepOutputs map[string]map[string]string
 }
 
 func (c *Ctx) Note(k string, v any) {
@@ -119,6 +125,11 @@ type Action interface {
 }
 
 var registry = map[string]Action{}
+
+// ErrSkipCase is returned by RunList when a per_case step fails with
+// on_failure: skip. The runner interprets it as "exclude this case, continue
+// with the next one" rather than aborting the whole run.
+var ErrSkipCase = errors.New("case skipped")
 
 func register(a Action) { registry[a.Name()] = a }
 
@@ -163,6 +174,12 @@ func ValidateList(scope Scope, list []config.Action, from int, cmds *cmdrun.Runn
 		if err := act.Validate(a); err != nil {
 			return fmt.Errorf("pipeline.%s[%d] (%s): %w", scope, i, a.Label(), err)
 		}
+		if a.Fix != "" {
+			if cmds == nil || !cmds.Has(a.Fix) {
+				return fmt.Errorf("pipeline.%s[%d] (%s): fix: %q is not a configured command",
+					scope, i, a.Label(), a.Fix)
+			}
+		}
 	}
 	return nil
 }
@@ -180,6 +197,13 @@ func allows(a Action, s Scope) bool {
 // unless it declared on_failure: warn.
 func RunList(ctx context.Context, c *Ctx, list []config.Action, cmds *cmdrun.Runner) error {
 	for _, a := range list {
+		// A drop is a publication decision. Once a guard has made it, later
+		// post-processing must not scrub, archive, or ship a rejected trial.
+		// Put bookkeeping that must see both verdicts before the guard.
+		if c.Scope == PerTrial && c.Drop {
+			c.Logf("%s: skip %s (already dropped)", c.Where(), a.Label())
+			continue
+		}
 		act, err := Resolve(a, cmds)
 		if err != nil {
 			return err
@@ -187,15 +211,55 @@ func RunList(ctx context.Context, c *Ctx, list []config.Action, cmds *cmdrun.Run
 		if c.Enter != nil {
 			c.Enter(a.Label())
 		}
-		if err := act.Run(ctx, c, a); err != nil {
+		err = act.Run(ctx, c, a)
+		if err != nil && a.Fix != "" {
+			if !a.FixWriteback {
+				// A fix: without fix_writeback: true is declared but inert --
+				// naming a repair command is not the same as consenting to it
+				// mutating the case directory. This is intentionally silent
+				// at the info level (would spam every failing case) but shows
+				// up in the failure message so it isn't a total mystery.
+				c.Logf("%s: %s failed (fix %s not applied: fix_writeback is false): %v",
+					c.Where(), a.Label(), a.Fix, err)
+			} else {
+				c.Logf("%s: %s failed, attempting fix (%s): %v", c.Where(), a.Label(), a.Fix, err)
+				if ferr := runFix(ctx, c, a.Fix); ferr != nil {
+					c.Logf("%s: fix %s itself failed: %v", c.Where(), a.Fix, ferr)
+				} else {
+					c.Logf("%s: fix %s applied, retrying %s", c.Where(), a.Fix, a.Label())
+					err = act.Run(ctx, c, a)
+				}
+			}
+		}
+		if err != nil {
 			if a.Warns() {
 				c.Logf("%s: %s failed (on_failure: warn): %v", c.Where(), a.Label(), err)
 				continue
+			}
+			if a.Skips() {
+				c.Logf("%s: %s failed (on_failure: skip): %v", c.Where(), a.Label(), err)
+				return ErrSkipCase
 			}
 			return fmt.Errorf("%s: %w", a.Label(), err)
 		}
 	}
 	return nil
+}
+
+// runFix runs the command named by a step's fix: with the same case context
+// the step itself sees, so a fix adapter can read and rewrite the same
+// CASE_DIR the failing check just rejected. It gets no with: of its own --
+// the fix is a fixed remedy for a fixed check, not another configurable step.
+func runFix(ctx context.Context, c *Ctx, name string) error {
+	vars := map[string]string{
+		"Experiment": c.Experiment, "RunId": c.RunID, "RunDir": c.RunDir,
+		"LocalPath": c.RunDir,
+	}
+	if c.CaseDir != "" {
+		vars["CaseDir"], vars["CaseLabel"], vars["CaseSha"] = c.CaseDir, c.CaseLabel, c.CaseSHA
+	}
+	_, err := c.Cmds.Run(ctx, name, vars)
+	return err
 }
 
 func unknown(a config.Action, known ...string) error {

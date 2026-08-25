@@ -205,6 +205,22 @@ type Action struct {
 	// OnViolation is the guard's verdict: "fail" (default), "warn", or "drop"
 	// -- keep the measurement, publish nothing from it.
 	OnViolation string `yaml:"on_violation"`
+	// Fix names a command to run when this step fails, before on_failure is
+	// applied: the case gets one repair attempt (e.g. an adapter that asks an
+	// agent to patch whatever the check flagged), then this step retries
+	// exactly once. A fix that resolves the problem makes the retry pass and
+	// the case proceeds normally; a fix that does not still leaves on_failure
+	// to decide the outcome, so a broken or absent fix is never worse than not
+	// having one.
+	Fix string `yaml:"fix"`
+	// FixWriteback must be explicitly true for Fix to actually run. For a
+	// local case, CaseDir is the submission's own directory, not a copy --
+	// a fix command runs with write access to it and can edit it in place.
+	// That is a mutation of shared source, which is a different kind of
+	// decision than "retry this check": naming a fix: does not imply consent
+	// to it touching the case, so a step can declare a fix and still leave it
+	// inert until this flag turns it on.
+	FixWriteback bool `yaml:"fix_writeback"`
 }
 
 // UnmarshalYAML rejects keys this struct does not have. Plain struct decoding
@@ -218,10 +234,10 @@ func (a *Action) UnmarshalYAML(n *yaml.Node) error {
 	type plain Action
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		switch k := n.Content[i].Value; k {
-		case "uses", "name", "with", "on_failure", "on_violation":
+		case "uses", "name", "with", "on_failure", "on_violation", "fix", "fix_writeback":
 		default:
 			return fmt.Errorf("unknown key %q in a pipeline step; "+
-				"a step takes uses, name, with, on_failure, on_violation", k)
+				"a step takes uses, name, with, on_failure, on_violation, fix, fix_writeback", k)
 		}
 	}
 	return n.Decode((*plain)(a))
@@ -235,6 +251,7 @@ func (a Action) Label() string {
 }
 
 func (a Action) Warns() bool { return a.OnFailure == "warn" }
+func (a Action) Skips() bool { return a.OnFailure == "skip" }
 
 func (a Action) Has(k string) bool { _, ok := a.With[k]; return ok }
 
@@ -316,6 +333,13 @@ type Pipeline struct {
 	// be scrubbed, packed and shipped at once", and at batch sizes where the
 	// data is the problem those are different questions.
 	Concurrency int `yaml:"concurrency"`
+
+	// PerCaseConcurrency bounds how many cases run their per_case gate
+	// (quality audit, admission, ...) at once. It defaults to 1 -- serial,
+	// matching the behavior every existing experiment.yaml was written and
+	// pinned against -- so raising it is an opt-in a submission makes on
+	// purpose, not a side effect of upgrading rollout-man.
+	PerCaseConcurrency int `yaml:"per_case_concurrency"`
 
 	PerCase       []Action `yaml:"per_case"`
 	PerTrial      []Action `yaml:"per_trial"`
@@ -493,6 +517,9 @@ func (f *File) validate() error {
 	if e.Pipeline.Concurrency <= 0 {
 		e.Pipeline.Concurrency = e.Concurrency
 	}
+	if e.Pipeline.PerCaseConcurrency <= 0 {
+		e.Pipeline.PerCaseConcurrency = 1
+	}
 	if _, err := e.Pipeline.Executor(); err != nil {
 		return err
 	}
@@ -509,9 +536,21 @@ func (f *File) validate() error {
 			if a.Uses == "" {
 				return fmt.Errorf("pipeline.%s[%d] has no uses:", u.name, i)
 			}
-			if a.OnFailure != "" && a.OnFailure != "fail" && a.OnFailure != "warn" {
-				return fmt.Errorf("pipeline.%s[%d] (%s): on_failure must be fail or warn, got %q",
+			if a.OnFailure != "" && a.OnFailure != "fail" && a.OnFailure != "warn" && a.OnFailure != "skip" {
+				return fmt.Errorf("pipeline.%s[%d] (%s): on_failure must be fail, warn or skip, got %q",
 					u.name, i, a.Label(), a.OnFailure)
+			}
+			if a.Fix != "" && u.name != "per_case" {
+				// A fix-and-retry only makes sense where the fingerprint that
+				// decides "does this need re-checking" already lives: the
+				// per_case gate cache. Elsewhere the config offers no place to
+				// remember that a fix ran, so the retry could loop silently.
+				return fmt.Errorf("pipeline.%s[%d] (%s): fix: is only valid in per_case",
+					u.name, i, a.Label())
+			}
+			if a.FixWriteback && a.Fix == "" {
+				return fmt.Errorf("pipeline.%s[%d] (%s): fix_writeback: true without fix:",
+					u.name, i, a.Label())
 			}
 		}
 	}

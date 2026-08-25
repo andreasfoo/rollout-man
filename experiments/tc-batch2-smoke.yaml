@@ -50,7 +50,18 @@ check_toml_image:
 # CYBER_GATE_ROOT  path to the cyber-gate source tree (default: /home/foo/project/cyber-gate).
 check_quality:
   uses: adapters/acc-quality-audit.sh
-  sha256: 1f53d3ce35e34efac9a87309fe8a09b4a95fb76256eda87978bc039b2138fef8
+  sha256: 7637d475e1a39ccbae3bf8f0fb90d913488727357b63bb6e3658762f838ed568
+  env: [PATH, HOME, CYBER_GATE_ROOT]
+
+# Auto-fix for a blocking check_quality verdict: a subagent reads the report
+# check_quality already saved and patches the flagged critical/high/
+# direct_removal categories under $CASE_DIR (a live, writable, git-tracked
+# case directory -- recoverable with git diff/checkout if a fix goes wrong).
+# check_quality itself retries once afterward, which is the real validation
+# (a fresh, independent audit) -- this adapter only attempts the repair.
+fix_quality_audit:
+  uses: adapters/fix-quality-audit.sh
+  sha256: e2d751e6ef8f5c695f8c4eff17a3afa206d69eabf6115280733a80cef33c73ad
   env: [PATH, HOME, CYBER_GATE_ROOT]
 
 # Admission oracle/nop trials use the real Harbor adapter.
@@ -76,13 +87,18 @@ forge_flow_fuzz_mock:
 
 materialize_week2:
   uses: adapters/materialize-forge-week2.sh
-  sha256: 22901dbeda38f4d59db290b9a1e176f8a1d9b08f9d8f5a1659a2de8b780a0831
+  sha256: 7048e4c3cd9e3bfc99fc45d3f8664b506a198efe64cd7e7bf879ec5d36b040db
   env: [PATH, HOME]
 
 record_progress:
   uses: adapters/record-forge-progress.sh
   sha256: bcd9d57c18e824cc2e642470a3ada42ae9e74d0f3cc8d42ac98b349ae8ea8d48
   env: [PATH, HOME, PROGRESS_FILE]
+
+ship_week2_atomic:
+  uses: adapters/ship-hf-week2-atomic.sh
+  sha256: 54093b03b1df0b9db6f728a73e8c385dd5b6eb5fe82fc28ec5977a71f570368a
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH]
 
 ship_week2_cases:
   uses: adapters/ship-hf-week2-cases.sh
@@ -102,17 +118,14 @@ name: tc-batch2-smoke
 case_defaults:
   source: local
 
+# TEMPORARY: scoped to the 13 still-rejected cases from the full 24-case batch
+# (bind9-891c50a excluded per user -- being re-run separately) to exercise the
+# new check_quality fix:/fix_writeback: auto-repair without re-touching the 10
+# already-admitted cases' gate-cache/admission results. Restore the full
+# 24-case list afterward (backup: /tmp/tc-batch2-smoke.yaml.full-backup).
 cases:
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/bind9-891c50a-commit-921043b-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-166a63c-issue-48343-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-2165cc1-issue-64543-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-a22b95a-issue-98523-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-ce552bd-issue-103630-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-e9a9df4-issue-78299-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/dnsmasq-5b99eae-commit-a90f09db-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/duckdb-097ce70-issue-7348-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/duckdb-8dabba981e-issue-21623-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/exiv2-a14510a-issue-3443-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/gstreamer-763d2bb-commit-b268b27-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/mariadb-eb41c11-commit-7741065-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-a152c63-commit-e66bd49-t4
@@ -122,9 +135,6 @@ cases:
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-312da26-commit-d9e1036-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-d04899f-commit-1c5c3b1-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-ea97ab6-commit-50f969c-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-81ef425-bug-2027357-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/squid-06a5d8-commit-06a5d871-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/squid-8617e9-commit-8617e90a-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-62ba7ba-commit-3bb5a4b-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tcpdump-0dd0132-commit-80deba1-t4
 
@@ -139,16 +149,27 @@ concurrency: 8
 max_attempts: 1
 
 pipeline:
+  per_case_concurrency: 4
   per_case:
     # 1. task.toml must have docker_image -- catches packaging defects early.
     - uses: check_toml_image
+      on_failure: skip
     # 2. acc-quality-audit (11-point verifier-trust-boundary AI review via claude -p).
+    #    On a blocking failure, fix_quality_audit gets one attempt to patch the
+    #    flagged categories under CASE_DIR, then check_quality retries once --
+    #    that retry (a fresh, independent audit) is what actually decides
+    #    whether the fix held.
     - uses: check_quality
+      on_failure: skip
+      fix: fix_quality_audit
+      fix_writeback: true
     # 3. admission -- oracle must score 1.0, nop must score 0.0.
     - uses: admission
       with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
     # 4. trajectory layout -- jobs/ must have agent/trajectory.json per trial.
+    #    on_failure: skip drops the case rather than aborting the whole run.
     - uses: check_traj_layout
+      on_failure: skip
 
   per_trial:
     - uses: forge_flow_fuzz_mock
@@ -165,16 +186,11 @@ pipeline:
   per_experiment:
     - uses: materialize_week2
 
+    # Single atomic HF commit: task/week2 + trajectory in one push.
+    # Either both land or neither does -- no half-uploaded state.
     - uses: ship
       with:
-        using: ship_week2_cases
-        path: accepted-cases
-        dest: tinglydev/cyber-xianjin
-
-    - uses: ship
-      with:
-        using: ship_week2_trajectories
-        path: accepted-trajectories
+        using: ship_week2_atomic
         dest: tinglydev/cyber-xianjin
 
     - uses: record_progress

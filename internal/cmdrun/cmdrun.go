@@ -4,6 +4,7 @@
 package cmdrun
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -52,6 +53,12 @@ func (r *Runner) Has(name string) bool {
 type Result struct {
 	Stdout string
 	Stderr string
+	// Outputs are key=value lines the command wrote to the file named by
+	// $ROLLOUT_MAN_OUTPUT, mirroring GitHub Actions' $GITHUB_OUTPUT. A step
+	// further down the same pipeline can read them as
+	// ${{ steps.<label>.outputs.<key> }} instead of the two of them agreeing
+	// on a stdout format to scrape.
+	Outputs map[string]string
 }
 
 // Run executes the named command. vars keys are Go template field names
@@ -131,12 +138,59 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 	}
 	cmd.Env = append(r.hostEnv(c), envPairs(vars)...)
 
+	outFile, err := os.CreateTemp("", "rollout-man-output-*")
+	if err != nil {
+		return Result{}, fmt.Errorf("create output file: %w", err)
+	}
+	outPath := outFile.Name()
+	outFile.Close()
+	defer os.Remove(outPath)
+	cmd.Env = append(cmd.Env, "ROLLOUT_MAN_OUTPUT="+outPath)
+
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
 		return Result{}, fmt.Errorf("%w: %s", err, strings.TrimSpace(tail(errb.String(), 2000)))
 	}
-	return Result{Stdout: out.String(), Stderr: errb.String()}, nil
+	outputs, err := parseOutputFile(outPath)
+	if err != nil {
+		return Result{}, fmt.Errorf("%s wrote a malformed $ROLLOUT_MAN_OUTPUT: %w", name, err)
+	}
+	return Result{Stdout: out.String(), Stderr: errb.String(), Outputs: outputs}, nil
+}
+
+// parseOutputFile reads key=value lines written to $ROLLOUT_MAN_OUTPUT, the
+// same convention as GitHub Actions' $GITHUB_OUTPUT. A missing file (most
+// commands never write one) is not an error -- it just means no outputs.
+func parseOutputFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	out := map[string]string{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("line %q is not key=value", line)
+		}
+		out[strings.TrimSpace(k)] = v
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 // hostEnv decides what of the machine the command gets to see. Inheriting

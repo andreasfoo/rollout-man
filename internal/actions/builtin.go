@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -185,8 +186,11 @@ var batchMetrics = []string{"trials", "shipped", "mean_reward"}
 
 func (guardAction) Validate(a config.Action) error {
 	known := []string{"require_measured"}
+	// *_exclusive is deliberately separate from max_/min_: the latter use
+	// inclusive bounds, while curation often needs a strict cutoff (e.g.
+	// reward < 0.6 means accepted; reward == 0.6 is rejected).
 	for _, m := range append(append([]string{}, trialMetrics...), batchMetrics...) {
-		known = append(known, "min_"+m, "max_"+m)
+		known = append(known, "min_"+m, "max_"+m, "min_"+m+"_exclusive", "max_"+m+"_exclusive")
 	}
 	if err := unknown(a, known...); err != nil {
 		return err
@@ -214,6 +218,16 @@ func (g guardAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 		if a.Has("max_" + name) {
 			if want := a.Num("max_"+name, 0); got > want {
 				violations = append(violations, fmt.Sprintf("%s = %g, wanted <= %g", name, got, want))
+			}
+		}
+		if a.Has("min_" + name + "_exclusive") {
+			if want := a.Num("min_"+name+"_exclusive", 0); got <= want {
+				violations = append(violations, fmt.Sprintf("%s = %g, wanted > %g", name, got, want))
+			}
+		}
+		if a.Has("max_" + name + "_exclusive") {
+			if want := a.Num("max_"+name+"_exclusive", 0); got >= want {
+				violations = append(violations, fmt.Sprintf("%s = %g, wanted < %g", name, got, want))
 			}
 		}
 	}
@@ -540,7 +554,30 @@ func expand(s string, c *Ctx) string {
 	if c.Trial != nil {
 		s = strings.NewReplacer("{{.TrialID}}", c.Trial.ID, "{{.Case}}", c.Trial.Case).Replace(s)
 	}
+	s = expandStepOutputs(s, c)
 	return rep.Replace(s)
+}
+
+var stepOutputRe = regexp.MustCompile(`\{\{\s*steps\.([^.\s]+)\.outputs\.([^\s}]+)\s*\}\}`)
+
+// expandStepOutputs resolves {{steps.<label>.outputs.<key>}} against what an
+// earlier step in the same pipeline list wrote to $ROLLOUT_MAN_OUTPUT. An
+// unresolved reference (unknown step or key) is left as an error rather than
+// silently becoming an empty string, since a typo'd label would otherwise
+// pass a blank value straight into a shell adapter.
+func expandStepOutputs(s string, c *Ctx) string {
+	if !strings.Contains(s, "{{steps.") && !strings.Contains(s, "{{ steps.") {
+		return s
+	}
+	return stepOutputRe.ReplaceAllStringFunc(s, func(m string) string {
+		g := stepOutputRe.FindStringSubmatch(m)
+		label, key := g[1], g[2]
+		outs, ok := c.StepOutputs[label]
+		if !ok {
+			return m // leave unresolved; caller sees the literal placeholder
+		}
+		return outs[key]
+	})
 }
 
 // --------------------------------------------------------------- command ---
@@ -570,11 +607,19 @@ func (cm command) Run(ctx context.Context, c *Ctx, a config.Action) error {
 	}
 	// with: entries reach the command as template names and env vars, so a
 	// custom step is configured the same way every other command is.
+	// String values may reference {{steps.<label>.outputs.<key>}} from an
+	// earlier step in the same pipeline list.
 	for k, v := range a.With {
 		if s, ok := v.(string); ok {
-			vars[camel(k)] = s
+			vars[camel(k)] = expandStepOutputs(s, c)
 		}
 	}
-	_, err := c.Cmds.Run(ctx, cm.cmd, vars)
+	res, err := c.Cmds.Run(ctx, cm.cmd, vars)
+	if len(res.Outputs) > 0 {
+		if c.StepOutputs == nil {
+			c.StepOutputs = map[string]map[string]string{}
+		}
+		c.StepOutputs[a.Label()] = res.Outputs
+	}
 	return err
 }

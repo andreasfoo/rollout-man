@@ -46,3 +46,30 @@ func TestHashIgnoresGitDir(t *testing.T) {
 		t.Fatal("a .git directory changed the case hash")
 	}
 }
+
+func TestHashIgnoresCaseForgeRuntimeDirs(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "task.toml"), []byte("[task]\nid = \"x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := HashDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{".factory/state.json", "trials/job/agent/sessions/private.json"} {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("runtime"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	after, err := HashDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("runtime artifacts changed hash: %s != %s", before, after)
+	}
+}

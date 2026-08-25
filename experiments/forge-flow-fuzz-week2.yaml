@@ -28,7 +28,7 @@ harbor:
 # LLM rollout = forge-flow-fuzz's entire stage1 -> stage2 lifecycle.
 forge_flow_fuzz:
   uses: adapters/forge-flow-fuzz.sh
-  sha256: c716b5d1c490bd815b0ac6a26a066eb23cf9c4614c52a346379c5c6b8b04d5a6
+  sha256: 0f416035209c7ba5424d1e34404ad88606a21fd3b730a399c9d13ce8e4cb567c
   env: [PATH, HOME, DOCKER_HOST, FORGE_CASES_ROOT, FORGE_TASKS_ROOT,
         FORGE_BRIDGE, FORGE_PYTHON, ROLLOUT_MAN_HARBOR_ADAPTER]
 
@@ -39,7 +39,7 @@ materialize_week2:
 
 record_progress:
   uses: adapters/record-forge-progress.sh
-  sha256: bcd9d57c18e824cc2e642470a3ada42ae9e74d0f3cc8d42ac98b349ae8ea8d48
+  sha256: 0d2d7ea126b3887da85087e5929b47572cc927a3a88b53d49c0a8d3b70fbee33
   env: [PATH, HOME, PROGRESS_FILE]
 
 ship_week2_cases:
@@ -56,7 +56,7 @@ ship_week2_trajectories:
 
 ---
 kind: Experiment
-name: forge-flow-fuzz-week2-smoke
+name: forge-flow-fuzz-week2
 
 case_defaults:
   source: local
@@ -64,10 +64,17 @@ case_defaults:
 # Replace with the generated full list described above.  One sample is kept so
 # `rollout-man cases` can validate this file in a fresh checkout.
 cases:
-  # Already-accepted case (stage2 reward=0.0): exercises the accepted path
-  # through the guard, materialize, HF ship, and progress record without
-  # re-running the LLM -- forge-flow-fuzz.sh fast-paths to the cached verdict.
-  - path: /home/foo/project/casefactory-firefox/cases/clickhouse-166a63c-issue-48343-t4
+  # Frozen eligibility snapshot (2026-08-24): source task must be keeper or
+  # validated; no terminal progress/task/casefactory verdict; no active
+  # casefactory operation. Drafts are deliberately excluded: do not admit or
+  # drive draft-pending-oracle-validation tasks.
+  - path: /home/foo/project/fuzz-harbor-task/tasks/dnsmasq-982faf4-commit-04b0ac0-t4
+  - path: /home/foo/project/fuzz-harbor-task/tasks/gstreamer-401f350-commit-0672324-t4
+  - path: /home/foo/project/casefactory-firefox/cases/lighttpd-f2b33e7-commit-c42b280-t4
+  - path: /home/foo/project/casefactory-firefox/cases/sdl-459e2b0-commit-cb8bf6b-t4
+  - path: /home/foo/project/casefactory-firefox/cases/sdl-d04899f-commit-1c5c3b1-t4
+  - path: /home/foo/project/fuzz-harbor-task/tasks/strongswan-5645ad2-commit-1f9e4d0-t4
+  - path: /home/foo/project/fuzz-harbor-task/tasks/unbound-19473d9-commit-c4e199e-t4
 
 matrix:
   agents:

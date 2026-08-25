@@ -12,6 +12,9 @@
 #   DO NOT PROMOTE        → exit 1  (critical/high/direct_removal FAIL, blocks admission)
 #
 # Report is saved to $RUN_DIR/quality/<case-label>.txt for later inspection.
+# Structured result is written to $ROLLOUT_MAN_OUTPUT (verdict, report, blocking)
+# so a later pipeline step can read it via {{steps.<label>.outputs.<key>}}
+# instead of re-parsing the report text.
 #
 # ENV (all passed through rollout-man):
 #   CASE_DIR    path to the case package
@@ -20,15 +23,19 @@
 #   CYBER_GATE_ROOT  optional; defaults to /home/foo/project/cyber-gate
 set -euo pipefail
 
+emit() { [ -n "${ROLLOUT_MAN_OUTPUT:-}" ] && printf '%s=%s\n' "$1" "$2" >> "$ROLLOUT_MAN_OUTPUT" || true; }
+
 SKILL_FILE="${CYBER_GATE_ROOT:-/home/foo/project/cyber-gate}/.claude/skills/acc-quality-audit/SKILL.md"
 
 [ -f "$SKILL_FILE" ] || {
   printf 'acc-quality-audit: FAIL %s -- skill file not found: %s\n' "$CASE_LABEL" "$SKILL_FILE" >&2
+  emit verdict ERROR
   exit 1
 }
 
 mkdir -p "$RUN_DIR/quality"
-report_file="$RUN_DIR/quality/${CASE_LABEL}.txt"
+slug=$(basename "$CASE_LABEL")
+report_file="$RUN_DIR/quality/${slug}.txt"
 
 prompt="Read the case package at ${CASE_DIR} and audit it against the 11 static verifier-trust-boundary categories. Definitions and the exact per-category checks are in the skill file ${SKILL_FILE} (fully self-contained). Read tests/verifier.py, tests/test.sh, the Dockerfiles, environment/seed/*, solution/solve.sh, instruction.md, task.toml and apply each rule. Return ONLY the structured report shown at the end of the skill file, with a PROMOTE / DO-NOT-PROMOTE recommendation. Do not modify any files."
 
@@ -41,21 +48,32 @@ claude -p \
 
 recommendation=$(grep -oP '(?i)recommendation:\s*\K.*' "$report_file" | head -1 | sed 's/[[:space:]]*$//')
 
+emit report "$report_file"
+emit case "$slug"
+
 case "$recommendation" in
   PROMOTE)
+    emit verdict PROMOTE
+    emit blocking false
     printf 'acc-quality-audit: CLEAN %s -- PROMOTE  (report: %s)\n' "$CASE_LABEL" "$report_file"
     ;;
   PROMOTE-WITH-WARNINGS)
+    emit verdict PROMOTE-WITH-WARNINGS
+    emit blocking false
     printf 'acc-quality-audit: WARNINGS %s -- medium issues found (not blocking)  (report: %s)\n' \
       "$CASE_LABEL" "$report_file" >&2
     printf 'acc-quality-audit: ok %s -- PROMOTE-WITH-WARNINGS\n' "$CASE_LABEL"
     ;;
   "DO NOT PROMOTE"*)
+    emit verdict DO-NOT-PROMOTE
+    emit blocking true
     printf 'acc-quality-audit: FAIL %s -- %s\n' "$CASE_LABEL" "$recommendation" >&2
     printf '  report: %s\n' "$report_file" >&2
     exit 1
     ;;
   *)
+    emit verdict PARSE-ERROR
+    emit blocking true
     printf 'acc-quality-audit: FAIL %s -- could not parse recommendation from subagent output\n' \
       "$CASE_LABEL" >&2
     printf '  got: %s\n' "${recommendation:-(empty)}" >&2

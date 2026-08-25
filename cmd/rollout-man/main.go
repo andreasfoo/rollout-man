@@ -106,7 +106,19 @@ func build(f *config.File, executor, commandsFile string) (*cmdrun.Runner, rexec
 	}
 	cmds := cmdrun.New(f.Commands)
 	cmds.Log = logf
-	ex, err := pick(executor, cmds)
+	// The first per_trial action names the executor. This lets an experiment
+	// select a workflow adapter (such as forge-flow-fuzz) while its admission
+	// probes still use the same adapter's oracle/nop delegation. An explicit
+	// --executor remains an operator override.
+	selected := executor
+	if selected == "" || selected == "auto" {
+		a, err := f.Experiment.Pipeline.Executor()
+		if err != nil {
+			return nil, nil, err
+		}
+		selected = a.Uses
+	}
+	ex, err := pick(selected, cmds)
 	return cmds, ex, err
 }
 

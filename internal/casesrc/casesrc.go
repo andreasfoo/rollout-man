@@ -142,7 +142,11 @@ func HashDir(dir string) (string, error) {
 		if err != nil || rel == "." {
 			return err
 		}
-		if fi.IsDir() && (rel == ".git" || strings.HasPrefix(rel, ".git"+string(filepath.Separator))) {
+		// Case-forge keeps mutable workflow state and Harbor trial artifacts beside
+		// the case definition. They are evidence for the factory, not input bytes
+		// for the task, and may include container-owned unreadable files. Excluding
+		// them keeps a local case resolvable after an oracle/agent run.
+		if fi.IsDir() && ignoredCaseRuntimeDir(rel) {
 			return filepath.SkipDir
 		}
 		rels = append(rels, rel)
@@ -200,6 +204,11 @@ func HashDir(dir string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func ignoredCaseRuntimeDir(rel string) bool {
+	first := strings.SplitN(filepath.ToSlash(rel), "/", 2)[0]
+	return first == ".git" || first == ".factory" || first == "trials"
 }
 
 func pinGit(dir, ref string) string {

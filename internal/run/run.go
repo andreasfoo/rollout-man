@@ -9,7 +9,10 @@ package run
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -83,6 +86,14 @@ type Runner struct {
 	done     map[string]bool
 	dropped  map[string]bool
 	progress *progress.Tracker
+
+	// gateCache remembers, per run directory, which cases have already been
+	// through per_case (quality audit, admission, ...) and what it decided.
+	// Unlike results.jsonl this covers the per_case gate itself: admission
+	// probes and adapters like acc-quality-audit are not trials, so without
+	// this a rerun under the same --id would redo the slowest part of the
+	// pipeline for every case even though only ship failed downstream.
+	gateCache map[string]gateCacheEntry
 }
 
 func (r *Runner) logf(f string, a ...any) {
@@ -101,6 +112,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := r.loadDone(); err != nil {
 		return err
 	}
+	r.loadGateCache()
 	if err := r.writeManifest(); err != nil {
 		return err
 	}
@@ -204,26 +216,154 @@ func sortedCmdNames(m map[string]config.Command) []string {
 
 // ------------------------------------------------------------- per_case ---
 
+// gateCacheEntry is one case's outcome from a previous run of per_case, keyed
+// so that it is only ever reused when both the case and the checks are
+// provably the same as when it was recorded.
+type gateCacheEntry struct {
+	// Fingerprint covers the per_case pipeline config itself (uses:, with:,
+	// on_failure:, and every command it can resolve to, including sha256
+	// pins and inline scripts). A changed check invalidates every entry that
+	// used it, not just the one that happens to be re-hashed by hand.
+	Fingerprint string `json:"fingerprint"`
+	// Admitted is false when this case was rejected (on_failure: skip) last
+	// time; a rejection is exactly as cacheable as an admission; it is still
+	// the same expensive audit landing on the same answer.
+	Admitted bool `json:"admitted"`
+}
+
+func (r *Runner) gateCachePath() string { return filepath.Join(r.Dir, "gate-cache.json") }
+
+func (r *Runner) loadGateCache() {
+	r.gateCache = map[string]gateCacheEntry{}
+	b, err := os.ReadFile(r.gateCachePath())
+	if err != nil {
+		return
+	}
+	_ = json.Unmarshal(b, &r.gateCache)
+}
+
+func (r *Runner) saveGateCache() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, err := json.MarshalIndent(r.gateCache, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(r.gateCachePath(), b, 0o644)
+}
+
+// perCaseFingerprint hashes everything that changing would make a cached
+// per_case verdict wrong: the step list itself and, for every step that
+// resolves to a configured command, that command's script/uses-file pin.
+// A case's own content is not part of this -- it is folded in separately, per
+// case, via its SHA256.
+func perCaseFingerprint(ex *config.Experiment, cmds map[string]config.Command) string {
+	h := sha256.New()
+	enc := json.NewEncoder(h)
+	_ = enc.Encode(ex.Pipeline.PerCase)
+	seen := map[string]bool{}
+	for _, a := range ex.Pipeline.PerCase {
+		for _, uses := range []string{a.Uses, a.Fix} {
+			if uses == "" || seen[uses] {
+				continue
+			}
+			seen[uses] = true
+			if cmd, ok := cmds[uses]; ok {
+				_ = enc.Encode(cmd)
+			}
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// perCase runs every case through the gate concurrently, bounded by
+// pipeline.per_case_concurrency (default 1: serial, the behavior every
+// existing experiment.yaml was written against). Results land in a
+// per-index slot rather than an appended slice so that the output order is
+// the case order regardless of which goroutine finishes first -- a batch's
+// admitted list should not depend on scheduling luck. The first error
+// cancels a shared context so cases still queued behind the semaphore do
+// not start slow work (a quality-audit subagent, a harbor probe) whose
+// answer will be thrown away.
 func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 	ex := &r.File.Experiment
-	var out []*casesrc.Case
-	for i, raw := range ex.Cases {
-		ref := raw.Merge(ex.CaseDefaults)
-		c, err := r.Res.Resolve(ctx, ref)
-		if err != nil {
-			return nil, fmt.Errorf("resolve %s: %w", ref.Label(), err)
-		}
-		r.logf("case %d/%d %s -> %s (pinned %s)", i+1, len(ex.Cases), c.Label, c.SHA256[:12], c.PinnedAt)
+	fp := perCaseFingerprint(ex, r.File.Commands.Cmds)
+	n := len(ex.Cases)
+	admitted := make([]*casesrc.Case, n)
+	errs := make([]error, n)
 
-		actx := r.actionCtx(actions.PerCase)
-		actx.CaseLabel, actx.CaseDir, actx.CaseSHA = c.Label, c.Dir, c.SHA256
-		actx.Probe = func(ctx context.Context, kind string, n int) ([]float64, error) {
-			return r.probe(ctx, c, rexec.AgentKind(kind), n)
-		}
-		if err := actions.RunList(ctx, actx, ex.Pipeline.PerCase, r.Cmds); err != nil {
+	gctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, ex.Pipeline.PerCaseConcurrency)
+	var wg sync.WaitGroup
+	for i, raw := range ex.Cases {
+		wg.Add(1)
+		go func(i int, raw config.CaseRef) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if gctx.Err() != nil {
+				return
+			}
+
+			ref := raw.Merge(ex.CaseDefaults)
+			c, err := r.Res.Resolve(gctx, ref)
+			if err != nil {
+				errs[i] = fmt.Errorf("resolve %s: %w", ref.Label(), err)
+				cancel()
+				return
+			}
+			r.logf("case %d/%d %s -> %s (pinned %s)", i+1, n, c.Label, c.SHA256[:12], c.PinnedAt)
+
+			key := c.SHA256
+			r.mu.Lock()
+			cached, ok := r.gateCache[key]
+			r.mu.Unlock()
+			if ok && cached.Fingerprint == fp {
+				r.logf("case %s: per_case gate cached (%s)", c.Label,
+					map[bool]string{true: "admitted", false: "rejected"}[cached.Admitted])
+				if cached.Admitted {
+					admitted[i] = c
+				}
+				return
+			}
+
+			actx := r.actionCtx(actions.PerCase)
+			actx.CaseLabel, actx.CaseDir, actx.CaseSHA = c.Label, c.Dir, c.SHA256
+			actx.Probe = func(ctx context.Context, kind string, n int) ([]float64, error) {
+				return r.probe(ctx, c, rexec.AgentKind(kind), n)
+			}
+			isAdmitted := true
+			if err := actions.RunList(gctx, actx, ex.Pipeline.PerCase, r.Cmds); err != nil {
+				if !errors.Is(err, actions.ErrSkipCase) {
+					errs[i] = err
+					cancel()
+					return
+				}
+				r.logf("case %s: skipped by per_case check (on_failure: skip)", c.Label)
+				isAdmitted = false
+			}
+			r.mu.Lock()
+			r.gateCache[key] = gateCacheEntry{Fingerprint: fp, Admitted: isAdmitted}
+			r.mu.Unlock()
+			r.saveGateCache()
+			if isAdmitted {
+				admitted[i] = c
+			}
+		}(i, raw)
+	}
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, c)
+	}
+	var out []*casesrc.Case
+	for _, c := range admitted {
+		if c != nil {
+			out = append(out, c)
+		}
 	}
 	return out, nil
 }

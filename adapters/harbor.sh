@@ -18,7 +18,18 @@ set -uo pipefail
 fail() { printf '%s\n%s\n' "$1" "$2" > "$OUT_DIR/failure.txt"; exit 1; }
 
 JOBS="$WORK_DIR/harbor"
-rm -rf "$JOBS"; mkdir -p "$JOBS"
+CASE_SNAPSHOT="$WORK_DIR/case"
+rm -rf "$JOBS" "$CASE_SNAPSHOT"
+mkdir -p "$JOBS" "$CASE_SNAPSHOT"
+
+# A casefactory case directory can accumulate .factory state and previous
+# Harbor trials. Those are mutable runtime artifacts (sometimes owned by the
+# container user), not part of task input; Harbor snapshots its --path and
+# would otherwise fail while hashing them. Give Harbor an isolated definition
+# snapshot instead.
+tar --exclude='./.git' --exclude='./.factory' --exclude='./trials' \
+  -C "$CASE_DIR" -cf - . | tar -C "$CASE_SNAPSHOT" -xf - ||
+  fail HOST_ERROR "could not snapshot case definition"
 
 agent=()
 case "$AGENT_KIND" in
@@ -49,7 +60,7 @@ esac
 # decision, made from the failure code, and doing them here would run the agent
 # more times than the results file admits to.
 harbor run \
-  --path "$CASE_DIR" \
+  --path "$CASE_SNAPSHOT" \
   "${agent[@]}" \
   --jobs-dir "$JOBS" \
   --job-name "$TRIAL_ID" \
