@@ -86,6 +86,13 @@ type Ctx struct {
 	// Enter is called as each step begins, so the middle of a pipeline is
 	// visible while it is happening rather than only in hindsight.
 	Enter func(step string)
+	// Wrote records a file a step produced, so the runner knows whether its
+	// own closing report would be writing over one already there.
+	Wrote func(path string)
+	// Outcome, when set, is how the run ended -- named in the closing report,
+	// because a batch that stopped halfway must not read like one that
+	// finished.
+	Outcome string
 
 	// StepOutputs holds each prior step's $ROLLOUT_MAN_OUTPUT, keyed by the
 	// step's label (name: if set, else uses:). A later step in the same list

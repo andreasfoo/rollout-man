@@ -777,9 +777,15 @@ func (reportAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 	var body string
 	switch format {
 	case "json":
-		b, err := json.MarshalIndent(map[string]any{
+		m := map[string]any{
 			"experiment": c.Experiment, "run_id": c.RunID, "agents": rows,
-		}, "", "  ")
+		}
+		if c.Outcome != "" {
+			// Whoever reads this file next has to be able to tell a batch that
+			// finished from one that stopped halfway.
+			m["incomplete"] = c.Outcome
+		}
+		b, err := json.MarshalIndent(m, "", "  ")
 		if err != nil {
 			return err
 		}
@@ -794,20 +800,30 @@ func (reportAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 		body = markdownReport(c, rows, a.Num("pass_at", -1))
 	}
 
-	if a.Bool("append", false) {
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = f.WriteString(body)
+	if err := write(path, body, a.Bool("append", false)); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		return err
+	// Telling the runner this file exists is what stops its own closing report
+	// from writing over -- or, in append mode, doubling -- the one just asked
+	// for.
+	if c.Wrote != nil {
+		c.Wrote(path)
 	}
 	c.Logf("report: %s", path)
 	return nil
+}
+
+func write(path, body string, appendTo bool) error {
+	if !appendTo {
+		return os.WriteFile(path, []byte(body), 0o644)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(body)
+	return err
 }
 
 type reportRow struct {
@@ -885,6 +901,10 @@ func markdownReport(c *Ctx, rows []reportRow, passAt float64) string {
 	b.WriteString("\nOnly an agent's own failures are in the denominator: " +
 		"infrastructure trouble is ours, and counting it would mark every agent " +
 		"down for our bad day.\n")
+	if c.Outcome != "" {
+		// A batch that stopped halfway must not read like one that finished.
+		fmt.Fprintf(&b, "\n**This run did not complete.** %s\n", c.Outcome)
+	}
 	return b.String()
 }
 
