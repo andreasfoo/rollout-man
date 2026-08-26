@@ -16,6 +16,7 @@ import (
 
 	"github.com/andreasfoo/rollout-man/internal/casesrc"
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
+	"github.com/andreasfoo/rollout-man/internal/cmdwatch"
 	"github.com/andreasfoo/rollout-man/internal/config"
 	rexec "github.com/andreasfoo/rollout-man/internal/exec"
 	"github.com/andreasfoo/rollout-man/internal/fail"
@@ -36,6 +37,8 @@ func main() {
 		os.Exit(cmdShip(os.Args[2:]))
 	case "cases":
 		os.Exit(cmdCases(os.Args[2:]))
+	case "watch":
+		os.Exit(cmdWatch(os.Args[2:]))
 	default:
 		usage()
 	}
@@ -57,6 +60,13 @@ func usage() {
 
   cases  <file.yaml> [--commands FILE]
          resolve every case and print its content hash.
+
+  watch  <dir> <file.yaml> [--interval 15s] [--runs DIR] [--commands FILE]
+         poll <dir> for case subdirectories (each with its own task.toml).
+         A new one is gated through <file.yaml>'s pipeline.per_case (quality
+         audit, admission, ...) automatically; per_experiment (ship) never
+         runs. A case that already ran and then changes is only reported --
+         re-gate it yourself with the same command once you're ready.
 `)
 	os.Exit(2)
 }
@@ -104,7 +114,7 @@ func build(f *config.File, executor, commandsFile string) (*cmdrun.Runner, rexec
 		}
 		f.Commands = trusted
 	}
-	cmds := cmdrun.New(f.Commands)
+	cmds := cmdrun.New(f.Commands, f.LLMSpecs)
 	cmds.Log = logf
 	// The first per_trial action names the executor. This lets an experiment
 	// select a workflow adapter (such as forge-flow-fuzz) while its admission
@@ -347,6 +357,15 @@ func cmdCases(args []string) int {
 			c.Config.AgentTimeout)
 	}
 	return rc
+}
+
+func cmdWatch(args []string) int {
+	return cmdwatch.Cmd(args, cmdwatch.Deps{
+		RunsRoot:  runsRoot,
+		Build:     build,
+		Logf:      logf,
+		SignalCtx: signalCtx,
+	})
 }
 
 // --------------------------------------------------------------- report ---

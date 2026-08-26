@@ -287,7 +287,6 @@ func perCaseFingerprint(ex *config.Experiment, cmds map[string]config.Command) s
 // answer will be thrown away.
 func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 	ex := &r.File.Experiment
-	fp := perCaseFingerprint(ex, r.File.Commands.Cmds)
 	n := len(ex.Cases)
 	admitted := make([]*casesrc.Case, n)
 	errs := make([]error, n)
@@ -306,47 +305,12 @@ func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 				return
 			}
 
-			ref := raw.Merge(ex.CaseDefaults)
-			c, err := r.Res.Resolve(gctx, ref)
+			c, isAdmitted, err := r.GateOne(gctx, raw)
 			if err != nil {
-				errs[i] = fmt.Errorf("resolve %s: %w", ref.Label(), err)
-				cancel()
+				errs[i] = err
+				cancel() // a hard failure aborts every case still queued behind sem
 				return
 			}
-			r.logf("case %d/%d %s -> %s (pinned %s)", i+1, n, c.Label, c.SHA256[:12], c.PinnedAt)
-
-			key := c.SHA256
-			r.mu.Lock()
-			cached, ok := r.gateCache[key]
-			r.mu.Unlock()
-			if ok && cached.Fingerprint == fp {
-				r.logf("case %s: per_case gate cached (%s)", c.Label,
-					map[bool]string{true: "admitted", false: "rejected"}[cached.Admitted])
-				if cached.Admitted {
-					admitted[i] = c
-				}
-				return
-			}
-
-			actx := r.actionCtx(actions.PerCase)
-			actx.CaseLabel, actx.CaseDir, actx.CaseSHA = c.Label, c.Dir, c.SHA256
-			actx.Probe = func(ctx context.Context, kind string, n int) ([]float64, error) {
-				return r.probe(ctx, c, rexec.AgentKind(kind), n)
-			}
-			isAdmitted := true
-			if err := actions.RunList(gctx, actx, ex.Pipeline.PerCase, r.Cmds); err != nil {
-				if !errors.Is(err, actions.ErrSkipCase) {
-					errs[i] = err
-					cancel()
-					return
-				}
-				r.logf("case %s: skipped by per_case check (on_failure: skip)", c.Label)
-				isAdmitted = false
-			}
-			r.mu.Lock()
-			r.gateCache[key] = gateCacheEntry{Fingerprint: fp, Admitted: isAdmitted}
-			r.mu.Unlock()
-			r.saveGateCache()
 			if isAdmitted {
 				admitted[i] = c
 			}
@@ -366,6 +330,64 @@ func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 		}
 	}
 	return out, nil
+}
+
+// GateOne resolves one case and runs it through pipeline.per_case (quality
+// audit, admission, ...), using and updating the persistent gate cache
+// exactly as perCase's own loop does for every case in an experiment. This is
+// the shared entry point for a full run's per_case stage and for `watch`,
+// which gates cases one at a time as it discovers them.
+//
+// admitted is false when the case was cleanly rejected (an on_failure: skip
+// step); err is non-nil only for a hard failure -- resolve failing, or a
+// per_case step failing without on_failure: skip.
+func (r *Runner) GateOne(ctx context.Context, raw config.CaseRef) (c *casesrc.Case, admitted bool, err error) {
+	ex := &r.File.Experiment
+	fp := perCaseFingerprint(ex, r.File.Commands.Cmds)
+
+	// Run() calls loadGateCache before perCase's goroutines start, so this is
+	// only ever nil for a caller (watch) that never went through Run -- and
+	// watch calls GateOne one case at a time, so this lazy init races with
+	// nothing.
+	if r.gateCache == nil {
+		r.loadGateCache()
+	}
+
+	ref := raw.Merge(ex.CaseDefaults)
+	c, err = r.Res.Resolve(ctx, ref)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve %s: %w", ref.Label(), err)
+	}
+	r.logf("case %s -> %s (pinned %s)", c.Label, c.SHA256[:12], c.PinnedAt)
+
+	key := c.SHA256
+	r.mu.Lock()
+	cached, ok := r.gateCache[key]
+	r.mu.Unlock()
+	if ok && cached.Fingerprint == fp {
+		r.logf("case %s: per_case gate cached (%s)", c.Label,
+			map[bool]string{true: "admitted", false: "rejected"}[cached.Admitted])
+		return c, cached.Admitted, nil
+	}
+
+	actx := r.actionCtx(actions.PerCase)
+	actx.CaseLabel, actx.CaseDir, actx.CaseSHA = c.Label, c.Dir, c.SHA256
+	actx.Probe = func(ctx context.Context, kind string, n int) ([]float64, error) {
+		return r.probe(ctx, c, rexec.AgentKind(kind), n)
+	}
+	isAdmitted := true
+	if err := actions.RunList(ctx, actx, ex.Pipeline.PerCase, r.Cmds); err != nil {
+		if !errors.Is(err, actions.ErrSkipCase) {
+			return c, false, err
+		}
+		r.logf("case %s: skipped by per_case check (on_failure: skip)", c.Label)
+		isAdmitted = false
+	}
+	r.mu.Lock()
+	r.gateCache[key] = gateCacheEntry{Fingerprint: fp, Admitted: isAdmitted}
+	r.mu.Unlock()
+	r.saveGateCache()
+	return c, isAdmitted, nil
 }
 
 // probe runs an admission probe through the ordinary execution path. Going the

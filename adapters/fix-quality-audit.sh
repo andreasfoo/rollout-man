@@ -19,7 +19,14 @@
 #               acc-quality-audit.sh uses for the report filename)
 #   RUN_DIR     rollout-man run directory (where the report to fix was saved)
 #   CYBER_GATE_ROOT  optional; defaults to /home/foo/project/cyber-gate
+#   LLM_BASE_URL LLM_MODEL LLM_API_KEY  optional; see acc-quality-audit.sh --
+#                same llm_spec: mapping onto ANTHROPIC_*, same fallthrough to
+#                the ambient claude config when unset.
 set -euo pipefail
+
+[ -n "${LLM_BASE_URL:-}" ] && export ANTHROPIC_BASE_URL="$LLM_BASE_URL"
+[ -n "${LLM_API_KEY:-}" ] && export ANTHROPIC_AUTH_TOKEN="$LLM_API_KEY"
+[ -n "${LLM_MODEL:-}" ] && export ANTHROPIC_MODEL="$LLM_MODEL"
 
 SKILL_FILE="${CYBER_GATE_ROOT:-/home/foo/project/cyber-gate}/.claude/skills/acc-quality-audit/SKILL.md"
 

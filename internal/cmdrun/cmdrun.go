@@ -25,14 +25,20 @@ type Runner struct {
 	MaxAttempts int
 	InheritEnv  bool
 	Log         func(format string, args ...any)
+	// LLMSpecs resolves a command's llm_spec: into LLM_BASE_URL / LLM_MODEL /
+	// LLM_PROVIDER / LLM_API_KEY, exactly as a trial's agent llm_spec is
+	// resolved (internal/run/run.go resolveLLM) -- an audit/fix subagent is
+	// an LLM call like any other, so which endpoint it talks to belongs in
+	// the submission, not hardcoded in the adapter script.
+	LLMSpecs map[string]config.LLMSpec
 
 	mu        sync.Mutex
 	announced map[string]bool
 }
 
-func New(c config.Commands) *Runner {
+func New(c config.Commands, llmSpecs map[string]config.LLMSpec) *Runner {
 	r := &Runner{Cmds: c.Cmds, Timeout: c.Timeout.D(), MaxAttempts: c.MaxAttempts,
-		InheritEnv: c.Inherits()}
+		InheritEnv: c.Inherits(), LLMSpecs: llmSpecs}
 	if r.Timeout <= 0 {
 		r.Timeout = 30 * time.Minute
 	}
@@ -137,6 +143,13 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 		cmd = exec.CommandContext(ctx, shell(), "-c", c.Script)
 	}
 	cmd.Env = append(r.hostEnv(c), envPairs(vars)...)
+	if c.LLMSpec != "" {
+		llmEnv, err := r.resolveLLM(ctx, c.LLMSpec)
+		if err != nil {
+			return Result{}, err
+		}
+		cmd.Env = append(cmd.Env, llmEnv...)
+	}
 
 	outFile, err := os.CreateTemp("", "rollout-man-output-*")
 	if err != nil {
@@ -215,6 +228,41 @@ func (r *Runner) hostEnv(c config.Command) []string {
 		}
 	}
 	return out
+}
+
+// resolveLLM turns a command's llm_spec: into LLM_BASE_URL / LLM_MODEL /
+// LLM_PROVIDER / LLM_API_KEY env pairs, the same names and the same
+// api_key_env/api_key_cmd resolution internal/run/run.go's resolveLLM uses
+// for a trial's agent -- one place decides how a key is obtained, whether the
+// LLM call is a trial or an audit/fix subagent.
+func (r *Runner) resolveLLM(ctx context.Context, name string) ([]string, error) {
+	s, ok := r.LLMSpecs[name]
+	if !ok {
+		return nil, fmt.Errorf("llm_spec %q is not defined (add a kind: LLMSpec document)", name)
+	}
+	var key string
+	switch {
+	case s.APIKeyEnv != "":
+		key = os.Getenv(s.APIKeyEnv)
+		if key == "" {
+			return nil, fmt.Errorf("llm_spec %s: %s is not set here", name, s.APIKeyEnv)
+		}
+	case len(s.APIKeyCmd) > 0:
+		out, err := exec.CommandContext(ctx, s.APIKeyCmd[0], s.APIKeyCmd[1:]...).Output()
+		if err != nil {
+			return nil, fmt.Errorf("llm_spec %s: api_key_cmd: %w", name, err)
+		}
+		key = strings.TrimSpace(string(out))
+		if key == "" {
+			return nil, fmt.Errorf("llm_spec %s: api_key_cmd produced an empty key", name)
+		}
+	}
+	return []string{
+		"LLM_BASE_URL=" + s.BaseURL,
+		"LLM_MODEL=" + s.Model,
+		"LLM_PROVIDER=" + s.Provider,
+		"LLM_API_KEY=" + key,
+	}, nil
 }
 
 // verify reads the file named by uses: and checks the pin. A pin that does not

@@ -21,7 +21,19 @@
 #   CASE_LABEL  human-readable label for the case
 #   RUN_DIR     rollout-man run directory (for report output)
 #   CYBER_GATE_ROOT  optional; defaults to /home/foo/project/cyber-gate
+#   LLM_BASE_URL LLM_MODEL LLM_API_KEY  optional; set when this command
+#                declares llm_spec: in kind: Commands. Mapped onto the
+#                ANTHROPIC_* names `claude -p` itself reads, same as
+#                adapters/harbor.sh maps LLM_* onto the right provider's
+#                names for a trial's agent -- an audit subagent's endpoint is
+#                a submission setting, not whatever happens to be ambient.
+#                Unset, the subagent falls through to the ambient
+#                ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN/ANTHROPIC_MODEL.
 set -euo pipefail
+
+[ -n "${LLM_BASE_URL:-}" ] && export ANTHROPIC_BASE_URL="$LLM_BASE_URL"
+[ -n "${LLM_API_KEY:-}" ] && export ANTHROPIC_AUTH_TOKEN="$LLM_API_KEY"
+[ -n "${LLM_MODEL:-}" ] && export ANTHROPIC_MODEL="$LLM_MODEL"
 
 emit() { [ -n "${ROLLOUT_MAN_OUTPUT:-}" ] && printf '%s=%s\n' "$1" "$2" >> "$ROLLOUT_MAN_OUTPUT" || true; }
 

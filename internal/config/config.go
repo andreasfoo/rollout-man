@@ -29,6 +29,13 @@ type Command struct {
 	SHA256 string   `yaml:"sha256"`
 	// Env names this command may read from the host, when inherit_env is off.
 	Env []string `yaml:"env"`
+	// LLMSpec names a kind: LLMSpec document this command talks to. Set only
+	// on commands that are themselves an LLM call (an audit or fix subagent,
+	// not a trial's agent) -- the runner resolves it the same way a trial's
+	// llm_spec is resolved and hands the command LLM_BASE_URL / LLM_MODEL /
+	// LLM_API_KEY, so which endpoint an adapter like acc-quality-audit.sh
+	// talks to is a submission setting, not something baked into the script.
+	LLMSpec string `yaml:"llm_spec"`
 }
 
 func (c Command) Empty() bool {
@@ -563,6 +570,13 @@ func (f *File) validate() error {
 		if a.LLMSpec != "" {
 			if _, ok := f.LLMSpecs[a.LLMSpec]; !ok {
 				return fmt.Errorf("agent %s references unknown llm_spec %q", a.Name, a.LLMSpec)
+			}
+		}
+	}
+	for name, cmd := range f.Commands.Cmds {
+		if cmd.LLMSpec != "" {
+			if _, ok := f.LLMSpecs[cmd.LLMSpec]; !ok {
+				return fmt.Errorf("command %q references unknown llm_spec %q", name, cmd.LLMSpec)
 			}
 		}
 	}

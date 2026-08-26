@@ -132,12 +132,14 @@ name: tc-batch2-smoke
 case_defaults:
   source: local
 
-# TEMPORARY: scoped to the 13 still-rejected cases from the full 24-case batch
-# (bind9-891c50a excluded per user -- being re-run separately) to exercise the
-# new check_quality fix:/fix_writeback: auto-repair without re-touching the 10
-# already-admitted cases' gate-cache/admission results. Restore the full
-# 24-case list afterward (backup: /tmp/tc-batch2-smoke.yaml.full-backup).
+# TEMPORARY: scoped to the 13 still-rejected cases from the full 24-case batch,
+# plus bind9-891c50a (re-added now that its trial layout has been repaired --
+# see tc_batch2 commit 08f0ba49e), to exercise the new check_quality
+# fix:/fix_writeback: auto-repair without re-touching the 10 already-admitted
+# cases' gate-cache/admission results. Restore the full 24-case list
+# afterward (backup: /tmp/tc-batch2-smoke.yaml.full-backup).
 cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/bind9-891c50a-commit-921043b-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-ce552bd-issue-103630-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/dnsmasq-5b99eae-commit-a90f09db-t4
   - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/gstreamer-763d2bb-commit-b268b27-t4
@@ -178,7 +180,13 @@ pipeline:
       fix: fix_quality_audit
       fix_writeback: true
     # 3. admission -- oracle must score 1.0, nop must score 0.0.
+    #    on_failure: skip so one case's rejection (or a harbor ENV_FAILED --
+    #    e.g. a packaging defect check_toml_image didn't catch) drops just
+    #    that case instead of cancel()-ing the whole per_case run (see
+    #    internal/run/run.go perCase: a step that returns a plain error, not
+    #    ErrSkipCase, aborts every case still queued behind the semaphore).
     - uses: admission
+      on_failure: skip
       with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
     # 4. trajectory layout -- jobs/ must have agent/trajectory.json per trial.
     #    on_failure: skip drops the case rather than aborting the whole run.
