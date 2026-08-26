@@ -12,6 +12,7 @@ cd "$(dirname "$0")/../.."
 RUNS=${RUNS:-/tmp/rm-smoke-runs}
 BUCKET=${ROLLOUT_MAN_BUCKET:-/tmp/rm-smoke-bucket}
 BIN=${BIN:-/tmp/rollout-man-smoke}
+PWD_ABS=$(pwd)
 export ROLLOUT_MAN_BUCKET="$BUCKET"
 export SMOKE_API_KEY="sk-smoketest-7f3a9c1d4e8b2a6f0c5d"
 
@@ -215,9 +216,9 @@ else
   check "the verifier scored it a full 1.00" 'grep -q "^FINAL SCORE: 1.00" "$LT/stdout.log"'
 fi
 
-step "12. commands as pinned, isolated adapters"
-# The safety story: a command can be a script file pinned by hash, run with only
-# the environment it declares, taken from a file the submission cannot override.
+step "12. commands: recorded, isolated, not the submission's to define"
+# A command is a file whose hash is recorded, run with only the environment it
+# declares, taken from a file the submission cannot override.
 PINDIR="$RUNS/pin"; rm -rf "$PINDIR"; mkdir -p "$PINDIR"
 cat > "$PINDIR/adapter.sh" <<'A'
 #!/usr/bin/env bash
@@ -235,7 +236,6 @@ kind: Commands
 inherit_env: false
 ship:
   uses: $PINDIR/adapter.sh
-  sha256: $SUM
   env: [KEEP]
 C
 cat > "$PINDIR/exp.yaml" <<C
@@ -259,10 +259,13 @@ check "the manifest marks the commands as trusted"     'grep -q "commands_from_t
 check "the declared env var reached the command"       'grep -q "KEEP=yes"     "$SAW"'
 check "an undeclared env var did NOT"                   'grep -q "DROP=<unset>" "$SAW"'
 
-# Tamper with the pinned file: the run must refuse rather than run it.
-echo "# tampered" >> "$PINDIR/adapter.sh"
-KEEP=yes "$BIN" run "$PINDIR/exp.yaml" --runs "$PINDIR/runs2" --id r --executor local --commands "$PINDIR/commands.yaml" > "$PINDIR/tamper.log" 2>&1
-check "a changed pin is refused, not run" 'grep -q "refusing to run" "$PINDIR/tamper.log"'
+# Editing an adapter is an ordinary thing to do and must not refuse a run,
+# but the recorded hash has to follow it or it stops being provenance.
+echo "# edited" >> "$PINDIR/adapter.sh"
+SUM2=$(sha256sum "$PINDIR/adapter.sh" | cut -d" " -f1)
+KEEP=yes "$BIN" run "$PINDIR/exp.yaml" --runs "$PINDIR/runs2" --id r --executor local --commands "$PINDIR/commands.yaml" > "$PINDIR/edit.log" 2>&1
+check "editing an adapter does not refuse the run" '[ -f "$PINDIR/runs2/r/manifest.json" ]'
+check "and the recorded hash follows the edit"     'grep -q "$SUM2" "$PINDIR/runs2/r/manifest.json"'
 
 # A submission that smuggles its own commands alongside a trusted file is refused.
 cat > "$PINDIR/evil.yaml" <<C
@@ -336,7 +339,7 @@ step "14. adapters are executable files, not necessarily shell scripts"
 # Only what something actually names in a uses: -- adapters/ also holds
 # modules that another tool imports (mock_agent.py is a Python class Harbor
 # loads, never executed), and those need no shebang and no execute bit.
-USED=$(grep -rhoE 'uses: *[^ $]+\.(sh|py|pl|rb)' experiments test/smoke 2>/dev/null |
+USED=$(grep -rhoE 'uses: *[^ $]+\.(sh|py|pl|rb)' experiments test/smoke --include='*.yaml' 2>/dev/null |
        sed 's/uses: *//' | sort -u)
 for a in $USED; do
   [ -f "$a" ] || { bad "$a exists"; continue; }
@@ -451,7 +454,8 @@ check "the heartbeat names the step"                'echo "$OUT" | grep -q "slow
 check "and per-case progress"                       'echo "$OUT" | grep -qE "leaky-case [0-9]+/2 · pass-case [0-9]+/2"'
 check "every completion carries a counter"          '[ "$(echo "$OUT" | grep -cE "^[0-9:]+ +[[][0-9]/4[]]")" -eq 4 ]'
 check "cases are counted as they resolve"           'echo "$OUT" | grep -q "case 2/2 "'
-check "the finished run says so"                    '"$BIN" status "$PDIR/runs/p" | grep -q "(finished)"'
+FIN=$("$BIN" status "$PDIR/runs/p" 2>&1 || true)
+check "the finished run says so"                    'echo "$FIN" | grep -q "(finished)"'
 # One line per command, not one per invocation: at batch scale the pin
 # announcement would otherwise outnumber the results.
 check "a command announces itself once"             '[ "$(echo "$OUT" | grep -c "command slowstep ->")" -le 1 ]'
@@ -526,6 +530,39 @@ check "the library is included, not copied" \
   '[ "$(grep -lc "include: \[commands.yaml\]" experiments/*.yaml | wc -l)" -ge 5 ]'
 check "no experiment inlines the harbor adapter" \
   '! grep -lq "rollout-man.s trial contract on top of" experiments/*.yaml'
+
+step "18. the smallest submission that runs a directory of cases"
+# How much has to be configured to point this at a directory of cases is a
+# product question, and the answer should be a number you can check.
+SDIR="$RUNS/smallest"; rm -rf "$SDIR"; mkdir -p "$SDIR/cases"
+cp -r test/smoke/pass-case test/smoke/leaky-case "$SDIR/cases/"
+cat > "$SDIR/exp.yaml" <<C
+---
+kind: Experiment
+name: smallest
+cases: [{path: "cases/*"}]
+matrix: {agents: [oracle], trials: 1}
+C
+check "five lines is a whole submission" '[ "$(wc -l < "$SDIR/exp.yaml")" -le 5 ]'
+# A glob, because a directory of cases is how people actually have them, and
+# one line per case is a list to maintain rather than a thing to say.
+GOUT=$("$BIN" cases "$SDIR/exp.yaml" 2>&1)
+check "a glob expands to every case in the directory" '[ "$(echo "$GOUT" | grep -c "cpus=")" -eq 2 ]'
+check "and only to directories that are cases" '! echo "$GOUT" | grep -q INVALID'
+# Paths are tried against the working directory and then beside the file, so
+# the same submission runs from the repository root and from its own directory.
+# Capture, then match. With `set -o pipefail` a command that exits non-zero
+# fails the whole pipeline even when grep found what it was looking for.
+ELSEWHERE=$(cd /tmp && "$BIN" cases "$SDIR/exp.yaml" 2>&1 || true)
+check "the submission runs from elsewhere too" 'echo "$ELSEWHERE" | grep -q "cpus="'
+# No pipeline: with one obvious executor there is nothing else it could mean.
+SOUT=$("$BIN" run "$SDIR/exp.yaml" --runs "$SDIR/runs" --id s --executor local 2>&1)
+check "it runs without a pipeline being spelled out" 'echo "$SOUT" | grep -q "matrix: 2 trials"'
+check "both cases were measured"                     '[ "$(wc -l < "$SDIR/runs/s/results.jsonl")" -eq 2 ]'
+# A setting that no longer exists must say so rather than be ignored.
+printf -- '---\nkind: Commands\nx: {uses: a.sh, sha256: deadbeef}\n---\nkind: Experiment\nname: n\ncases: [{path: test/smoke/pass-case}]\nmatrix: {agents: [oracle], trials: 1}\n' > "$SDIR/stale.yaml"
+STALE=$("$BIN" cases "$SDIR/stale.yaml" 2>&1 || true)
+check "a removed setting is an error, not ignored" 'echo "$STALE" | grep -q "no longer used"'
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

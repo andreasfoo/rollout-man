@@ -37,6 +37,70 @@ type Resolver struct {
 	TempDir string
 }
 
+// Expand turns the submission's case list into the actual cases. A local path
+// may be a glob, so pointing at a directory of cases is one line rather than
+// one line per case -- which is how people actually have them.
+//
+// Only local paths expand: a glob over a git or hub repository would mean
+// fetching it first to find out what is in there, and a submission should say
+// what it runs without a network round trip.
+func Expand(refs []config.CaseRef, defaults config.CaseRef, near string) ([]config.CaseRef, error) {
+	var out []config.CaseRef
+	for _, raw := range refs {
+		ref := raw.Merge(defaults)
+		if (ref.Source != "" && ref.Source != "local") || !strings.ContainsAny(ref.Path, "*?[") {
+			out = append(out, raw)
+			continue
+		}
+		matches, err := glob(ref.Path, near)
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			return nil, fail.New(fail.Host, "no case directories match "+ref.Path)
+		}
+		for _, m := range matches {
+			one := raw
+			one.Path = m
+			out = append(out, one)
+		}
+	}
+	return out, nil
+}
+
+// glob matches from the working directory, then from beside the submission
+// file. Trying both is what lets one file be run from the repository root and
+// from its own directory, which is otherwise a coin flip nobody should have to
+// remember.
+func glob(pattern, near string) ([]string, error) {
+	try := []string{pattern}
+	if near != "" && !filepath.IsAbs(pattern) {
+		try = append(try, filepath.Join(near, pattern))
+	}
+	for _, p := range try {
+		hits, err := filepath.Glob(p)
+		if err != nil {
+			return nil, fail.New(fail.Host, "bad case pattern "+pattern+": "+err.Error())
+		}
+		var dirs []string
+		for _, h := range hits {
+			// A match is a case only if it looks like one. A glob over a
+			// directory picks up README files and stray archives otherwise,
+			// and the failure would surface much later as "parse task.toml".
+			if fi, err := os.Stat(h); err == nil && fi.IsDir() {
+				if _, err := os.Stat(filepath.Join(h, "task.toml")); err == nil {
+					dirs = append(dirs, h)
+				}
+			}
+		}
+		if len(dirs) > 0 {
+			sort.Strings(dirs) // the trial list must not depend on readdir order
+			return dirs, nil
+		}
+	}
+	return nil, nil
+}
+
 // Resolve fetches the case if needed, hashes it, and reads its task.toml.
 func (r *Resolver) Resolve(ctx context.Context, ref config.CaseRef) (*Case, error) {
 	dir, pinned, err := r.fetch(ctx, ref)

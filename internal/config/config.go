@@ -37,6 +37,27 @@ type Command struct {
 	LLMSpec string `yaml:"llm_spec"`
 }
 
+// UnmarshalYAML rejects keys a command does not have. Plain struct decoding
+// ignores them, so a setting that has been removed -- sha256:, until recently --
+// would sit in a submission looking like it still did something.
+func (c *Command) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("a command must be a mapping with run:, script: or uses:")
+	}
+	type plain Command
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		switch k := n.Content[i].Value; k {
+		case "run", "script", "uses", "env", "llm_spec":
+		case "sha256":
+			return fmt.Errorf("sha256: on a command is no longer used -- remove it")
+		default:
+			return fmt.Errorf("unknown key %q in a command; "+
+				"a command takes run, script, uses, env, llm_spec", k)
+		}
+	}
+	return n.Decode((*plain)(c))
+}
+
 func (c Command) Empty() bool {
 	return len(c.Run) == 0 && strings.TrimSpace(c.Script) == "" && c.Uses == ""
 }
@@ -469,7 +490,12 @@ type Experiment struct {
 	MaxAttempts  int       `yaml:"max_attempts"`
 }
 
+// Near is the directory the submission was loaded from. Paths inside it are
+// tried against the working directory first and then against this, so one file
+// works from the repository root and from its own directory both.
 type File struct {
+	Near string `yaml:"-"`
+
 	Commands   Commands
 	LLMSpecs   map[string]LLMSpec
 	Experiment Experiment
@@ -554,7 +580,7 @@ func Load(path string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &File{LLMSpecs: map[string]LLMSpec{}}
+	f := &File{LLMSpecs: map[string]LLMSpec{}, Near: filepath.Dir(path)}
 	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
 	seen := false
 	for {
@@ -628,6 +654,16 @@ func (f *File) validate() error {
 	}
 	if e.Pipeline.PerCaseConcurrency <= 0 {
 		e.Pipeline.PerCaseConcurrency = 1
+	}
+	if len(e.Pipeline.PerTrial) == 0 {
+		// One obvious executor and nothing else to say: filling it in beats
+		// making every submission restate the only thing it could have meant.
+		for _, name := range []string{"harbor", "local"} {
+			if _, ok := f.Commands.Cmds[name]; ok || name == "local" {
+				e.Pipeline.PerTrial = []Action{{Uses: name}}
+				break
+			}
+		}
 	}
 	if _, err := e.Pipeline.Executor(); err != nil {
 		return err
