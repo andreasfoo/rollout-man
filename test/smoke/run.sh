@@ -640,5 +640,103 @@ check "both templates parse" 'for t in templates/*.sh; do bash -n "$t" || exit 1
 check "an unedited template fails rather than passing" \
   'for t in templates/*.sh; do RUN_DIR=/tmp LLM_MODEL=x bash "$t" >/dev/null 2>&1 && exit 1; done; true'
 
+step "21. the report is the last link of every pipeline"
+# The report is not an ordinary step. A batch that stopped at the gate, or
+# whose ship failed, is exactly the batch whose record matters most -- and it
+# is also the one nobody is around to ask for. So it is written on the way out,
+# whichever way out that was.
+RDIR=/tmp/rm-report; rm -rf "$RDIR"; mkdir -p "$RDIR"
+cat > "$RDIR/commands.yaml" <<C
+---
+kind: Commands
+timeout: 5m
+badship:
+  script: |
+    echo "the bucket is gone" >&2
+    exit 3
+C
+mkexp() { # name, extra per_experiment yaml, case path
+  cat > "$RDIR/$1.yaml" <<C
+---
+kind: Experiment
+name: $1
+case_defaults: {source: local}
+cases: [{path: $3}]
+matrix: {agents: [{name: oracle}], trials: 1}
+pipeline:
+$4
+  per_trial: [{uses: local}]
+  per_experiment:
+$2
+C
+}
+runexp() { "$BIN" run "$RDIR/$1.yaml" --runs "$RDIR/runs" --id "$1" \
+  --executor local --commands "$RDIR/commands.yaml" > "$RDIR/$1.log" 2>&1 || true; }
+
+# A submission that never mentions report still gets one.
+mkexp clean "    []" test/smoke/pass-case ""
+runexp clean
+check "a run that declares no report still writes one" '[ -f "$RDIR/runs/clean/report.md" ]'
+check "and it does not claim to be incomplete" \
+  '! grep -q "did not complete" "$RDIR/runs/clean/report.md"'
+
+# The pipeline failing downstream of the numbers does not cost you the numbers.
+mkexp shipfail "    - uses: ship
+      with: {using: badship, dest: nowhere}" test/smoke/pass-case ""
+runexp shipfail
+check "a failed ship still leaves a report"  '[ -f "$RDIR/runs/shipfail/report.md" ]'
+check "with the measurement still in it"     'grep -q "| oracle |" "$RDIR/runs/shipfail/report.md"'
+check "and the reason it stopped named"      'grep -q "did not complete.*bucket is gone" "$RDIR/runs/shipfail/report.md"'
+
+# A batch that died at the gate never reaches per_experiment at all.
+mkexp gatefail "    []" test/smoke/fail-cases/no-solution "  per_case:
+    - uses: admission
+      with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}"
+runexp gatefail
+check "a run that died at the gate still reports" '[ -f "$RDIR/runs/gatefail/report.md" ]'
+check "and says the gate is where it died" \
+  'grep -q "did not complete.*admission" "$RDIR/runs/gatefail/report.md"'
+
+# The closing report is the report that was asked for, not a default written
+# next to it: same destination, same format, same pass@.
+mkexp declared "    - uses: report
+      with: {dest: summary.md, pass_at: 0.8}
+    - uses: ship
+      with: {using: badship, dest: nowhere}" test/smoke/pass-case ""
+runexp declared
+check "the closing report honours the declared dest" '[ -f "$RDIR/runs/declared/summary.md" ]'
+check "and does not write a second one beside it"    '[ ! -f "$RDIR/runs/declared/report.md" ]'
+check "and keeps the declared pass@"                 'grep -q "pass@0.80" "$RDIR/runs/declared/summary.md"'
+check "and corrects it once the run failed"          'grep -q "did not complete" "$RDIR/runs/declared/summary.md"'
+
+# On a clean run the declared step has already said everything: writing again
+# would duplicate it, which append: true makes visible.
+mkexp once "    - uses: report
+      with: {dest: summary.md, append: true}" test/smoke/pass-case ""
+runexp once
+check "a clean run writes the declared report exactly once" \
+  '[ "$(grep -c "^# " "$RDIR/runs/once/summary.md")" -eq 1 ]'
+
+# Whoever parses the report has to be able to tell the two apart too.
+mkexp asjson "    - uses: report
+      with: {dest: report.json}
+    - uses: ship
+      with: {using: badship, dest: nowhere}" test/smoke/pass-case ""
+runexp asjson
+check "json reports carry the outcome as a field" \
+  'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get(\"incomplete\") and d[\"agents\"] else 1)" "$RDIR/runs/asjson/report.json"'
+
+# Ctrl-C is the other way to stop halfway, and the one that says nothing about
+# itself: the interrupted trials are recorded as host errors, honestly enough,
+# but nothing in the table would say the batch never got to the end.
+mkexp slow "    []" test/smoke/slow-case ""
+"$BIN" run "$RDIR/slow.yaml" --runs "$RDIR/runs" --id slow --executor local \
+  --commands "$RDIR/commands.yaml" > "$RDIR/slow.log" 2>&1 &
+SLOWPID=$!
+( sleep 2; kill -INT $SLOWPID 2>/dev/null ) &
+wait $SLOWPID 2>/dev/null || true
+check "an interrupted run leaves a report"   '[ -f "$RDIR/runs/slow/report.md" ]'
+check "that says it was interrupted"         'grep -q "did not complete.*interrupted" "$RDIR/runs/slow/report.md"'
+
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

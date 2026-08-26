@@ -208,6 +208,32 @@ They are **transport only**. What to send was decided by the step before —
 `dataset`, `archive`, or an explicit `path:` — and keeping that separate is what
 stops one project's idea of "the right files" from becoming everyone's.
 
+`report` is the one that is not an ordinary step: it is **the last link of every
+pipeline, written on the way out whichever way out that was**. A batch that died
+at the gate, one whose `ship` failed, one you Ctrl-C'd — those are the batches
+whose record matters most, and they are also the ones nobody is around to ask
+for. So a submission that never mentions `report` still gets `report.md`, and one
+that declares it gets exactly what it declared:
+
+```yaml
+per_experiment:
+  - uses: report
+    with: {dest: summary.md, pass_at: 0.8}
+```
+
+The closing report reuses that configuration — same destination, same format,
+same `pass@` — rather than writing a default beside it. On a clean run the
+declared step has already said everything and nothing is written twice. When the
+run stopped early, the report says so in the line it would otherwise not have:
+
+```
+**This run did not complete.** ship: exit status 3: the bucket is gone
+```
+
+(`json` carries the same as an `incomplete` field; `csv` stays a clean table.)
+The measurements are still in it. Stopping late costs you the shipping, never
+the numbers.
+
 Every action declares the inputs it understands, and one it does not is an error
 **before the batch starts**. A misspelled key would otherwise run the step with
 its defaults and look like success — which for `redact` means publishing keys.
@@ -595,7 +621,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 156 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 171 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

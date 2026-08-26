@@ -100,6 +100,7 @@ type Runner struct {
 	// pipeline for every case even though only ship failed downstream.
 	gateCache map[string]gateCacheEntry
 	casesSeen int
+	wrote     map[string]bool
 }
 
 func (r *Runner) logf(f string, a ...any) {
@@ -126,8 +127,15 @@ func (r *Runner) Run(ctx context.Context) error {
 		r.logf("resuming: %d trials already recorded", len(r.done))
 	}
 
+	// The closing report is written on every exit path, not only the happy
+	// one: a batch that stopped halfway is the one whose record matters most,
+	// and it is also the one nobody is around to ask for.
+	var runErr error
+	defer func() { r.closeOut(ctx, runErr) }()
+
 	cases, err := r.perCase(ctx)
 	if err != nil {
+		runErr = err
 		return err
 	}
 	trials := expand(&r.File.Experiment, cases)
@@ -152,9 +160,65 @@ func (r *Runner) Run(ctx context.Context) error {
 	r.progress.Close()
 
 	if err := r.Finish(ctx); err != nil {
+		runErr = err
 		return err
 	}
 	return nil
+}
+
+// closeOut writes the run's closing report. The report is the last link of
+// every pipeline, not an ordinary step in one: a batch that stopped at the
+// gate, or whose ship step failed, is exactly the batch whose record matters
+// most, and it is also the one nobody is around to ask for.
+//
+// It reuses the submission's own report configuration when it declared one, so
+// the closing report is the report that was asked for -- same destination,
+// same format, same pass@ -- rather than a default written over it.
+func (r *Runner) closeOut(ctx context.Context, runErr error) {
+	a := config.Action{Uses: "report"}
+	for _, s := range r.File.Experiment.Pipeline.PerExperiment {
+		if s.Uses == "report" {
+			a = s
+			break
+		}
+	}
+	dest := a.Str("dest", "report.md")
+	if !filepath.IsAbs(dest) {
+		dest = filepath.Join(r.Dir, dest)
+	}
+
+	// Two ways to stop halfway. An error says so itself; a Ctrl-C does not --
+	// the trials it interrupted are recorded as host errors, honestly enough,
+	// but nothing in the table says the batch never got to the end.
+	outcome := ""
+	switch {
+	case runErr != nil:
+		outcome = firstLine(runErr.Error())
+	case ctx.Err() != nil:
+		outcome = "interrupted before every trial ran"
+	}
+
+	r.mu.Lock()
+	already := r.wrote[dest]
+	r.mu.Unlock()
+	// A report the declared step already wrote is left alone -- unless the run
+	// stopped after writing it, in which case that file says the batch finished
+	// and it did not. Then it is written again, with the outcome named.
+	if already && outcome == "" {
+		return
+	}
+
+	c := r.actionCtx(actions.PerExperiment)
+	c.Outcome = outcome
+	act, err := actions.Resolve(a, r.Cmds)
+	if err != nil {
+		return
+	}
+	// Ctrl-C cancels the run, and the run is what the report is about: it must
+	// still be written after the context that carried the work is gone.
+	if err := act.Run(context.WithoutCancel(ctx), c, a); err != nil {
+		r.logf("closing report: %v", err)
+	}
 }
 
 // writeManifest records what this run was actually made of: which commands
@@ -744,7 +808,17 @@ func (r *Runner) actionCtx(scope actions.Scope) *actions.Ctx {
 		Cmds: r.Cmds, Log: r.Log,
 		Trials:  r.snapshot,
 		Dropped: r.isDropped,
+		Wrote:   r.markWrote,
 	}
+}
+
+func (r *Runner) markWrote(path string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.wrote == nil {
+		r.wrote = map[string]bool{}
+	}
+	r.wrote[path] = true
 }
 
 func (r *Runner) markDropped(id string) {
