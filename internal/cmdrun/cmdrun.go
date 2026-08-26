@@ -328,19 +328,36 @@ func envPairs(vars map[string]string) []string {
 	return out
 }
 
+// upperSnake turns a CamelCase template name into the environment variable
+// spelling. Acronyms stay whole: CaseSHA is CASE_SHA, not CASE_S_H_A, because
+// the variable an adapter reads should be the one a person would guess.
+//
+// A separator goes before an upper-case letter only where a word actually
+// begins: after a lower-case letter or digit, or at the end of a run of
+// capitals that is followed by a lower-case letter (HTTPServer -> HTTP_SERVER).
 func upperSnake(s string) string {
+	r := []rune(s)
 	var b strings.Builder
-	for i, r := range s {
-		if i > 0 && r >= 'A' && r <= 'Z' {
-			b.WriteByte('_')
+	for i, c := range r {
+		if i > 0 && isUpper(c) {
+			prev := r[i-1]
+			startsWord := isLower(prev) || isDigit(prev)
+			endsAcronym := isUpper(prev) && i+1 < len(r) && isLower(r[i+1])
+			if startsWord || endsAcronym {
+				b.WriteByte('_')
+			}
 		}
-		if r >= 'a' && r <= 'z' {
-			r = r - 'a' + 'A'
+		if isLower(c) {
+			c = c - 'a' + 'A'
 		}
-		b.WriteRune(r)
+		b.WriteRune(c)
 	}
 	return b.String()
 }
+
+func isUpper(r rune) bool { return r >= 'A' && r <= 'Z' }
+func isLower(r rune) bool { return r >= 'a' && r <= 'z' }
+func isDigit(r rune) bool { return r >= '0' && r <= '9' }
 
 func tail(s string, n int) string {
 	if len(s) <= n {

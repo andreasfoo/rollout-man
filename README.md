@@ -164,6 +164,43 @@ being scrubbed, packed and shipped (nothing to do with containers). The executor
 slot is released before post-processing starts, so zipping a directory never
 holds the scarce resource.
 
+### Repairing a case, and what that does to its version
+
+A `per_case` step can name a `fix:` — a command that repairs whatever the check
+rejected — and `fix_attempts:` says how many check-repair-check rounds it gets.
+More than one is the normal case for a repair that *converges*: an agent asked
+to patch what a check flagged often gets part of the way on the first pass.
+
+```yaml
+per_case:
+  - uses: check_quality
+    fix: fix_quality_audit
+    fix_writeback: true      # naming a repair is not consent to it editing the case
+    fix_attempts: 2
+```
+
+**A repair changes the case's bytes, so it changes its version.** The hash is
+recomputed after `per_case` and *that* is what gets recorded and published —
+"the content hash is the version" only means something if it is the hash of what
+actually ran. Recording the hash as found would publish provenance pointing at
+content no trial ever saw.
+
+```
+case …/duckdb-3f0eb51: repaired in place, 1f2532b2e042 -> 7e6a9818b8e8
+```
+
+### Not re-auditing what has already been judged
+
+A gate verdict is bound to the case's content hash and a fingerprint of the
+checks — including the executor, because admission probes run *through* it and
+a verdict reached one way says nothing about another. Neither of those is a run,
+so the cache lives beside `runs/`, not inside one, and a fresh `--id` does not
+redo an audit that has already happened.
+
+It can only be keyed on what is written down. Anything else that decides an
+outcome — an environment variable, the state of the world — is invisible to it,
+so `--regate` runs the gate again regardless.
+
 ### Guards, and what dropping means
 
 `guard` asks a different question from `admission`. Admission asks whether a case
@@ -346,6 +383,21 @@ pip install harbor        # or: uv tool install harbor
 rollout-man run experiment.yaml     # --executor auto finds the harbor command
 ```
 
+Commands are shared with `include:`, so a submission references the library
+rather than restating it:
+
+```yaml
+kind: Commands
+include: [commands.yaml]     # relative to this file
+harbor:                      # only what differs
+  uses: adapters/my-harbor.sh
+```
+
+Definitions in the including file win. This opens no door that was not already
+open: without `--commands` a submission's commands are trusted anyway, and with
+it the submission's `Commands` document is refused outright, so the only
+includes that ever run are the operator's.
+
 `adapters/harbor.sh` is the real one, over `harbor run`. It lets Harbor enforce
 every timeout and resource limit `task.toml` declares, and maps Harbor's
 exception types onto the taxonomy — `AgentTimeoutError` and
@@ -470,7 +522,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 106 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 135 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

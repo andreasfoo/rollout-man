@@ -155,12 +155,15 @@ check "the case's limits reached the adapter" \
    grep -q "^ALLOW_INTERNET=0$"      "$HT/adapter-env.txt"'
 
 # An adapter that knows why it failed says so, and the code passes through.
-HF=$(FAKE_HARBOR_FAIL=declared "$BIN" run test/smoke/harbor.yaml --runs "$RUNS" --id harbor-f1 2>&1)
+# --regate: the fault is injected through the environment, which the gate cache
+# is keyed on nothing of. Reusing the earlier verdict would test the cache
+# rather than the adapter.
+HF=$(FAKE_HARBOR_FAIL=declared "$BIN" run test/smoke/harbor.yaml --runs "$RUNS" --id harbor-f1 --regate 2>&1)
 echo "$HF" | grep -E 'could not run' | sed 's/^/    /'
 check "a declared failure code passes through" 'echo "$HF" | grep -q "AGENT_TIMEOUT: the agent outran its clock"'
 # An adapter that just dies must not be read as the agent failing. "Could not
 # measure" is ours, and putting it in the agent's denominator corrupts the number.
-HS=$(FAKE_HARBOR_FAIL=silent "$BIN" run test/smoke/harbor.yaml --runs "$RUNS" --id harbor-f2 2>&1)
+HS=$(FAKE_HARBOR_FAIL=silent "$BIN" run test/smoke/harbor.yaml --runs "$RUNS" --id harbor-f2 --regate 2>&1)
 echo "$HS" | grep -E 'could not run' | sed 's/^/    /'
 check "an adapter that dies silently is ENV_FAILED, not AGENT_*" \
   'echo "$HS" | grep -q "ENV_FAILED" && ! echo "$HS" | grep -q "AGENT_"'
@@ -176,6 +179,8 @@ elif ! docker info >/dev/null 2>&1; then
   skip "Harbor executor (no docker daemon on this host)"
 else
   ROUT=$("$BIN" run test/smoke/harbor-real.yaml --runs "$RUNS" --id harbor-real 2>&1)
+  check "a different executor does not inherit the gate verdict" \
+    '! echo "$ROUT" | grep -q "gate cached"' 
   RDIR="$RUNS/harbor-real"
   echo "$ROUT" | grep -E 'want|matrix|reward' | sed 's/^/    /'
   RT="$RDIR/trials/test-smoke-harbor-case-oracle-1/out"
@@ -328,7 +333,13 @@ step "14. adapters are executable files, not necessarily shell scripts"
 # Nothing in it says shell, so the runner executes the file directly and lets
 # its shebang decide what runs it. Interpreting it with a shell here would
 # force every adapter to be sh and silently ignore the one it declares.
-for a in adapters/*; do
+# Only what something actually names in a uses: -- adapters/ also holds
+# modules that another tool imports (mock_agent.py is a Python class Harbor
+# loads, never executed), and those need no shebang and no execute bit.
+USED=$(grep -rhoE 'uses: *[^ $]+\.(sh|py|pl|rb)' experiments test/smoke 2>/dev/null |
+       sed 's/uses: *//' | sort -u)
+for a in $USED; do
+  [ -f "$a" ] || { bad "$a exists"; continue; }
   b=$(basename "$a")
   [ -x "$a" ] || { bad "$b is executable"; continue; }
   head -1 "$a" | grep -q '^#!' || { bad "$b names its own interpreter"; continue; }
@@ -444,6 +455,77 @@ check "the finished run says so"                    '"$BIN" status "$PDIR/runs/p
 # One line per command, not one per invocation: at batch scale the pin
 # announcement would otherwise outnumber the results.
 check "a command announces itself once"             '[ "$(echo "$OUT" | grep -c "command slowstep ->")" -le 1 ]'
+
+step "16. repair rounds, and the version is the bytes that were measured"
+# A fix: step edits the case in place. Two things have to hold: the case gets
+# as many repair rounds as it asked for, and whatever is recorded as the
+# version is the content that actually ran -- not the content as it was found.
+RDIR="$RUNS/repair"; rm -rf "$RDIR"; mkdir -p "$RDIR/case/solution" "$RDIR/case/tests" "$RDIR/case/environment"
+cat > "$RDIR/case/task.toml" <<'T'
+schema_version = "1.2"
+[task]
+name = "repair"
+description = "d"
+[agent]
+timeout_sec = 30.0
+[verifier]
+timeout_sec = 30.0
+[environment]
+build_timeout_sec = 60.0
+cpus = 1
+memory_mb = 512
+T
+printf '#!/usr/bin/env bash\nprintf OK > /app/a.txt\n' > "$RDIR/case/solution/solve.sh"
+printf '#!/usr/bin/env bash\nmkdir -p /logs/verifier\necho 1.0 > /logs/verifier/reward.txt\n' > "$RDIR/case/tests/test.sh"
+printf 'FROM scratch\n' > "$RDIR/case/environment/Dockerfile"
+printf 'x\n' > "$RDIR/case/marker.txt"
+chmod +x "$RDIR/case/solution/solve.sh" "$RDIR/case/tests/test.sh"
+cat > "$RDIR/exp.yaml" <<C
+---
+kind: Commands
+timeout: 2m
+# Passes only after three repairs: a check that converges rather than one that
+# happens to succeed, which is the case fix_attempts exists for.
+converges: {script: '[ "\$(wc -l < "\$CASE_DIR/marker.txt")" -ge 4 ]'}
+patch:     {script: 'echo more >> "\$CASE_DIR/marker.txt"'}
+---
+kind: Experiment
+name: repair
+case_defaults: {source: local}
+cases: [{path: $RDIR/case}]
+matrix: {agents: [oracle], trials: 1}
+pipeline:
+  per_case:
+    - uses: converges
+      fix: patch
+      fix_writeback: true
+      fix_attempts: 3
+  per_trial: [{uses: local}]
+C
+ROUT=$("$BIN" run "$RDIR/exp.yaml" --runs "$RDIR/runs" --id a --executor local 2>&1)
+echo "$ROUT" | grep -E "attempting fix|repaired" | sed 's/^/    /'
+check "the case got every repair round it asked for" '[ "$(echo "$ROUT" | grep -c "attempting fix")" -eq 3 ]'
+check "and the third one carried it"                 'echo "$ROUT" | grep -q "repaired in place"'
+check "the case was admitted after repair"           'echo "$ROUT" | grep -q "reward 1.000"'
+# The recorded version has to be the repaired bytes. Recording the hash as
+# found would publish provenance pointing at content no trial ever saw.
+RECORDED=$(sed -n 1p "$RDIR/runs/a/results.jsonl" | sed 's/.*"case_sha256":"\([^"]*\)".*/\1/')
+ACTUAL=$("$BIN" cases "$RDIR/exp.yaml" | awk '{print $2}')
+check "the recorded version is what actually ran" '[ "${RECORDED:0:16}" = "$ACTUAL" ]'
+# And a check is not retried: a "no" is a verdict, not a transient failure.
+check "a failing check is not retried three times" '! echo "$ROUT" | grep -q "failed after . attempts"'
+
+# A second run under a different id must find the verdict rather than repair
+# again -- the gate is keyed by content and checks, neither of which is a run.
+ROUT2=$("$BIN" run "$RDIR/exp.yaml" --runs "$RDIR/runs" --id b --executor local 2>&1)
+check "a later run reuses the gate verdict"  'echo "$ROUT2" | grep -q "per_case gate cached"'
+check "and does not repair the case again"   '[ "$(wc -l < "$RDIR/case/marker.txt")" -eq 4 ]'
+
+step "17. a submission references the shared commands instead of restating them"
+check "the library is included, not copied" \
+  '[ "$(grep -lc "include: \[commands.yaml\]" experiments/*.yaml | wc -l)" -ge 5 ]'
+check "no experiment inlines the harbor adapter" \
+  '! grep -lq "rollout-man.s trial contract on top of" experiments/*.yaml'
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]

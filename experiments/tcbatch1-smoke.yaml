@@ -8,12 +8,10 @@
 #   ship  (once, after the batch) one zip per case to onedrive:testcase/,
 #         jobs files inside, ips and keys scrubbed
 #
-# Self-contained in the go-task style: every command the pipeline needs --
-# including the harbor adapter and the ship script -- is inline below. The one
-# file this yaml still points at is adapters/mock_agent.py, the replay agent
-# harbor imports (a Python module, not shell); point ROLLOUT_MAN_ADAPTERS at
-# its directory if running from elsewhere. Everything else travels with this
-# file.
+# Commands come from experiments/commands.yaml via include:. They used to be
+# inlined here -- a verbatim copy of adapters/harbor.sh, comments and all --
+# which meant every fix to the adapter had to be made twice and the copies
+# drifted. A submission should say what it runs, not restate how.
 #
 # Run it:
 #   go build -o rollout-man ./cmd/rollout-man
@@ -26,243 +24,7 @@
 ---
 kind: Commands
 timeout: 150m          # one harbor trial: build + agent + verifier, cold
-max_attempts: 2
-
-# The Harbor adapter: rollout-man's trial contract on top of `harbor run`.
-# Harbor owns how a trial runs -- it builds the environment, starts it, runs
-# the agent inside it, runs the verifier, and enforces every timeout and
-# resource limit declared in the case's own task.toml. Nothing here re-decides
-# any of that; this script translates one call and one answer.
-#
-#   in   CASE_DIR OUT_DIR WORK_DIR TRIAL_ID AGENT_KIND AGENT_NAME
-#        LLM_BASE_URL LLM_MODEL LLM_API_KEY
-#   out  $OUT_DIR/reward.txt   the score
-#        $OUT_DIR/failure.txt  first line a failure code, rest an explanation
-#        $OUT_DIR/*            artifacts kept from the trial
-#
-# Needs `harbor` (pip install harbor) and python3 on PATH.
-harbor:
-  script: |
-    set -uo pipefail
-
-    fail() { printf '%s\n%s\n' "$1" "$2" > "$OUT_DIR/failure.txt"; exit 1; }
-
-    JOBS="$WORK_DIR/harbor"
-    rm -rf "$JOBS"; mkdir -p "$JOBS"
-
-    agent=()
-    case "$AGENT_KIND" in
-      oracle) agent=(-a oracle) ;;
-      nop)    agent=(-a nop) ;;
-      llm)
-        # AGENT_NAME is a Harbor agent id (claude-code, codex, openhands, ...)
-        # or "mock" -- our replay agent (adapters/mock_agent.py), instant, real
-        # trail.
-        if [ "$AGENT_NAME" = mock ]; then
-          agent=(-a mock_agent:MockAgent --ak task_dir="$CASE_DIR")
-          # The mock needs no key; a missing one must not stop the trial.
-          LLM_API_KEY=mock
-        else
-          agent=(-a "$AGENT_NAME")
-        fi
-        [ -n "${LLM_MODEL:-}" ] && agent+=(-m "$LLM_MODEL")
-        # Which env var the key belongs in is the provider's business, not ours.
-        case "${LLM_PROVIDER:-openai}" in
-          anthropic) key_var=ANTHROPIC_API_KEY; url_var=ANTHROPIC_BASE_URL ;;
-          google|gemini) key_var=GEMINI_API_KEY; url_var=GOOGLE_GEMINI_BASE_URL ;;
-          *) key_var=OPENAI_API_KEY; url_var=OPENAI_BASE_URL ;;
-        esac
-        [ -n "${LLM_BASE_URL:-}" ] && agent+=(--ae "$url_var=$LLM_BASE_URL")
-        if [ -n "${LLM_API_KEY:-}" ]; then
-          agent+=(--ae "$key_var=$LLM_API_KEY")
-        else
-          # Fail here rather than let Harbor start a container that cannot talk
-          # to anything: an agent with no key is a setup mistake, not a
-          # measurement.
-          fail ENV_FAILED "no API key for $AGENT_NAME (llm_spec resolved to an empty key)"
-        fi ;;
-      *) fail HOST_ERROR "unknown agent kind $AGENT_KIND" ;;
-    esac
-
-    # mock_agent:MockAgent lives outside this yaml (a Python module harbor
-    # imports); ROLLOUT_MAN_ADAPTERS names its directory, default adapters/
-    # next to the cwd.
-    ADPERS="${ROLLOUT_MAN_ADAPTERS:-$PWD/adapters}"
-    case ":${PYTHONPATH:-}:" in
-      *":$ADPERS:"*) ;;
-      *) PYTHONPATH="$ADPERS${PYTHONPATH:+:$PYTHONPATH}" ;;
-    esac
-    export PYTHONPATH
-
-    # -k 1 / -n 1: one attempt, one trial. Repetition and retries are the run's
-    # decision, made from the failure code, and doing them here would run the
-    # agent more times than the results file admits to.
-    harbor run \
-      --path "$CASE_DIR" \
-      "${agent[@]}" \
-      --jobs-dir "$JOBS" \
-      --job-name "$TRIAL_ID" \
-      -k 1 -n 1 --max-retries 0 \
-      --yes --quiet > "$OUT_DIR/harbor.log" 2>&1
-    rc=$?
-
-    trial=$(find "$JOBS/$TRIAL_ID" -mindepth 1 -maxdepth 1 -type d -name '*__*' | head -1)
-    if [ -z "$trial" ]; then
-      fail ENV_FAILED "harbor run exited $rc and produced no trial directory"
-    fi
-
-    # Artifacts first: a trial you cannot read is a trial you cannot fix, and
-    # the failed ones are the ones worth reading. jobs/ comes along too -- the
-    # case's own record of the run -- which means it lands inside the WalkDir
-    # redaction and inside whatever ships later. Nothing copies it back out.
-    cp "$trial/verifier/verifier.log"     "$OUT_DIR/verifier.log"  2>/dev/null
-    cp "$trial/verifier/test-stdout.txt"  "$OUT_DIR/stdout.log"    2>/dev/null
-    cp "$trial/trial.log"                 "$OUT_DIR/trial.log"     2>/dev/null
-    cp -r "$trial/agent"                  "$OUT_DIR/agent"         2>/dev/null
-    cp -r "$trial"                        "$OUT_DIR/jobs"          2>/dev/null
-    [ -f "$OUT_DIR/traj.jsonl" ] || : > "$OUT_DIR/traj.jsonl"
-
-    python3 - "$trial/result.json" "$OUT_DIR" <<'PY'
-    import json, pathlib, sys
-
-    # Harbor's exception types, mapped onto the four things the taxonomy needs
-    # to tell apart. Only the first group belongs in an agent's denominator;
-    # the rest mean "we could not measure", which is ours and not the agent's.
-    AGENT_TIMEOUT = {"AgentTimeoutError"}
-    AGENT_FAILED = {
-        "NonZeroAgentExitCodeError", "AgentSafetyRefusalError",
-        "ContextLengthExceededError", "ContextWindowExceededError",
-        "OutputLengthExceededError", "OutputTokenExceededError",
-    }
-    VERIFIER = {
-        "VerifierTimeoutError", "VerifierOutputParseError", "RewardFileNotFoundError",
-        "RewardFileEmptyError", "RegradeError", "DownloadVerifierDirError",
-        "AddTestsDirError",
-    }
-    # Transient and worth another go; everything unrecognised falls through to
-    # ENV_FAILED instead, which is the conservative reading.
-    HOST = {
-        "ApiRateLimitError", "ApiOverloadedError", "ApiConnectionError",
-        "ApiConnectionClosedError", "ApiInternalServerError", "ApiResponseStalledError",
-        "NetworkConnectionError", "UnknownApiError", "RuntimeRequestError",
-    }
-
-    res, out = json.loads(pathlib.Path(sys.argv[1]).read_text()), pathlib.Path(sys.argv[2])
-    exc = res.get("exception_info") or {}
-    kind = exc.get("exception_type", "")
-    rewards = (res.get("verifier_result") or {}).get("rewards") or {}
-
-    if kind:
-        code = ("AGENT_TIMEOUT" if kind in AGENT_TIMEOUT else
-                "AGENT_FAILED" if kind in AGENT_FAILED else
-                "VERIFIER_ERROR" if kind in VERIFIER else
-                "HOST_ERROR" if kind in HOST else "ENV_FAILED")
-        msg = (exc.get("exception_message") or "").strip().splitlines()
-        (out / "failure.txt").write_text(f"{code}\n{kind}: {msg[0] if msg else ''}\n")
-        sys.exit(1)
-
-    if "reward" not in rewards:
-        (out / "failure.txt").write_text(
-            "VERIFIER_ERROR\nharbor reported no exception and no reward\n")
-        sys.exit(1)
-
-    (out / "reward.txt").write_text(f"{rewards['reward']}\n")
-    PY
-    exit $?
-
-# Batch upload to OneDrive: one zip per case, under 我的文件/testcase/.
-# The unit is the case, not the trial: each case's zip carries its trials'
-# agent output, the harbor jobs dir (the case-format record of the run), and
-# the one-line verdicts from results.jsonl. Admission probes stay behind --
-# they are the gate's evidence, not the batch's product.
-#
-# The redaction tiers in the run already scrubbed keys (everywhere) and IPs
-# (distributables only). IPs are wanted gone from everything that ships, so
-# this is the second, blunt pass: a mask grep over the staging tree before
-# zip, refusing to upload rather than uploading something with an address in
-# it. Credentials are not ours: rclone uses whatever rclone.conf the machine
-# already has.
-#
-# Configuration:
-#   KEY          (in)  destination path, from pipeline.per_experiment.ship.dest
-#   SHIP_REMOTE  (env) rclone remote name, default "onedrive" -- the machine's
-#                      own rclone.conf decides which account that is
-#   SHIP_BASE    (env) fallback destination when KEY is unset, default "testcase"
-#
-# What is NOT configurable: the leak guard. "脱敏 ip、token、key" is the
-# requirement the upload exists under, so it is enforced, not offered.
-ship:
-  script: |
-    set -euo pipefail
-
-    REMOTE=${SHIP_REMOTE:-onedrive}
-    DEST_BASE=${KEY:-${SHIP_BASE:-testcase}}
-    STAGE=$(mktemp -d)
-    trap 'rm -rf "$STAGE"' EXIT
-
-    # One zip per case. results.jsonl names each trial's case; the trial
-    # directories themselves group the artifacts.
-    declare -A case_of trials_of
-    while IFS= read -r line; do
-      id=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["trial_id"])')
-      cs=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["case"])')
-      case "$id" in admit-*) continue ;; esac
-      case_of["$id"]="$cs"
-      trials_of["$cs"]+="$id "
-    done < "$LOCAL_PATH/results.jsonl"
-
-    [ ${#case_of[@]} -gt 0 ] || { echo "ship-onedrive: no trials recorded"; exit 1; }
-
-    mkdir -p "$STAGE/zips"
-    for cs in "${!trials_of[@]}"; do
-      name=$(basename "$cs")          # duckdb-3f0eb51-issue-526-t4
-      dir="$STAGE/$name"
-      mkdir -p "$dir"
-      for id in ${trials_of["$cs"]}; do
-        out="$LOCAL_PATH/trials/$id/out"
-        [ -d "$out" ] || continue
-        # The jobs dir rides along inside the trial, named after it.
-        mkdir -p "$dir/jobs/$id"
-        cp -r "$out/." "$dir/jobs/$id/" 2>/dev/null || true
-      done
-      # The batch's verdict on this case's trials.
-      python3 - "$LOCAL_PATH/results.jsonl" "$cs" > "$dir/results.jsonl" <<'PY'
-    import json, sys
-    cs = sys.argv[2]
-    for line in open(sys.argv[1]):
-        line = line.strip()
-        if not line:
-            continue
-        r = json.loads(line)
-        if r.get("trial_id", "").startswith("admit-"):
-            continue
-        if r.get("case") == cs:
-            print(line)
-    PY
-
-      # Second pass, blunt on purpose: everything here leaves the machine, so
-      # keys AND ips get masked. A hit we cannot explain stops the upload.
-      hits=$(grep -rlE \
-        -e 'sk-[A-Za-z0-9_-]{16,}' \
-        -e '(authorization|api[_-]?key|token)\s*[:=]' \
-        -e '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' \
-        "$dir" 2>/dev/null || true)
-      if [ -n "$hits" ]; then
-        echo "ship-onedrive: refusing to upload $name, potential secrets/IPs in:" >&2
-        echo "$hits" >&2
-        exit 1
-      fi
-
-      (cd "$STAGE" && zip -qr "zips/$name.zip" "$name")
-    done
-
-    for z in "$STAGE"/zips/*.zip; do
-      [ -e "$z" ] || break
-      name=$(basename "$z")
-      target="${REMOTE}:${DEST_BASE%/}/$name"
-      rclone copyto -- "$z" "$target"
-      echo "ship-onedrive: uploaded $name -> $target"
-    done
+include: [commands.yaml]
 
 ---
 kind: LLMSpec
@@ -302,31 +64,23 @@ max_attempts: 1
 
 pipeline:
   per_case:
-    pre:
-      # 1. say where we are -- each case gets its own line in the run log
-      - script: |
-          echo "=== reached case $CASE ($CASE_SHA)"
-      # admission is the second pre step by declaration order: the echo must
-      # have happened before the gate can reject anything, so the log always
-      # shows which case was rejected and which case never got that far
-    post:
-      # which run of which case ended -- $TRIAL is the last trial recorded
-      # for the case, $CASE names it
-      - script: |
-          echo "=== case $CASE done, last recorded run: $TRIAL"
-
-    admission:
-      require: admitted
-      oracle_min_reward: 1.0
-      nop_max_reward: 0.0
-      trials: 1
+    # Say where we are before the gate can reject anything, so the log always
+    # shows which case was rejected and which never got that far.
+    - uses: announce_case
+    - uses: admission
+      with: {require: admitted, oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
 
   per_trial:
-    redact:
-      keys: required
-      ips: {traj: true, logs: false}   # the ship pass masks ips everywhere
+    - uses: harbor
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: false}}
+    - uses: archive
+      with: {format: zip}          # one zip per case, as the header describes
 
   per_experiment:
-    ship:
-      using: ship
-      dest: "testcase/{{.Experiment}}/{{.RunID}}"   # -> onedrive: 我的文件/testcase/
+    - uses: dataset
+    - uses: ship
+      with:
+        using: ship_onedrive
+        dest: "testcase/{{.Experiment}}/{{.RunID}}"
+      retries: 2                   # an upload really can fail transiently

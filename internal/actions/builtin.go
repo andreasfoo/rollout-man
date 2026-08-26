@@ -517,7 +517,7 @@ func (shipAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 		local = c.Trial.OutDir
 	}
 	dest := expand(a.Str("dest", ""), c)
-	if _, err := c.Cmds.Run(ctx, using, map[string]string{
+	if _, err := runStep(ctx, c, a, using, map[string]string{
 		"LocalPath": local, "Key": dest,
 		"Experiment": c.Experiment, "RunId": c.RunID, "RunDir": c.RunDir,
 	}); err != nil {
@@ -614,7 +614,7 @@ func (cm command) Run(ctx context.Context, c *Ctx, a config.Action) error {
 			vars[camel(k)] = expandStepOutputs(s, c)
 		}
 	}
-	res, err := c.Cmds.Run(ctx, cm.cmd, vars)
+	res, err := runStep(ctx, c, a, cm.cmd, vars)
 	if len(res.Outputs) > 0 {
 		if c.StepOutputs == nil {
 			c.StepOutputs = map[string]map[string]string{}
