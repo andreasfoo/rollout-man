@@ -48,7 +48,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `rollout-man
 
   run    <file.yaml> [--runs DIR] [--id NAME] [--executor harbor|local|auto]
-         [--commands FILE]
+         [--commands FILE] [--regate]
          orchestrate, execute, record. Re-running the same id resumes: trials
          already in results.jsonl are not repeated.
 
@@ -167,6 +167,7 @@ func cmdRun(args []string) int {
 	id := fs.String("id", "", "run id (default: experiment name + timestamp)")
 	executor := fs.String("executor", "auto", "name of the configured trial command (e.g. harbor) | local | auto")
 	commandsFile := fs.String("commands", "", "take commands from this file instead of the submission")
+	regate := fs.Bool("regate", false, "re-run per_case even for cases with a cached verdict")
 	if len(args) == 0 {
 		usage()
 	}
@@ -201,7 +202,7 @@ func cmdRun(args []string) int {
 	}
 	defer os.RemoveAll(tmp)
 	r := &run.Runner{
-		File: f, Cmds: cmds, Exec: ex, Dir: dir, Log: logf,
+		File: f, Cmds: cmds, Exec: ex, Dir: dir, Log: logf, Regate: *regate,
 		Res: &casesrc.Resolver{Cmds: cmds, TempDir: tmp},
 	}
 	fmt.Printf("\n%s  (%s executor)\n  %s\n\n", f.Experiment.Name, ex.Name(), dir)

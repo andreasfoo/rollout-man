@@ -80,6 +80,11 @@ type Runner struct {
 	Res  *casesrc.Resolver
 	Dir  string // runs/<run-id>
 	Log  func(string, ...any)
+	// Regate ignores a cached per_case verdict and runs the gate again. The
+	// cache is keyed by what is written down -- the case's bytes and the
+	// checks' configuration -- and cannot see everything that decides an
+	// outcome, so there has to be a way to say "ask again".
+	Regate bool
 
 	mu       sync.Mutex
 	results  []Result
@@ -87,13 +92,14 @@ type Runner struct {
 	dropped  map[string]bool
 	progress *progress.Tracker
 
-	// gateCache remembers, per run directory, which cases have already been
-	// through per_case (quality audit, admission, ...) and what it decided.
+	// gateCache remembers which cases have already been through per_case
+	// (quality audit, admission, ...) and what it decided.
 	// Unlike results.jsonl this covers the per_case gate itself: admission
 	// probes and adapters like acc-quality-audit are not trials, so without
 	// this a rerun under the same --id would redo the slowest part of the
 	// pipeline for every case even though only ship failed downstream.
 	gateCache map[string]gateCacheEntry
+	casesSeen int
 }
 
 func (r *Runner) logf(f string, a ...any) {
@@ -231,7 +237,29 @@ type gateCacheEntry struct {
 	Admitted bool `json:"admitted"`
 }
 
-func (r *Runner) gateCachePath() string { return filepath.Join(r.Dir, "gate-cache.json") }
+// caseCounter numbers cases as they are gated. The gate can be the slowest
+// part of a batch -- an audit and a repair per case -- so "how many are there
+// and how far in are we" has to be answerable during it, not only after.
+func (r *Runner) caseCounter() string {
+	total := len(r.File.Experiment.Cases)
+	if total <= 1 {
+		return ""
+	}
+	r.mu.Lock()
+	r.casesSeen++
+	n := r.casesSeen
+	r.mu.Unlock()
+	return fmt.Sprintf("%d/%d ", n, total)
+}
+
+// gateCachePath sits beside the runs, not inside one. A gate verdict is bound
+// to the case's content hash and the checks' fingerprint -- neither of which
+// has anything to do with which run asked. Keeping it per run directory meant
+// it only ever helped a resume of the same --id, while every fresh batch redid
+// the audits it was written to avoid.
+func (r *Runner) gateCachePath() string {
+	return filepath.Join(filepath.Dir(r.Dir), "gate-cache.json")
+}
 
 func (r *Runner) loadGateCache() {
 	r.gateCache = map[string]gateCacheEntry{}
@@ -249,7 +277,12 @@ func (r *Runner) saveGateCache() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(r.gateCachePath(), b, 0o644)
+	// By rename, like progress.json: a crash mid-write would otherwise leave a
+	// truncated cache that silently re-gates every case on the next run.
+	tmp := r.gateCachePath() + ".tmp"
+	if os.WriteFile(tmp, b, 0o644) == nil {
+		_ = os.Rename(tmp, r.gateCachePath())
+	}
 }
 
 // perCaseFingerprint hashes everything that changing would make a cached
@@ -257,12 +290,23 @@ func (r *Runner) saveGateCache() {
 // resolves to a configured command, that command's script/uses-file pin.
 // A case's own content is not part of this -- it is folded in separately, per
 // case, via its SHA256.
-func perCaseFingerprint(ex *config.Experiment, cmds map[string]config.Command) string {
+func perCaseFingerprint(ex *config.Experiment, cmds map[string]config.Command, executor string) string {
 	h := sha256.New()
 	enc := json.NewEncoder(h)
 	_ = enc.Encode(ex.Pipeline.PerCase)
+	// The execution chain is part of the verdict. Admission probes run through
+	// the executor, and passing the gate is supposed to prove the whole chain
+	// works here -- so a verdict reached through one executor says nothing
+	// about another. Both the resolved name (--executor can override the
+	// file) and the step itself go in.
+	_ = enc.Encode(executor)
 	seen := map[string]bool{}
-	for _, a := range ex.Pipeline.PerCase {
+	steps := append([]config.Action{}, ex.Pipeline.PerCase...)
+	if x, err := ex.Pipeline.Executor(); err == nil {
+		_ = enc.Encode(x)
+		steps = append(steps, x)
+	}
+	for _, a := range steps {
 		for _, uses := range []string{a.Uses, a.Fix} {
 			if uses == "" || seen[uses] {
 				continue
@@ -343,7 +387,7 @@ func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 // per_case step failing without on_failure: skip.
 func (r *Runner) GateOne(ctx context.Context, raw config.CaseRef) (c *casesrc.Case, admitted bool, err error) {
 	ex := &r.File.Experiment
-	fp := perCaseFingerprint(ex, r.File.Commands.Cmds)
+	fp := perCaseFingerprint(ex, r.File.Commands.Cmds, r.executorName())
 
 	// Run() calls loadGateCache before perCase's goroutines start, so this is
 	// only ever nil for a caller (watch) that never went through Run -- and
@@ -358,13 +402,13 @@ func (r *Runner) GateOne(ctx context.Context, raw config.CaseRef) (c *casesrc.Ca
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve %s: %w", ref.Label(), err)
 	}
-	r.logf("case %s -> %s (pinned %s)", c.Label, c.SHA256[:12], c.PinnedAt)
+	r.logf("case %s%s -> %s (pinned %s)", r.caseCounter(), c.Label, c.SHA256[:12], c.PinnedAt)
 
 	key := c.SHA256
 	r.mu.Lock()
 	cached, ok := r.gateCache[key]
 	r.mu.Unlock()
-	if ok && cached.Fingerprint == fp {
+	if ok && cached.Fingerprint == fp && !r.Regate {
 		r.logf("case %s: per_case gate cached (%s)", c.Label,
 			map[bool]string{true: "admitted", false: "rejected"}[cached.Admitted])
 		return c, cached.Admitted, nil
@@ -376,15 +420,34 @@ func (r *Runner) GateOne(ctx context.Context, raw config.CaseRef) (c *casesrc.Ca
 		return r.probe(ctx, c, rexec.AgentKind(kind), n)
 	}
 	isAdmitted := true
-	if err := actions.RunList(ctx, actx, ex.Pipeline.PerCase, r.Cmds); err != nil {
-		if !errors.Is(err, actions.ErrSkipCase) {
-			return c, false, err
+	gateErr := actions.RunList(ctx, actx, ex.Pipeline.PerCase, r.Cmds)
+
+	// A fix step edits the case in place, so the bytes that will be measured
+	// are not necessarily the bytes that were hashed above. Re-hash before
+	// anything records a version: "the content hash is the version" only means
+	// something if it is the hash of what actually ran. Recording the
+	// pre-repair hash would publish provenance pointing at bytes no trial ever
+	// saw -- and it would also mean this case's gate result could never be
+	// found again, because the next run hashes the repaired directory.
+	if sha, herr := casesrc.HashDir(c.Dir); herr == nil && sha != c.SHA256 {
+		r.logf("case %s: repaired in place, %s -> %s", c.Label, c.SHA256[:12], sha[:12])
+		c.SHA256 = sha
+	}
+
+	if gateErr != nil {
+		if !errors.Is(gateErr, actions.ErrSkipCase) {
+			return c, false, gateErr
 		}
 		r.logf("case %s: skipped by per_case check (on_failure: skip)", c.Label)
 		isAdmitted = false
 	}
+	entry := gateCacheEntry{Fingerprint: fp, Admitted: isAdmitted}
 	r.mu.Lock()
-	r.gateCache[key] = gateCacheEntry{Fingerprint: fp, Admitted: isAdmitted}
+	// Under both hashes: the repaired bytes so the next run finds this verdict
+	// without redoing the audit, and the original so restoring the directory
+	// does not re-run a repair that has already been judged.
+	r.gateCache[key] = entry
+	r.gateCache[c.SHA256] = entry
 	r.mu.Unlock()
 	r.saveGateCache()
 	return c, isAdmitted, nil

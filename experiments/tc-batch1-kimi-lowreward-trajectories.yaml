@@ -19,40 +19,19 @@
 #   ./rollout-man run experiments/tc-batch1-kimi-lowreward-trajectories.yaml
 ---
 kind: Commands
+# Shared adapters come from the library; only what differs is below.
+include: [commands.yaml]
 timeout: 30m
 max_attempts: 1
 inherit_env: false
 
 # Admission still runs the real oracle and nop via harbor.sh so the gate
 # fires normally, exactly as in tc-batch2-smoke.
-harbor:
-  uses: adapters/harbor.sh
-  sha256: c8c35c4905df03fb64650c8f1573a2487ab9da36e734e93972f113ef1481b7ae
-  env: [DOCKER_HOST, PATH, HOME]
 
 # Mock adapter: skips the LLM, replays jobs/ trials, writes reward=0.0.
-forge_flow_fuzz_mock:
-  uses: adapters/forge-flow-fuzz-mock.sh
-  sha256: 85e12944db18638de4f1c694819b9ba87734a888b40b9d3ec33d7eeabe4d817e
-  env: [PATH, HOME, DOCKER_HOST, ROLLOUT_MAN_HARBOR_ADAPTER]
-
-materialize_week2:
-  uses: adapters/materialize-forge-week2.sh
-  sha256: 7048e4c3cd9e3bfc99fc45d3f8664b506a198efe64cd7e7bf879ec5d36b040db
-  env: [PATH, HOME]
-
-record_progress:
-  uses: adapters/record-forge-progress.sh
-  sha256: bcd9d57c18e824cc2e642470a3ada42ae9e74d0f3cc8d42ac98b349ae8ea8d48
-  env: [PATH, HOME, PROGRESS_FILE]
 
 # Trajectories only -- no ship_week2_cases / accepted-cases step in this
 # experiment (deliberate: this batch does not publish task/week2).
-ship_week2_trajectories:
-  uses: adapters/ship-hf-week2-trajectories.sh
-  sha256: 7d34fa91264fea31ccfda4e7429a0470ecddab05eb2c6511d5ada2bd42d75d6b
-  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
-        ROLLOUT_MAN_SHIP_HF_ADAPTER]
 
 ---
 kind: Experiment

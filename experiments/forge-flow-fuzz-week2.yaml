@@ -15,15 +15,13 @@
 # campaign; rollout-man itself makes resuming a given run idempotent.
 ---
 kind: Commands
+# Shared adapters come from the library; only what differs is below.
+include: [commands.yaml]
 timeout: 8h
 max_attempts: 1
 inherit_env: false
 
 # Ordinary Harbor is used solely by the admission builtin (oracle=1, nop=0).
-harbor:
-  uses: adapters/harbor.sh
-  sha256: c8c35c4905df03fb64650c8f1573a2487ab9da36e734e93972f113ef1481b7ae
-  env: [DOCKER_HOST, PATH, HOME]
 
 # LLM rollout = forge-flow-fuzz's entire stage1 -> stage2 lifecycle.
 forge_flow_fuzz:
@@ -32,27 +30,6 @@ forge_flow_fuzz:
   env: [PATH, HOME, DOCKER_HOST, FORGE_CASES_ROOT, FORGE_TASKS_ROOT,
         FORGE_BRIDGE, FORGE_PYTHON, ROLLOUT_MAN_HARBOR_ADAPTER]
 
-materialize_week2:
-  uses: adapters/materialize-forge-week2.sh
-  sha256: 7048e4c3cd9e3bfc99fc45d3f8664b506a198efe64cd7e7bf879ec5d36b040db
-  env: [PATH, HOME]
-
-record_progress:
-  uses: adapters/record-forge-progress.sh
-  sha256: 0d2d7ea126b3887da85087e5929b47572cc927a3a88b53d49c0a8d3b70fbee33
-  env: [PATH, HOME, PROGRESS_FILE]
-
-ship_week2_cases:
-  uses: adapters/ship-hf-week2-cases.sh
-  sha256: 0b426ae8820135da5e4734f83f4103ebaebbfe15da40b7076ee5a1cd0a984c40
-  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
-        ROLLOUT_MAN_SHIP_HF_ADAPTER]
-
-ship_week2_trajectories:
-  uses: adapters/ship-hf-week2-trajectories.sh
-  sha256: 7d34fa91264fea31ccfda4e7429a0470ecddab05eb2c6511d5ada2bd42d75d6b
-  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
-        ROLLOUT_MAN_SHIP_HF_ADAPTER]
 
 ---
 kind: Experiment

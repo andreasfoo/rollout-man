@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
 	"github.com/andreasfoo/rollout-man/internal/config"
@@ -212,24 +213,30 @@ func RunList(ctx context.Context, c *Ctx, list []config.Action, cmds *cmdrun.Run
 			c.Enter(a.Label())
 		}
 		err = act.Run(ctx, c, a)
-		if err != nil && a.Fix != "" {
-			if !a.FixWriteback {
-				// A fix: without fix_writeback: true is declared but inert --
-				// naming a repair command is not the same as consenting to it
-				// mutating the case directory. This is intentionally silent
-				// at the info level (would spam every failing case) but shows
-				// up in the failure message so it isn't a total mystery.
-				c.Logf("%s: %s failed (fix %s not applied: fix_writeback is false): %v",
-					c.Where(), a.Label(), a.Fix, err)
-			} else {
-				c.Logf("%s: %s failed, attempting fix (%s): %v", c.Where(), a.Label(), a.Fix, err)
-				if ferr := runFix(ctx, c, a.Fix); ferr != nil {
-					c.Logf("%s: fix %s itself failed: %v", c.Where(), a.Fix, ferr)
-				} else {
-					c.Logf("%s: fix %s applied, retrying %s", c.Where(), a.Fix, a.Label())
-					err = act.Run(ctx, c, a)
-				}
+		if err != nil && a.Fix != "" && !a.FixWriteback {
+			// A fix: without fix_writeback: true is declared but inert --
+			// naming a repair command is not the same as consenting to it
+			// mutating the case directory.
+			c.Logf("%s: %s failed (fix %s not applied: fix_writeback is false): %v",
+				c.Where(), a.Label(), a.Fix, err)
+		}
+		// Repair rounds: run the fix, then check again. More than one round is
+		// for repairs that converge rather than succeed outright -- an agent
+		// asked to patch what a check flagged often gets part of the way on
+		// the first pass and the rest on the second.
+		for round := 1; err != nil && a.Fix != "" && a.FixWriteback && round <= a.Repairs(); round++ {
+			of := ""
+			if a.Repairs() > 1 {
+				of = fmt.Sprintf(" %d/%d", round, a.Repairs())
 			}
+			c.Logf("%s: %s failed, attempting fix%s (%s): %v",
+				c.Where(), a.Label(), of, a.Fix, firstLine(err.Error()))
+			if ferr := runFix(ctx, c, a.Fix); ferr != nil {
+				c.Logf("%s: fix %s itself failed: %v", c.Where(), a.Fix, ferr)
+				break
+			}
+			c.Logf("%s: fix %s applied, rechecking %s", c.Where(), a.Fix, a.Label())
+			err = act.Run(ctx, c, a)
 		}
 		if err != nil {
 			if a.Warns() {
@@ -258,8 +265,37 @@ func runFix(ctx context.Context, c *Ctx, name string) error {
 	if c.CaseDir != "" {
 		vars["CaseDir"], vars["CaseLabel"], vars["CaseSha"] = c.CaseDir, c.CaseLabel, c.CaseSHA
 	}
-	_, err := c.Cmds.Run(ctx, name, vars)
+	_, err := c.Cmds.RunOnce(ctx, name, vars, 0)
 	return err
+}
+
+// runStep runs a command for a pipeline step. It runs once unless the step
+// asked for retries: a check that says "no" is a verdict, not an incident, and
+// retrying it three times only multiplies the cost of finding that out -- an
+// audit that calls a model is billed every one of those times. Steps whose
+// failures really are transient, like an upload, opt in with retries:.
+func runStep(ctx context.Context, c *Ctx, a config.Action, name string, vars map[string]string) (cmdrun.Result, error) {
+	var res cmdrun.Result
+	var err error
+	for attempt := 0; attempt <= a.Retries; attempt++ {
+		if attempt > 0 {
+			c.Logf("%s: %s failed, retry %d/%d", c.Where(), a.Label(), attempt, a.Retries)
+		}
+		if res, err = c.Cmds.RunOnce(ctx, name, vars, 0); err == nil {
+			return res, nil
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return res, err
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 func unknown(a config.Action, known ...string) error {

@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -53,9 +54,72 @@ type Commands struct {
 	InheritEnv *bool
 	Cmds       map[string]Command
 
+	// Include names other files whose kind: Commands document is merged into
+	// this one, so a shared library of adapters is referenced rather than
+	// copied. Definitions here win over an included file's, and later
+	// includes win over earlier ones -- an experiment overrides one command
+	// without restating the other twenty.
+	//
+	// This opens no new door: without --commands a submission's commands are
+	// already trusted, and with --commands its Commands document is refused
+	// outright, so the only includes that ever run are the operator's own.
+	Include []string `yaml:"include"`
+
 	// Trusted marks commands that came from the runner's own config rather
 	// than from a submission. Set by LoadCommands, never by YAML.
 	Trusted bool `yaml:"-"`
+}
+
+// merge folds an included document underneath this one: anything defined here
+// stays, anything only they have is added.
+func (c *Commands) merge(base Commands) {
+	if c.Cmds == nil {
+		c.Cmds = map[string]Command{}
+	}
+	for k, v := range base.Cmds {
+		if _, ok := c.Cmds[k]; !ok {
+			c.Cmds[k] = v
+		}
+	}
+	if c.Timeout.D() == 0 {
+		c.Timeout = base.Timeout
+	}
+	if c.MaxAttempts == 0 {
+		c.MaxAttempts = base.MaxAttempts
+	}
+	if c.InheritEnv == nil {
+		c.InheritEnv = base.InheritEnv
+	}
+}
+
+// resolveIncludes loads every included file and merges it in. Paths are
+// relative to the file doing the including, so a submission moved to another
+// directory still finds its library.
+func (c *Commands) resolveIncludes(from string, seen map[string]bool) error {
+	if len(c.Include) == 0 {
+		return nil
+	}
+	dir := filepath.Dir(from)
+	for _, inc := range c.Include {
+		path := inc
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(dir, inc)
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		if seen[abs] {
+			return fmt.Errorf("commands include cycle at %s", inc)
+		}
+		seen[abs] = true
+		base, err := loadCommandsFile(abs, seen)
+		if err != nil {
+			return fmt.Errorf("include %s: %w", inc, err)
+		}
+		c.merge(base)
+	}
+	return nil
 }
 
 func (c Commands) Inherits() bool { return c.InheritEnv == nil || *c.InheritEnv }
@@ -77,6 +141,10 @@ func (c *Commands) UnmarshalYAML(n *yaml.Node) error {
 			}
 		case "max_attempts":
 			if err := val.Decode(&c.MaxAttempts); err != nil {
+				return err
+			}
+		case "include":
+			if err := val.Decode(&c.Include); err != nil {
 				return err
 			}
 		case "inherit_env":
@@ -228,6 +296,26 @@ type Action struct {
 	// to it touching the case, so a step can declare a fix and still leave it
 	// inert until this flag turns it on.
 	FixWriteback bool `yaml:"fix_writeback"`
+	// FixAttempts is how many repair rounds this step gets: run the check,
+	// and on failure run the fix and check again, up to this many times.
+	// Default 1. More than one is for repairs that converge rather than
+	// succeed outright -- an agent asked to patch what a check flagged often
+	// gets part of the way on the first pass and the rest on the second.
+	FixAttempts int `yaml:"fix_attempts"`
+	// Retries is how many extra times to run this step after a plain failure,
+	// with no repair in between. Default 0, because a check that says "no" is
+	// a verdict, not an incident -- the same distinction the failure taxonomy
+	// draws for agents. Set it on steps whose failures really are transient,
+	// like an upload.
+	Retries int `yaml:"retries"`
+}
+
+// Repairs is how many check-fix-recheck rounds this step gets.
+func (a Action) Repairs() int {
+	if a.FixAttempts > 0 {
+		return a.FixAttempts
+	}
+	return 1
 }
 
 // UnmarshalYAML rejects keys this struct does not have. Plain struct decoding
@@ -241,10 +329,12 @@ func (a *Action) UnmarshalYAML(n *yaml.Node) error {
 	type plain Action
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		switch k := n.Content[i].Value; k {
-		case "uses", "name", "with", "on_failure", "on_violation", "fix", "fix_writeback":
+		case "uses", "name", "with", "on_failure", "on_violation",
+			"fix", "fix_writeback", "fix_attempts", "retries":
 		default:
-			return fmt.Errorf("unknown key %q in a pipeline step; "+
-				"a step takes uses, name, with, on_failure, on_violation, fix, fix_writeback", k)
+			return fmt.Errorf("unknown key %q in a pipeline step; a step takes "+
+				"uses, name, with, on_failure, on_violation, fix, fix_writeback, "+
+				"fix_attempts, retries", k)
 		}
 	}
 	return n.Decode((*plain)(a))
@@ -414,6 +504,15 @@ func (d Duration) D() time.Duration { return time.Duration(d) }
 // you a submission can run code on your machine, because a submission may
 // define its own commands.
 func LoadCommands(path string) (Commands, error) {
+	c, err := loadCommandsFile(path, map[string]bool{})
+	if err != nil {
+		return Commands{}, err
+	}
+	c.Trusted = true
+	return c, nil
+}
+
+func loadCommandsFile(path string, seen map[string]bool) (Commands, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return Commands{}, err
@@ -446,7 +545,9 @@ func LoadCommands(path string) (Commands, error) {
 	if !found {
 		return Commands{}, fmt.Errorf("%s: no kind: Commands", path)
 	}
-	out.Trusted = true
+	if err := out.resolveIncludes(path, seen); err != nil {
+		return Commands{}, err
+	}
 	return out, nil
 }
 
@@ -472,6 +573,9 @@ func Load(path string) (*File, error) {
 		switch probe.Kind {
 		case "Commands":
 			if err := node.Decode(&f.Commands); err != nil {
+				return nil, err
+			}
+			if err := f.Commands.resolveIncludes(path, map[string]bool{}); err != nil {
 				return nil, err
 			}
 			f.DeclaresCommands = true
