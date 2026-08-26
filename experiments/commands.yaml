@@ -112,3 +112,12 @@ ship_week2_trajectories:
   uses: adapters/ship-hf-week2-trajectories.sh
   env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
         ROLLOUT_MAN_SHIP_HF_ADAPTER]
+
+# ── shared by the tc_batch / forge-flow experiments ─────────────────────────
+# Here rather than restated in each submission. An experiment overrides one
+# by redefining it; the rest still come from here.
+
+forge_flow_fuzz:
+  uses: adapters/forge-flow-fuzz.sh
+  env: [PATH, HOME, DOCKER_HOST, FORGE_CASES_ROOT, FORGE_TASKS_ROOT,
+        FORGE_BRIDGE, FORGE_PYTHON, ROLLOUT_MAN_HARBOR_ADAPTER]

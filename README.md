@@ -47,6 +47,43 @@ trials that are missing.
 
 ---
 
+## The smallest thing that runs
+
+Pointing this at a directory of cases is five lines:
+
+```yaml
+---
+kind: Experiment
+name: nightly
+cases: [{path: "cases/*"}]
+matrix: {agents: [oracle], trials: 1}
+```
+
+```bash
+rollout-man run nightly.yaml --executor local
+```
+
+A local `path` may be a glob — a directory of cases is how people have them,
+and one line per case is a list to maintain rather than a thing to say. Only
+directories that actually contain a `task.toml` match, so a stray README does
+not become a case. Paths are tried against the working directory and then
+beside the submission file.
+
+Everything else has a default: `source` is local, `trials` is 1, `concurrency`
+is 1, and `pipeline.per_trial` fills in the one executor when there is only one
+it could mean. To run through Harbor rather than the local fixture, name the
+adapter — that is the seventh and eighth line:
+
+```yaml
+---
+kind: Commands
+harbor: {uses: adapters/harbor.sh}
+```
+
+From there you add what you actually want: an admission gate, redaction, guards,
+an archive, somewhere to publish. Each is a line or two, and each is a decision
+worth making on purpose — which is why none of them is on by default.
+
 ## The submission file
 
 `experiments/complete.yaml` is a worked example of everything below in one
@@ -522,7 +559,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 135 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 142 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 

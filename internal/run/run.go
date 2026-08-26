@@ -330,6 +330,11 @@ func perCaseFingerprint(ex *config.Experiment, cmds map[string]config.Command, e
 // answer will be thrown away.
 func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 	ex := &r.File.Experiment
+	cases, err := casesrc.Expand(ex.Cases, ex.CaseDefaults, r.File.Near)
+	if err != nil {
+		return nil, err
+	}
+	ex.Cases = cases
 	n := len(ex.Cases)
 	admitted := make([]*casesrc.Case, n)
 	errs := make([]error, n)

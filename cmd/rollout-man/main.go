@@ -345,7 +345,12 @@ func cmdCases(args []string) int {
 	}
 	res := &casesrc.Resolver{Cmds: cmds, TempDir: os.TempDir()}
 	rc := 0
-	for _, raw := range f.Experiment.Cases {
+	expanded, err := casesrc.Expand(f.Experiment.Cases, f.Experiment.CaseDefaults, f.Near)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	for _, raw := range expanded {
 		ref := raw.Merge(f.Experiment.CaseDefaults)
 		c, err := res.Resolve(context.Background(), ref)
 		if err != nil {
