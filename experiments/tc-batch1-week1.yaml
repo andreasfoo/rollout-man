@@ -42,8 +42,6 @@ model: kimi-k3
 api_key_env: ANTHROPIC_AUTH_TOKEN
 ---
 kind: Commands
-# Shared adapters come from the library; only what differs is below.
-include: [commands.yaml]
 timeout: 30m
 max_attempts: 1
 inherit_env: false
@@ -52,6 +50,25 @@ inherit_env: false
 # case must have a top-level environment/ directory. Same rationale/wording
 # as tc-batch2-smoke.yaml's check_toml_image -- see there for the Harbor
 # dataset-mode fallthrough this specifically guards against.
+check_toml_image:
+  env: [PATH, HOME]
+  script: |
+    set -euo pipefail
+    toml="$CASE_DIR/task.toml"
+    [ -f "$toml" ] || { echo "check_toml_image: FAIL -- task.toml not found" >&2; exit 1; }
+    if ! grep -qE '^\s*docker_image\s*=' "$toml"; then
+      echo "check_toml_image: FAIL $CASE_LABEL -- no docker_image field" >&2; exit 1
+    fi
+    val=$(grep -E '^\s*docker_image\s*=' "$toml" | head -1 | sed 's/.*=\s*//' | tr -d '"'"'"' ')
+    [ -n "$val" ] || { echo "check_toml_image: FAIL $CASE_LABEL -- docker_image is empty" >&2; exit 1; }
+    if [ ! -d "$CASE_DIR/environment" ]; then
+      echo "check_toml_image: FAIL $CASE_LABEL -- no environment/ directory (harbor run --path" \
+        "requires task.toml + environment/ to treat this dir as a single task, otherwise it" \
+        "falls through to dataset-mode and admission fails with 'Either datasets or tasks" \
+        "must be provided')" >&2
+      exit 1
+    fi
+    echo "check_toml_image: ok $CASE_LABEL -- $val"
 
 # Per-case pre-check 2: cyber-gate acc-quality-audit (11-point verifier-trust-boundary).
 # Same adapter as tc-batch2-smoke.yaml, with llm_spec: env mapping added.
@@ -68,9 +85,27 @@ fix_quality_audit:
   llm_spec: quality-audit-llm
 
 # Admission oracle/nop trials use the real Harbor adapter.
+check_traj_layout:
+  uses: adapters/check-traj-layout.sh
+  env: [PATH, HOME]
+
+harbor:
+  uses: adapters/harbor.sh
+  env: [DOCKER_HOST, PATH, HOME]
 
 # Mock adapter: skips the LLM (no case-forge-fuzz lifecycle -- these cases are
 # already acc), replays jobs/ trials, writes reward=0.0.
+forge_flow_fuzz_mock:
+  uses: adapters/forge-flow-fuzz-mock.sh
+  env: [PATH, HOME, DOCKER_HOST, ROLLOUT_MAN_HARBOR_ADAPTER]
+
+materialize_week2:
+  uses: adapters/materialize-forge-week2.sh
+  env: [PATH, HOME]
+
+record_progress:
+  uses: adapters/record-forge-progress.sh
+  env: [PATH, HOME, PROGRESS_FILE]
 
 # Generic HF-dataset-path publisher: KEY = "<repo_id>::<path_in_repo>".
 # Reused across weeks by changing dest:, not by copying the script.

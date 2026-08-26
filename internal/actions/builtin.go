@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/BurntSushi/toml"
+
 	"github.com/andreasfoo/rollout-man/internal/archive"
 	"github.com/andreasfoo/rollout-man/internal/config"
 	"github.com/andreasfoo/rollout-man/internal/fail"
@@ -23,6 +25,9 @@ func init() {
 	register(archiveAction{})
 	register(datasetAction{})
 	register(shipAction{})
+	register(checkCaseAction{})
+	register(reportAction{})
+	register(shipGitHubAction{})
 }
 
 // ------------------------------------------------------------- admission ---
@@ -622,4 +627,457 @@ func (cm command) Run(ctx context.Context, c *Ctx, a config.Action) error {
 		c.StepOutputs[a.Label()] = res.Outputs
 	}
 	return err
+}
+
+// ------------------------------------------------------------ check_case ---
+
+// checkCase validates the case package against the contract Harbor expects,
+// before anything expensive runs against it.
+//
+// It is built in because it is the one check that is about the case *format*
+// rather than about a project's own conventions -- and because the shell
+// version of it parses TOML with grep, which finds a commented-out key, misses
+// one under an unexpected table, and cannot tell an empty value from a missing
+// one. rollout-man already reads task.toml; asking it the question directly is
+// both shorter and right.
+type checkCaseAction struct{}
+
+func (checkCaseAction) Name() string    { return "check_case" }
+func (checkCaseAction) Scopes() []Scope { return []Scope{PerCase} }
+
+func (checkCaseAction) Validate(a config.Action) error {
+	return unknown(a, "require", "require_fields")
+}
+
+// harborShape is what `harbor run --path <dir>` needs to see a single task at
+// all. Without environment/ it silently falls through to dataset mode, scans
+// the directory, finds no tasks, and the failure surfaces much later as
+// "Either datasets or tasks must be provided" -- a message about nothing that
+// is wrong with the case.
+var harborShape = []string{"task.toml", "environment"}
+
+func (checkCaseAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
+	required := a.Strs("require")
+	if len(required) == 0 {
+		required = harborShape
+	}
+	var missing []string
+	for _, rel := range required {
+		if _, err := os.Stat(filepath.Join(c.CaseDir, rel)); err != nil {
+			missing = append(missing, rel)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%s is missing %s", c.CaseLabel, strings.Join(missing, ", "))
+	}
+
+	fields := a.Strs("require_fields")
+	if len(fields) == 0 {
+		return nil
+	}
+	var doc map[string]any
+	b, err := os.ReadFile(filepath.Join(c.CaseDir, "task.toml"))
+	if err != nil {
+		return err
+	}
+	if err := toml.Unmarshal(b, &doc); err != nil {
+		return fmt.Errorf("%s: task.toml does not parse: %w", c.CaseLabel, err)
+	}
+	var empty []string
+	for _, f := range fields {
+		if v, ok := lookupField(doc, f); !ok || isBlank(v) {
+			empty = append(empty, f)
+		}
+	}
+	if len(empty) > 0 {
+		return fmt.Errorf("%s: task.toml has no value for %s", c.CaseLabel, strings.Join(empty, ", "))
+	}
+	return nil
+}
+
+// lookupField finds a dotted path (environment.docker_image), or a bare name
+// at any depth. The bare form exists because a submission should not have to
+// know which table a case's author put the key in.
+func lookupField(doc map[string]any, name string) (any, bool) {
+	if strings.Contains(name, ".") {
+		cur := any(doc)
+		for _, part := range strings.Split(name, ".") {
+			m, ok := cur.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			if cur, ok = m[part]; !ok {
+				return nil, false
+			}
+		}
+		return cur, true
+	}
+	if v, ok := doc[name]; ok {
+		return v, true
+	}
+	for _, v := range doc {
+		if m, ok := v.(map[string]any); ok {
+			if got, ok := lookupField(m, name); ok {
+				return got, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func isBlank(v any) bool {
+	s, ok := v.(string)
+	return ok && strings.TrimSpace(s) == ""
+}
+
+// ---------------------------------------------------------------- report ---
+
+// report writes what happened to a file, so a batch leaves something readable
+// behind without anyone re-running `status` and pasting the output.
+//
+// It is the same aggregation `status` prints. Which number counts as a pass is
+// a question, not a setting -- pass_at is the threshold this particular report
+// was asked about, and it is recorded in the file so the answer cannot be read
+// without the question.
+type reportAction struct{}
+
+func (reportAction) Name() string    { return "report" }
+func (reportAction) Scopes() []Scope { return []Scope{PerExperiment} }
+
+func (reportAction) Validate(a config.Action) error {
+	if err := unknown(a, "dest", "format", "pass_at", "append"); err != nil {
+		return err
+	}
+	switch a.Str("format", "") {
+	case "", "md", "json", "csv":
+	default:
+		return fmt.Errorf("format must be md, json or csv, got %q", a.Str("format", ""))
+	}
+	return nil
+}
+
+func (reportAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
+	dest := a.Str("dest", "report.md")
+	format := a.Str("format", "")
+	if format == "" {
+		format = strings.TrimPrefix(filepath.Ext(dest), ".")
+		if format != "json" && format != "csv" {
+			format = "md"
+		}
+	}
+	path := dest
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(c.RunDir, dest)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	rows := aggregate(c, a.Num("pass_at", -1))
+	var body string
+	switch format {
+	case "json":
+		b, err := json.MarshalIndent(map[string]any{
+			"experiment": c.Experiment, "run_id": c.RunID, "agents": rows,
+		}, "", "  ")
+		if err != nil {
+			return err
+		}
+		body = string(b) + "\n"
+	case "csv":
+		body = "agent,llm_spec,measured,mean,not_measured,passed\n"
+		for _, r := range rows {
+			body += fmt.Sprintf("%s,%s,%d,%.4f,%d,%d\n",
+				r.Agent, r.LLMSpec, r.Measured, r.Mean, r.NotMeasured, r.Passed)
+		}
+	default:
+		body = markdownReport(c, rows, a.Num("pass_at", -1))
+	}
+
+	if a.Bool("append", false) {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.WriteString(body)
+		return err
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		return err
+	}
+	c.Logf("report: %s", path)
+	return nil
+}
+
+type reportRow struct {
+	Agent       string  `json:"agent"`
+	LLMSpec     string  `json:"llm_spec,omitempty"`
+	Measured    int     `json:"measured"`
+	Mean        float64 `json:"mean"`
+	NotMeasured int     `json:"not_measured"`
+	Passed      int     `json:"passed,omitempty"`
+	Denominator int     `json:"denominator,omitempty"`
+}
+
+// aggregate counts the same way status does, denominator included: only the
+// agent's own failures belong in it, because counting our infrastructure
+// trouble marks every agent down for our bad day.
+func aggregate(c *Ctx, passAt float64) []reportRow {
+	idx := map[string]*reportRow{}
+	var order []*reportRow
+	for _, t := range c.Trials() {
+		if strings.HasPrefix(t.ID, "admit-") {
+			continue
+		}
+		k := t.Agent + "|" + t.LLMSpec
+		r, ok := idx[k]
+		if !ok {
+			r = &reportRow{Agent: t.Agent, LLMSpec: t.LLMSpec}
+			idx[k], order = r, append(order, r)
+		}
+		switch {
+		case t.Reward != nil:
+			r.Measured++
+			r.Mean += *t.Reward
+			if passAt >= 0 && *t.Reward >= passAt {
+				r.Passed++
+			}
+		default:
+			r.NotMeasured++
+			if fail.Code(t.Code).CountsAgainstAgent() {
+				r.Denominator++
+			}
+		}
+	}
+	out := make([]reportRow, 0, len(order))
+	for _, r := range order {
+		if r.Measured > 0 {
+			r.Mean /= float64(r.Measured)
+		}
+		r.Denominator += r.Measured
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Agent < out[j].Agent })
+	return out
+}
+
+func markdownReport(c *Ctx, rows []reportRow, passAt float64) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s — %s\n\n", c.Experiment, c.RunID)
+	b.WriteString("| agent | llm spec | measured | mean | not measured |")
+	if passAt >= 0 {
+		fmt.Fprintf(&b, " pass@%.2f |", passAt)
+	}
+	b.WriteString("\n|---|---|---:|---:|---:|")
+	if passAt >= 0 {
+		b.WriteString("---:|")
+	}
+	b.WriteString("\n")
+	for _, r := range rows {
+		fmt.Fprintf(&b, "| %s | %s | %d | %.3f | %d |",
+			r.Agent, dashIf(r.LLMSpec), r.Measured, r.Mean, r.NotMeasured)
+		if passAt >= 0 {
+			fmt.Fprintf(&b, " %d/%d |", r.Passed, r.Denominator)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\nOnly an agent's own failures are in the denominator: " +
+		"infrastructure trouble is ours, and counting it would mark every agent " +
+		"down for our bad day.\n")
+	return b.String()
+}
+
+func dashIf(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// ------------------------------------------------------------ transports ---
+
+// The three destinations everyone needs, built in.
+//
+// They drive the same CLIs an adapter would (`hf`, `rclone`, `git`), so no
+// storage SDK enters this repository and no credential is read, stored or
+// forwarded by it -- each tool finds its own, exactly as before. What changes
+// is only who carries the glue: the tool, rather than every submission
+// copying a script.
+//
+// They are transport and nothing else. *What* to send is already decided by
+// the step before -- `dataset`, `archive`, or an explicit path: -- and keeping
+// that separate is what stops one project's idea of "the right files" from
+// becoming everyone's. Anything these three cannot reach is still `ship` with
+// `using:` naming a command.
+type transport struct {
+	name string
+	// env names the host variables this transport's CLI needs to find its own
+	// credentials. The tool knows them; the operator should not have to.
+	env  []string
+	args func(c *Ctx, a config.Action, local string) ([]string, string, error)
+}
+
+func (t transport) Name() string    { return t.name }
+func (t transport) Scopes() []Scope { return []Scope{PerTrial, PerExperiment} }
+
+func (t transport) Validate(a config.Action) error {
+	if err := unknown(a, "repo", "remote", "path", "dest", "private", "revision",
+		"message", "branch", "env"); err != nil {
+		return err
+	}
+	switch t.name {
+	case "ship_hf":
+		if a.Str("repo", "") == "" {
+			return fmt.Errorf("repo: is required -- the dataset repo id, e.g. my-org/rollouts")
+		}
+	case "ship_rclone":
+		if a.Str("remote", "") == "" {
+			return fmt.Errorf("remote: is required -- an rclone remote, e.g. onedrive:rollout-man")
+		}
+	}
+	return nil
+}
+
+func (t transport) Run(ctx context.Context, c *Ctx, a config.Action) error {
+	if c.Scope == PerTrial && c.Drop {
+		return nil
+	}
+	local := shipSource(c, a)
+	if _, err := os.Stat(local); err != nil {
+		return fmt.Errorf("nothing to ship at %s", local)
+	}
+	argv, where, err := t.args(c, a, local)
+	if err != nil {
+		return err
+	}
+	if _, err := c.Cmds.RunArgv(ctx, t.name, argv, append(t.env, a.Strs("env")...), 0); err != nil {
+		return err
+	}
+	c.Logf("shipped %s -> %s", local, where)
+	return nil
+}
+
+// shipSource is what to send: an explicit path, else the trial's artifacts,
+// else the whole run directory.
+func shipSource(c *Ctx, a config.Action) string {
+	if p := a.Str("path", ""); p != "" {
+		if filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(c.RunDir, p)
+	}
+	if c.Scope == PerTrial && c.Trial != nil {
+		return c.Trial.OutDir
+	}
+	return c.RunDir
+}
+
+func init() {
+	register(transport{
+		name: "ship_hf",
+		env:  []string{"HF_TOKEN", "HF_HOME", "HF_ENDPOINT"},
+		args: func(c *Ctx, a config.Action, local string) ([]string, string, error) {
+			repo := a.Str("repo", "")
+			argv := []string{"hf", "upload", repo, local, a.Str("dest", "."),
+				"--repo-type", "dataset",
+				"--commit-message", a.Str("message", "rollout-man: "+c.Experiment+" "+c.RunID)}
+			if rev := a.Str("revision", ""); rev != "" {
+				argv = append(argv, "--revision", rev)
+			}
+			if a.Bool("private", true) {
+				argv = append(argv, "--private")
+			}
+			return argv, repo, nil
+		},
+	})
+	register(transport{
+		name: "ship_rclone",
+		env:  []string{"RCLONE_CONFIG", "RCLONE_CONFIG_PASS"},
+		args: func(c *Ctx, a config.Action, local string) ([]string, string, error) {
+			dest := a.Str("remote", "") + "/" + strings.TrimPrefix(expand(a.Str("dest", ""), c), "/")
+			return []string{"rclone", "copyto", "--create-empty-src-dirs", "--", local, dest}, dest, nil
+		},
+	})
+}
+
+// shipGitHub commits into a git checkout and pushes. Unlike the other two it
+// is not one CLI call, so it is written out rather than squeezed into an argv
+// builder -- but it is still transport only: what to commit was decided before.
+type shipGitHubAction struct{}
+
+func (shipGitHubAction) Name() string    { return "ship_github" }
+func (shipGitHubAction) Scopes() []Scope { return []Scope{PerExperiment} }
+
+func (shipGitHubAction) Validate(a config.Action) error {
+	if err := unknown(a, "repo", "branch", "path", "dest", "message", "env"); err != nil {
+		return err
+	}
+	if a.Str("dest", "") == "" {
+		return fmt.Errorf("dest: is required -- the path inside the repository to write to")
+	}
+	return nil
+}
+
+func (s shipGitHubAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
+	repo := a.Str("repo", "")
+	if repo == "" {
+		return fmt.Errorf("repo: is required -- a checkout to commit into")
+	}
+	local := shipSource(c, a)
+	dest := expand(a.Str("dest", ""), c)
+	full := filepath.Join(repo, dest)
+	if err := os.MkdirAll(full, 0o755); err != nil {
+		return err
+	}
+	if err := copyTree(local, full); err != nil {
+		return err
+	}
+
+	env := append([]string{"SSH_AUTH_SOCK", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+		"GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_SSH_COMMAND"}, a.Strs("env")...)
+	git := func(args ...string) error {
+		_, err := c.Cmds.RunArgv(ctx, "ship_github", append([]string{"git", "-C", repo}, args...), env, 0)
+		return err
+	}
+	if err := git("add", "--", dest); err != nil {
+		return err
+	}
+	// Nothing staged is success, not failure: a batch that produced no new
+	// files should not fail the run for having nothing to say.
+	if err := git("diff", "--cached", "--quiet", "--", dest); err == nil {
+		c.Logf("ship_github: nothing new under %s", dest)
+		return nil
+	}
+	msg := a.Str("message", fmt.Sprintf("%s: %s", c.Experiment, c.RunID))
+	if err := git("commit", "-q", "-m", msg); err != nil {
+		return err
+	}
+	branch := a.Str("branch", "HEAD")
+	if err := git("push", "origin", branch); err != nil {
+		return err
+	}
+	c.Logf("shipped %s -> %s (%s)", local, dest, branch)
+	return nil
+}
+
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(src, p)
+		if rerr != nil {
+			return rerr
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		return os.WriteFile(target, b, 0o644)
+	})
 }

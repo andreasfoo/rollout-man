@@ -19,19 +19,36 @@
 #   ./rollout-man run experiments/tc-batch1-kimi-lowreward-trajectories.yaml
 ---
 kind: Commands
-# Shared adapters come from the library; only what differs is below.
-include: [commands.yaml]
 timeout: 30m
 max_attempts: 1
 inherit_env: false
 
 # Admission still runs the real oracle and nop via harbor.sh so the gate
 # fires normally, exactly as in tc-batch2-smoke.
+harbor:
+  uses: adapters/harbor.sh
+  env: [DOCKER_HOST, PATH, HOME]
 
 # Mock adapter: skips the LLM, replays jobs/ trials, writes reward=0.0.
+forge_flow_fuzz_mock:
+  uses: adapters/forge-flow-fuzz-mock.sh
+  env: [PATH, HOME, DOCKER_HOST, ROLLOUT_MAN_HARBOR_ADAPTER]
+
+materialize_week2:
+  uses: adapters/materialize-forge-week2.sh
+  env: [PATH, HOME]
+
+record_progress:
+  uses: adapters/record-forge-progress.sh
+  env: [PATH, HOME, PROGRESS_FILE]
 
 # Trajectories only -- no ship_week2_cases / accepted-cases step in this
 # experiment (deliberate: this batch does not publish task/week2).
+ship_week2_trajectories:
+  uses: adapters/ship-hf-week2-trajectories.sh
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
+        ROLLOUT_MAN_SHIP_HF_ADAPTER]
+
 ---
 kind: Experiment
 name: tc-batch1-kimi-lowreward-trajectories

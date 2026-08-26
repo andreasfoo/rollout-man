@@ -525,11 +525,23 @@ ROUT2=$("$BIN" run "$RDIR/exp.yaml" --runs "$RDIR/runs" --id b --executor local 
 check "a later run reuses the gate verdict"  'echo "$ROUT2" | grep -q "per_case gate cached"'
 check "and does not repair the case again"   '[ "$(wc -l < "$RDIR/case/marker.txt")" -eq 4 ]'
 
-step "17. a submission references the shared commands instead of restating them"
-check "the library is included, not copied" \
-  '[ "$(grep -lc "include: \[commands.yaml\]" experiments/*.yaml | wc -l)" -ge 5 ]'
+step "17. the official actions are what the documentation says they are"
+# The shared steps are built in rather than restated per submission, so the one
+# thing that can drift is the list -- and the list in a README is the copy that
+# goes stale, not the registry.
+ACTS=$("$BIN" actions 2>&1)
+check "the tool can say what it offers" '[ "$(echo "$ACTS" | wc -l)" -ge 10 ]'
+for a in $(echo "$ACTS" | awk '{print $1}'); do
+  grep -q "\`$a\`" README.md || bad "README documents $a"
+done
+ok "every built-in action is in the README"
+for a in $(grep -oE '^\| \`[a-z_]+\`' README.md | tr -d '|` '); do
+  echo "$ACTS" | awk '{print $1}' | grep -qx "$a" || bad "README's $a actually exists"
+done
+ok "every action the README lists actually exists"
 check "no experiment inlines the harbor adapter" \
   '! grep -lq "rollout-man.s trial contract on top of" experiments/*.yaml'
+
 
 step "18. the smallest submission that runs a directory of cases"
 # How much has to be configured to point this at a directory of cases is a
@@ -563,6 +575,70 @@ check "both cases were measured"                     '[ "$(wc -l < "$SDIR/runs/s
 printf -- '---\nkind: Commands\nx: {uses: a.sh, sha256: deadbeef}\n---\nkind: Experiment\nname: n\ncases: [{path: test/smoke/pass-case}]\nmatrix: {agents: [oracle], trials: 1}\n' > "$SDIR/stale.yaml"
 STALE=$("$BIN" cases "$SDIR/stale.yaml" 2>&1 || true)
 check "a removed setting is an error, not ignored" 'echo "$STALE" | grep -q "no longer used"'
+
+step "19. the official actions"
+ADIR="$RUNS/official"; rm -rf "$ADIR"; mkdir -p "$ADIR"
+cat > "$ADIR/exp.yaml" <<C
+---
+kind: Experiment
+name: official
+cases: [{path: test/smoke/pass-case}]
+matrix: {agents: [oracle], trials: 1}
+pipeline:
+  per_case:
+    - uses: check_case
+      with:
+        require: [task.toml, environment, solution/solve.sh, tests/test.sh]
+        require_fields: [agent.timeout_sec]
+  per_experiment:
+    - {uses: report, with: {dest: report.md, pass_at: 0.8}}
+    - {uses: report, with: {dest: report.json}}
+C
+OOUT=$("$BIN" run "$ADIR/exp.yaml" --runs "$ADIR/runs" --id o --executor local 2>&1)
+check "check_case passes a well formed case"  'echo "$OOUT" | grep -q "reward 1.000"'
+check "report writes a table"                 'grep -q "| oracle |" "$ADIR/runs/o/report.md"'
+check "and records the question it answered"  'grep -q "pass@0.80" "$ADIR/runs/o/report.md"'
+check "format follows the extension"          'grep -q "\"experiment\"" "$ADIR/runs/o/report.json"'
+
+# check_case must catch a package Harbor would silently mis-read: without a
+# top-level environment/ it falls through to dataset mode and fails much later
+# with a message about nothing that is wrong with the case.
+BAD="$ADIR/bad"; mkdir -p "$BAD"; cp test/smoke/pass-case/task.toml "$BAD/"
+sed "s|test/smoke/pass-case|$BAD|" "$ADIR/exp.yaml" > "$ADIR/bad.yaml"
+BOUT=$("$BIN" run "$ADIR/bad.yaml" --runs "$ADIR/runs2" --id o --executor local 2>&1 || true)
+check "check_case names what the package is missing" \
+  'echo "$BOUT" | grep -q "is missing environment"'
+# A field the case does not declare is a different failure from a file it does
+# not have, and the message has to say which.
+BOUT2=$(sed "s|agent.timeout_sec|environment.docker_image|" "$ADIR/exp.yaml" > "$ADIR/f.yaml"; \
+        "$BIN" run "$ADIR/f.yaml" --runs "$ADIR/runs3" --id o --executor local 2>&1 || true)
+check "and a missing task.toml field separately" 'echo "$BOUT2" | grep -q "no value for"'
+
+# The transports are declared, validated and reject a submission that forgets
+# what they need -- without needing the CLI present to find that out.
+cat > "$ADIR/noship.yaml" <<C
+---
+kind: Experiment
+name: noship
+cases: [{path: test/smoke/pass-case}]
+matrix: {agents: [oracle], trials: 1}
+pipeline:
+  per_experiment: [{uses: ship_hf, with: {path: dataset}}]
+C
+NOUT=$("$BIN" run "$ADIR/noship.yaml" --runs "$ADIR/runs4" --id o --executor local 2>&1 || true)
+check "ship_hf says repo: is required"  'echo "$NOUT" | grep -q "repo: is required"'
+check "and refuses before anything runs" '[ ! -f "$ADIR/runs4/o/results.jsonl" ]'
+
+step "20. the two action templates"
+for t in templates/action-tool.sh templates/action-llm.sh; do
+  [ -x "$t" ] && head -1 "$t" | grep -q '^#!' && ok "$(basename "$t") is a runnable starting point" ||
+    bad "$(basename "$t") is a runnable starting point"
+done
+check "both templates parse" 'for t in templates/*.sh; do bash -n "$t" || exit 1; done'
+# A template that silently succeeds would be copied into a pipeline and quietly
+# do nothing. Both must fail until someone replaces the body.
+check "an unedited template fails rather than passing" \
+  'for t in templates/*.sh; do RUN_DIR=/tmp LLM_MODEL=x bash "$t" >/dev/null 2>&1 && exit 1; done; true'
 
 printf '\n\033[1m%d passed, %d failed, %d skipped\033[0m\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
