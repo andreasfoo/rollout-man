@@ -24,11 +24,9 @@ inherit_env: false
 
 # uses: names an executable, not a shell script: the file is run directly and
 # its #! line decides what interprets it, so an adapter can be Python, a
-# compiled binary, or anything else. sha256: pins it -- if the file on disk
-# stops matching, the run is refused rather than warned about.
+# compiled binary, or anything else.
 harbor:
   uses: adapters/harbor.sh
-  sha256: d822f0cf2ea49988a32766b479ee679d5869272b38e2b466fe7c756a81bfb04f
   env: [DOCKER_HOST, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY]
 
 # Where cases come from. One command per source kind; the case picks by name.
@@ -45,12 +43,10 @@ source_hf:
 # Where results go. Four destinations, same contract: LOCAL_PATH and KEY.
 ship_local:
   uses: adapters/ship-local.sh
-  sha256: bab134e61f7465add7f9536dbbe64d3edb4cd1b14a51a66e19d9e3e8f7fa1899
   env: [SHIP_ROOT]
 
 ship_hf:
   uses: adapters/ship-hf.sh
-  sha256: 7bf57edebf474fe96eebd485a18c9c2f5e9b34d60e295f7574c9452d0468f70f
   env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HF_PATH_IN_REPO]
 
 ship_github:

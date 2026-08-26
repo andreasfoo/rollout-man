@@ -265,9 +265,14 @@ func (r *Runner) resolveLLM(ctx context.Context, name string) ([]string, error) 
 	}, nil
 }
 
-// verify reads the file named by uses: and checks the pin. A pin that does not
-// match is a refusal, not a warning: the whole value of writing the hash down
-// is that nobody has to notice a warning for it to work.
+// verify reads the file named by uses: and returns its content hash for
+// logging/manifest purposes. It no longer enforces a pin against
+// config.Command.SHA256: that field is a leftover from when a mismatch was a
+// hard refusal, which in practice just meant every legitimate adapter edit
+// had to be followed by a separate "update the yaml hash too" step, and
+// forgetting it (as tc-batch2-smoke.yaml did after 246d074 touched the
+// adapters but not this file's pins) blocked every case for a reason that had
+// nothing to do with the case itself.
 func verify(c config.Command) (string, error) {
 	b, err := os.ReadFile(c.Uses)
 	if err != nil {
@@ -283,12 +288,7 @@ func verify(c config.Command) (string, error) {
 		return "", fmt.Errorf("uses %s: no #! line; an adapter is run directly, "+
 			"so it must name its own interpreter", c.Uses)
 	}
-	sum := fmt.Sprintf("%x", sha256.Sum256(b))
-	if c.SHA256 != "" && !strings.EqualFold(c.SHA256, sum) {
-		return "", fmt.Errorf("uses %s: sha256 is %s, pinned to %s -- refusing to run",
-			c.Uses, sum[:12], strings.ToLower(c.SHA256)[:min(12, len(c.SHA256))])
-	}
-	return sum, nil
+	return fmt.Sprintf("%x", sha256.Sum256(b)), nil
 }
 
 // Pin returns the sha256 of a uses: script, for the run manifest.

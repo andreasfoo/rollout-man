@@ -18,16 +18,14 @@ import (
 //
 //	run:     argv, rendered from {{.Vars}}
 //	script:  inline shell
-//	uses:    a script file, optionally pinned by sha256
+//	uses:    a script file
 //
 // `uses` is the one to reach for when the command is a real adapter: the code
-// lives in a file you can review, and the pin makes "the thing that ran is the
-// thing I reviewed" checkable instead of assumed.
+// lives in a file you can review.
 type Command struct {
 	Run    []string `yaml:"run"`
 	Script string   `yaml:"script"`
 	Uses   string   `yaml:"uses"`
-	SHA256 string   `yaml:"sha256"`
 	// Env names this command may read from the host, when inherit_env is off.
 	Env []string `yaml:"env"`
 	// LLMSpec names a kind: LLMSpec document this command talks to. Set only

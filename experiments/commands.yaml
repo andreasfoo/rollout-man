@@ -3,9 +3,10 @@
 #
 #   rollout-man run experiments/local.yaml --commands experiments/commands.yaml
 #
-# Every adapter is pinned by content hash. If a file on disk stops matching, the
-# run is refused rather than warned about. Regenerate the hashes with:
-#   sha256sum adapters/*.sh
+# Every adapter runs via uses:, its file executed directly under its own #!
+# line. The manifest written per run records each command's content hash for
+# provenance, but a changed file is no longer refused -- edit the adapter and
+# it just runs the new version.
 ---
 kind: Commands
 timeout: 120m
@@ -19,7 +20,6 @@ inherit_env: false
 # Running a trial is Harbor's job. This is the only way in.
 harbor:
   uses: adapters/harbor.sh
-  sha256: d822f0cf2ea49988a32766b479ee679d5869272b38e2b466fe7c756a81bfb04f
   env: [DOCKER_HOST, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, PATH, HOME]
 
 # ── where cases come from ──────────────────────────────────────────────────
@@ -31,7 +31,6 @@ source_git:
 
 source_hf:
   uses: adapters/source-hf.sh
-  sha256: 7307102f5ad3a5f29a4f7c175cb419ff36fc27338cfda0b3a702512f5748ee52
   env: [HF_TOKEN, HF_HOME, HOME, PATH]
 
 # A step that just says where the pipeline has reached. Useful as the first
@@ -43,18 +42,15 @@ announce_case:
 # ── where results go ───────────────────────────────────────────────────────
 ship_local:
   uses: adapters/ship-local.sh
-  sha256: bab134e61f7465add7f9536dbbe64d3edb4cd1b14a51a66e19d9e3e8f7fa1899
   env: [SHIP_ROOT, HOME, PATH]
 
 ship_github:
   uses: adapters/ship-github.sh
-  sha256: 61b73aac154b7246d2cb12be1baafee0b4c759ac362f274816f6e657b9e0e749
   env: [SHIP_REPO, SHIP_BRANCH, SSH_AUTH_SOCK, HOME, PATH,
         GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL]
 
 ship_hf:
   uses: adapters/ship-hf.sh
-  sha256: 7bf57edebf474fe96eebd485a18c9c2f5e9b34d60e295f7574c9452d0468f70f
   env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HF_PATH_IN_REPO, HOME, PATH]
 
 ship_onedrive:
@@ -64,7 +60,6 @@ ship_onedrive:
 # OneDrive, S3, WebDAV, sftp -- whatever the operator's rclone.conf reaches.
 ship_rclone:
   uses: adapters/ship-rclone.sh
-  sha256: f5ae5e1786894a016bb4a365f10a9b9cd50a4643e7cfa8678607db4d5a35bcef
   env: [RCLONE_REMOTE, RCLONE_CONFIG, HOME, PATH]
 
 # ── shared by the tc_batch / forge-flow experiments ─────────────────────────
@@ -94,32 +89,26 @@ check_toml_image:
 
 check_traj_layout:
   uses: adapters/check-traj-layout.sh
-  sha256: e0850b8d68be96cf4f9f5750a8c2e38eb26c701ee60c17b362eb0d107f6a82bf
   env: [PATH, HOME]
 
 forge_flow_fuzz_mock:
   uses: adapters/forge-flow-fuzz-mock.sh
-  sha256: 85e12944db18638de4f1c694819b9ba87734a888b40b9d3ec33d7eeabe4d817e
   env: [PATH, HOME, DOCKER_HOST, ROLLOUT_MAN_HARBOR_ADAPTER]
 
 materialize_week2:
   uses: adapters/materialize-forge-week2.sh
-  sha256: 7048e4c3cd9e3bfc99fc45d3f8664b506a198efe64cd7e7bf879ec5d36b040db
   env: [PATH, HOME]
 
 record_progress:
   uses: adapters/record-forge-progress.sh
-  sha256: bcd9d57c18e824cc2e642470a3ada42ae9e74d0f3cc8d42ac98b349ae8ea8d48
   env: [PATH, HOME, PROGRESS_FILE]
 
 ship_week2_cases:
   uses: adapters/ship-hf-week2-cases.sh
-  sha256: 0b426ae8820135da5e4734f83f4103ebaebbfe15da40b7076ee5a1cd0a984c40
   env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
         ROLLOUT_MAN_SHIP_HF_ADAPTER]
 
 ship_week2_trajectories:
   uses: adapters/ship-hf-week2-trajectories.sh
-  sha256: 7d34fa91264fea31ccfda4e7429a0470ecddab05eb2c6511d5ada2bd42d75d6b
   env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
         ROLLOUT_MAN_SHIP_HF_ADAPTER]

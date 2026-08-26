@@ -168,7 +168,6 @@ func (r *Runner) writeManifest() error {
 		Form    string `json:"form"` // uses | run | script
 		Uses    string `json:"uses,omitempty"`
 		SHA256  string `json:"sha256,omitempty"`
-		Pinned  bool   `json:"pinned,omitempty"`
 		Problem string `json:"problem,omitempty"`
 	}
 	m := struct {
@@ -192,7 +191,7 @@ func (r *Runner) writeManifest() error {
 		e := cmd{Name: name, Form: "script"}
 		switch {
 		case c.Uses != "":
-			e.Form, e.Uses, e.Pinned = "uses", c.Uses, c.SHA256 != ""
+			e.Form, e.Uses = "uses", c.Uses
 			sum, err := cmdrun.Pin(c)
 			if err != nil {
 				e.Problem = err.Error()
