@@ -134,6 +134,22 @@ var ErrSkipCase = errors.New("case skipped")
 
 func register(a Action) { registry[a.Name()] = a }
 
+// Describe lists the built-in actions and the units each runs on, so "what can
+// I use here" is answerable from the tool rather than from the documentation,
+// which is the copy that goes stale.
+func Describe() []string {
+	out := make([]string, 0, len(registry))
+	for _, n := range Names() {
+		a := registry[n]
+		scopes := make([]string, 0, len(a.Scopes()))
+		for _, s := range a.Scopes() {
+			scopes = append(scopes, string(s))
+		}
+		out = append(out, fmt.Sprintf("%-14s %s", n, strings.Join(scopes, ", ")))
+	}
+	return out
+}
+
 func Names() []string {
 	out := make([]string, 0, len(registry))
 	for k := range registry {

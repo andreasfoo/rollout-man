@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/andreasfoo/rollout-man/internal/actions"
 	"github.com/andreasfoo/rollout-man/internal/casesrc"
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
 	"github.com/andreasfoo/rollout-man/internal/cmdwatch"
@@ -35,6 +36,11 @@ func main() {
 		os.Exit(cmdStatus(os.Args[2:]))
 	case "ship":
 		os.Exit(cmdShip(os.Args[2:]))
+	case "actions":
+		for _, line := range actions.Describe() {
+			fmt.Println(line)
+		}
+		os.Exit(0)
 	case "cases":
 		os.Exit(cmdCases(os.Args[2:]))
 	case "watch":
@@ -57,6 +63,9 @@ func usage() {
 
   ship   <run-dir> <file.yaml> [--commands FILE]
          re-run the per_experiment steps against an existing run directory.
+
+  actions
+         the built-in pipeline steps and the units each runs on.
 
   cases  <file.yaml> [--commands FILE]
          resolve every case and print its content hash.

@@ -92,6 +92,24 @@ func (r *Runner) Run(ctx context.Context, name string, vars map[string]string) (
 	return Result{}, fmt.Errorf("command %s failed after %d attempts: %w", name, r.MaxAttempts, last)
 }
 
+// RunArgv runs an argv the runner built itself -- a built-in action driving a
+// CLI -- through the same environment policy, timeout and logging as a
+// configured command. The action says which host variables its transport needs
+// (HF_TOKEN, RCLONE_CONFIG, ...), so an operator does not have to enumerate
+// them for a step whose requirements the tool already knows.
+func (r *Runner) RunArgv(ctx context.Context, name string, argv, env []string, timeout time.Duration) (Result, error) {
+	if len(argv) == 0 {
+		return Result{}, fmt.Errorf("%s: empty command", name)
+	}
+	if _, err := exec.LookPath(argv[0]); err != nil {
+		return Result{}, fmt.Errorf("%s needs %q on PATH: %w", name, argv[0], err)
+	}
+	if timeout <= 0 {
+		timeout = r.Timeout
+	}
+	return r.once(ctx, name, config.Command{Run: argv, Env: env}, nil, timeout)
+}
+
 // RunOnce executes the named command exactly once, with its own timeout. A
 // trial goes through here rather than Run: retrying is the runner's decision,
 // made from the failure code, and a silent retry inside the adapter would run

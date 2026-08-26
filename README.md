@@ -184,12 +184,29 @@ allowlist that commands already have.
 
 | action | unit | what it does |
 |---|---|---|
+| `check_case` | per_case | the package is shaped the way Harbor needs before anything expensive runs |
 | `admission` | per_case | refuses a case whose oracle cannot score or whose nop can |
 | `redact` | per_trial | keys always, addresses only in what leaves the machine |
-| `guard` | per_trial, per_experiment | asserts on `reward` / `steps` / `seconds`, or on `trials` / `shipped` / `mean_reward` |
+| `guard` | per_trial, per_experiment | asserts on `reward` / `steps` / `seconds`, or `trials` / `shipped` / `mean_reward` |
 | `archive` | per_trial | one archive per trial (`tar`, `tar.gz`, `zip`) |
 | `dataset` | per_experiment | turns the run into rows plus a card |
-| `ship` | per_trial, per_experiment | hands a path to a configured command |
+| `report` | per_experiment | writes what happened to a file (`md`, `json`, `csv`) |
+| `ship_hf` | per_trial, per_experiment | publish to a dataset hub |
+| `ship_github` | per_experiment | commit into a checkout and push |
+| `ship_rclone` | per_trial, per_experiment | OneDrive, S3, WebDAV, sftp — whatever rclone reaches |
+| `ship` | per_trial, per_experiment | hand a path to a command you configured |
+
+The three transports drive the same CLIs an adapter would (`hf`, `rclone`,
+`git`), so **no storage SDK is in this repository and no credential is read,
+stored or forwarded by it** — each tool finds its own. What changed is who
+carries the glue: the tool, rather than every submission copying a script. Each
+one declares the host variables its CLI needs (`HF_TOKEN`, `RCLONE_CONFIG`, …),
+so an operator does not enumerate them for a step whose requirements are
+already known.
+
+They are **transport only**. What to send was decided by the step before —
+`dataset`, `archive`, or an explicit `path:` — and keeping that separate is what
+stops one project's idea of "the right files" from becoming everyone's.
 
 Every action declares the inputs it understands, and one it does not is an error
 **before the batch starts**. A misspelled key would otherwise run the step with
@@ -237,6 +254,25 @@ redo an audit that has already happened.
 It can only be keyed on what is written down. Anything else that decides an
 outcome — an environment variable, the state of the world — is invisible to it,
 so `--regate` runs the gate again regardless.
+
+### Writing your own step
+
+Most of what people reach for is already above. When the thing you need is
+genuinely yours, `templates/` has two starting points, and the difference
+between them is the part worth getting right:
+
+- **`action-tool.sh`** — a deterministic local tool. Be safe to run twice, and
+  keep secrets out of anything under `$RUN_DIR`.
+- **`action-llm.sh`** — a step that asks a model. Two failures look identical
+  from inside and must not be treated the same: **the model answered and the
+  answer is no** is a *verdict* (the step failing is the point; retrying bills
+  you again for the same answer), while **the call did not complete** is an
+  *incident* (that one wants `retries:`). Getting it backwards is expensive
+  both ways — retrying a verdict multiplies the cost of one answer, and
+  treating an outage as a verdict rejects work that was never judged.
+
+Both templates **fail until you replace the body**, on purpose: a template that
+quietly succeeded would be copied into a pipeline and do nothing.
 
 ### Guards, and what dropping means
 
@@ -559,7 +595,7 @@ and VCS credentials belong to whatever command you configured — `rclone.conf`,
 
 ```bash
 go test ./internal/...
-test/smoke/run.sh        # 142 assertions: the whole pipeline end to end
+test/smoke/run.sh        # 156 assertions: the whole pipeline end to end
 test/smoke/resume.sh     # 6 assertions: kill a run mid-trial, re-run, resume
 ```
 
