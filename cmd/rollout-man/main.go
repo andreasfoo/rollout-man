@@ -75,13 +75,13 @@ func logf(format string, a ...any) {
 	fmt.Printf("%s  %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, a...))
 }
 
-func signalCtx() (context.Context, func()) {
+func signalCtx(interruptedMsg string) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-ch
-		fmt.Fprintln(os.Stderr, "\ninterrupted; re-run with the same --id to pick up where this stopped")
+		fmt.Fprintln(os.Stderr, "\n"+interruptedMsg)
 		cancel()
 	}()
 	return ctx, cancel
@@ -190,7 +190,7 @@ func cmdRun(args []string) int {
 	}
 	dir := filepath.Join(runsRoot(*runs), runID)
 
-	ctx, cancel := signalCtx()
+	ctx, cancel := signalCtx("interrupted; re-run with the same --id to pick up where this stopped")
 	defer cancel()
 
 	// scratch lives outside the run directory: the run directory is a
@@ -362,10 +362,12 @@ func cmdCases(args []string) int {
 
 func cmdWatch(args []string) int {
 	return cmdwatch.Cmd(args, cmdwatch.Deps{
-		RunsRoot:  runsRoot,
-		Build:     build,
-		Logf:      logf,
-		SignalCtx: signalCtx,
+		RunsRoot: runsRoot,
+		Build:    build,
+		Logf:     logf,
+		SignalCtx: func() (context.Context, func()) {
+			return signalCtx("interrupted; stopping the watch loop")
+		},
 	})
 }
 
