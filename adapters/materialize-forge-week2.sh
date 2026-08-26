@@ -12,12 +12,21 @@ python3 - "$run" "$cases" "$trajs" <<'PY'
 import json, os, re, shutil, sys
 run, cases, trajs = map(os.path.abspath, sys.argv[1:])
 
-# The published task.toml must not leak which network the agent actually saw.
-# [agent] network_mode = "allowlist" + allowed_hosts = [...] name the live
-# proxy IP (e.g. the Kimi proxy) that the case's real agent sandbox is wired
-# to; that has no business surviving into a public dataset. Only the [agent]
-# section is touched -- [verifier]/[environment] network_mode is unrelated.
-def scrub_agent_network(path):
+# The published task.toml must not leak which network a live task actually
+# saw. [agent] network_mode/allowed_hosts name the proxy IP (e.g. the Kimi
+# proxy) the case's real agent sandbox is wired to; [verifier.environment]
+# network_mode and [environment] network_mode/allowed_hosts name the
+# verifier/candidate-environment's own live network config (e.g. an
+# allowlisted egress IP) -- same class of leak, different sections. Keys are
+# dropped outright (not masked): a stray "allowed_hosts = [...]" with no
+# hosts left behind is itself a tell, so the line goes, not just its value.
+SCRUB = {
+    'agent': {'network_mode', 'allowed_hosts'},
+    'verifier.environment': {'network_mode'},
+    'environment': {'network_mode', 'allowed_hosts'},
+}
+
+def scrub_network(path):
     if not os.path.isfile(path):
         return
     lines = open(path).read().splitlines(keepends=True)
@@ -26,7 +35,8 @@ def scrub_agent_network(path):
         m = re.match(r'\s*\[([^\]]+)\]\s*$', line)
         if m:
             section = m.group(1)
-        if section == 'agent' and re.match(r'\s*(network_mode|allowed_hosts)\s*=', line):
+        keys = SCRUB.get(section, ())
+        if keys and re.match(r'\s*(' + '|'.join(keys) + r')\s*=', line):
             continue
         out.append(line)
     open(path, 'w').writelines(out)
@@ -52,7 +62,7 @@ for line in open(os.path.join(run, 'results.jsonl')):
     # along into the published dataset undetected.
     shutil.copytree(src, case_dst, symlinks=True,
                      ignore=shutil.ignore_patterns('.factory', 'trials', 'jobs'))
-    scrub_agent_network(os.path.join(case_dst, 'task.toml'))
+    scrub_network(os.path.join(case_dst, 'task.toml'))
     # Harbor's own started_at is the trajectory timestamp. Each accepted task
     # owns its trajectory namespace, so jobs publish as
     # trajectory/<task-slug>/jobs/<timestamp>/<task-slug>__<harbor-run-suffix>/.
