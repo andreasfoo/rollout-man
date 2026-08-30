@@ -53,15 +53,103 @@ prompt="Read the case package at ${CASE_DIR} and audit it against the 11 static 
 
 printf 'acc-quality-audit: running subagent for %s ...\n' "$CASE_LABEL"
 
-claude -p \
-  --dangerously-skip-permissions \
-  --output-format text \
-  "$prompt" > "$report_file" 2>&1
+# Preflight the endpoint with a 90s ping before burning a 20-minute audit
+# attempt on a dead gateway: the tingly gateway has been observed to accept
+# the connection and then stall the stream indefinitely, so a hang here
+# means every real attempt would hang too. Fail fast as TEMPFAIL so the
+# case is retried later rather than cached as a rejection after two 20-min
+# timeouts (which also blow the command-level timeout mid-retry).
+if ! timeout --signal=TERM --kill-after=10s 90 \
+    claude -p --dangerously-skip-permissions --output-format text \
+    "Reply with the single word: ok" > /dev/null 2>&1; then
+  emit verdict TEMPFAIL
+  emit blocking false
+  printf 'acc-quality-audit: TEMPFAIL %s -- gateway preflight failed (endpoint down or stalling)\n' \
+    "$CASE_LABEL" >&2
+  exit 75
+fi
 
-recommendation=$(grep -oP '(?i)recommendation:\s*\K.*' "$report_file" | head -1 | sed 's/[[:space:]]*$//')
+parse_recommendation() {
+  # Collect every "recommendation:" line, not just the first: subagents
+  # sometimes echo the skill's template ("recommendation: PROMOTE | DO NOT
+  # PROMOTE (...) | PROMOTE-WITH-WARNINGS") before their actual verdict --
+  # option lists contain a pipe, verdicts never do, so drop pipe lines and
+  # take the last surviving line. Markdown emphasis (**PROMOTE**) and
+  # trailing punctuation are prose-y decoration, not different verdicts.
+  # (Three cases were false-rejected by the first-match parser on exactly
+  # these shapes, 2026-08-30.)
+  # The trailing || true is load-bearing: under set -e + pipefail, an empty
+  # report makes the first grep exit 1 and would kill the whole script
+  # before the retry/tempfail logic below ever runs (observed 2026-08-30
+  # on a timeout-killed subagent: silent exit 1, cached as a rejection).
+  grep -oP '(?i)recommendation:\s*\K.*' "$1" \
+    | grep -v '|' \
+    | tail -1 \
+    | tr -d '*_`' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[.!,;:[:space:]]*$//' || true
+}
+
+run_subagent() {
+  # The gateway connection can hang with a stalled stream (observed twice:
+  # 16-27min elapsed, single-digit CPU seconds, 0-byte report). Cap each
+  # attempt; a killed attempt leaves a partial/empty report, which
+  # report_is_broken catches and the retry path below handles. The || true
+  # keeps set -e from killing the script on a nonzero claude/timeout exit --
+  # the report's content, not the exit code, drives every decision below.
+  timeout --signal=TERM --kill-after=30s 1200 \
+    claude -p \
+    --dangerously-skip-permissions \
+    --output-format text \
+    "$prompt" > "$report_file" 2>&1 || true
+}
+
+run_subagent
+recommendation=$(parse_recommendation "$report_file")
+
+# The audit subagent rides the same inference gateway as everything else,
+# and that upstream has been observed to fail in ways that look like
+# reports: a 500 streaming error written as the whole "report", or an
+# empty stream (1-byte file), or a truncated one that dies mid-S-category
+# before ever reaching a recommendation line. A PARSE-ERROR verdict that
+# drops the case should mean "the audit genuinely produced no verdict",
+# not "the gateway hiccuped" -- so when the report carries no
+# recommendation line AND looks like an upstream failure (empty, or an
+# API-error blob, or cut off before the report's tail), retry the
+# subagent once before giving up. The retry overwrites report_file, so
+# the archived report is always the one the verdict was read from.
+report_is_broken() {
+  local n
+  n=$(wc -c < "$report_file")
+  [ "$n" -le 1 ] && return 0
+  grep -q 'API Error' "$report_file" && [ "$n" -lt 3000 ] && return 0
+  # A real report ends past S11 with the recommendation block; one that
+  # stops mid-category (stream cut) has no recommendation and is short.
+  [ -z "$(parse_recommendation "$report_file")" ] && [ "$n" -lt 3000 ] && return 0
+  return 1
+}
+if [ -z "$recommendation" ] && report_is_broken; then
+  printf 'acc-quality-audit: %s -- subagent produced no verdict (empty/error/truncated report, %s bytes); retrying once\n' \
+    "$CASE_LABEL" "$(wc -c < "$report_file")" >&2
+  run_subagent
+  recommendation=$(parse_recommendation "$report_file")
+fi
 
 emit report "$report_file"
 emit case "$slug"
+
+if [ -z "$recommendation" ]; then
+  # No verdict even after the retry: the gateway/subagent failed to produce
+  # an audit, so there is nothing to judge the case by. Exit 75
+  # (EX_TEMPFAIL) tells rollout-man to record NO verdict -- the case is
+  # retried on a later watch poll instead of being cached as a rejection
+  # (three cases were poisoned that way before this protocol existed).
+  emit verdict TEMPFAIL
+  emit blocking false
+  printf 'acc-quality-audit: TEMPFAIL %s -- subagent produced no verdict after retry (%s bytes)\n' \
+    "$CASE_LABEL" "$(wc -c < "$report_file")" >&2
+  printf '  report: %s\n' "$report_file" >&2
+  exit 75
+fi
 
 case "$recommendation" in
   PROMOTE)
@@ -69,14 +157,26 @@ case "$recommendation" in
     emit blocking false
     printf 'acc-quality-audit: CLEAN %s -- PROMOTE  (report: %s)\n' "$CASE_LABEL" "$report_file"
     ;;
-  PROMOTE-WITH-WARNINGS)
+  PROMOTE-WITH-WARNINGS*)
     emit verdict PROMOTE-WITH-WARNINGS
     emit blocking false
     printf 'acc-quality-audit: WARNINGS %s -- medium issues found (not blocking)  (report: %s)\n' \
       "$CASE_LABEL" "$report_file" >&2
     printf 'acc-quality-audit: ok %s -- PROMOTE-WITH-WARNINGS\n' "$CASE_LABEL"
     ;;
-  "DO NOT PROMOTE"*)
+  # "PROMOTE (conditional on ...)" / "PROMOTE, conditioned on ...": the
+  # subagent promotes but hangs runtime conditions on it (typically R1/R2
+  # blocked-needs-build in the dockerless audit env). Those conditions are
+  # exactly what the pipeline's own admission step verifies downstream, so
+  # this admits like PROMOTE-WITH-WARNINGS rather than tempfailing.
+  PROMOTE[\ ,\(:\]]*)
+    emit verdict PROMOTE-WITH-WARNINGS
+    emit blocking false
+    printf 'acc-quality-audit: WARNINGS %s -- conditional promote: %s  (report: %s)\n' \
+      "$CASE_LABEL" "$recommendation" "$report_file" >&2
+    printf 'acc-quality-audit: ok %s -- PROMOTE (conditional)\n' "$CASE_LABEL"
+    ;;
+  "DO NOT PROMOTE"*|DO-NOT-PROMOTE*)
     emit verdict DO-NOT-PROMOTE
     emit blocking true
     printf 'acc-quality-audit: FAIL %s -- %s\n' "$CASE_LABEL" "$recommendation" >&2
@@ -84,12 +184,14 @@ case "$recommendation" in
     exit 1
     ;;
   *)
-    emit verdict PARSE-ERROR
-    emit blocking true
-    printf 'acc-quality-audit: FAIL %s -- could not parse recommendation from subagent output\n' \
+    # A verdict-shaped line we still cannot classify is the subagent
+    # misbehaving, not the case failing: tempfail, do not cache a rejection.
+    emit verdict TEMPFAIL
+    emit blocking false
+    printf 'acc-quality-audit: TEMPFAIL %s -- could not parse recommendation from subagent output\n' \
       "$CASE_LABEL" >&2
     printf '  got: %s\n' "${recommendation:-(empty)}" >&2
     printf '  report: %s\n' "$report_file" >&2
-    exit 1
+    exit 75
     ;;
 esac

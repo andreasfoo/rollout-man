@@ -15,7 +15,9 @@
 set -euo pipefail
 
 : "${KEY:?ship-hf needs dest: to be the repo id, e.g. my-org/rollout-libaom}"
-msg="${HF_COMMIT_MESSAGE:-rollout-man: ${EXPERIMENT:-batch} ${RUN_ID:-}}"
+# TRIAL_ID is present only for a per-trial ship; without it this is a
+# batch-level call, and RUN_ID stays the distinguisher.
+msg="${HF_COMMIT_MESSAGE:-rollout-man: ${EXPERIMENT:-batch} ${TRIAL_ID:-$RUN_ID}}"
 
 args=(upload "$KEY" "$LOCAL_PATH" "${HF_PATH_IN_REPO:-.}"
       --repo-type dataset --commit-message "$msg")

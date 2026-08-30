@@ -99,6 +99,12 @@ materialize_week2:
   uses: adapters/materialize-forge-week2.sh
   env: [PATH, HOME]
 
+# Per-trial variant: materializes one trial's slice of the two trees inside
+# its own OUT_DIR, for per_trial ship steps that publish incrementally.
+materialize_week2_trial:
+  uses: adapters/materialize-forge-week2-trial.sh
+  env: [PATH, HOME]
+
 record_progress:
   uses: adapters/record-forge-progress.sh
   env: [PATH, HOME, PROGRESS_FILE]

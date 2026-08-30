@@ -88,50 +88,7 @@ check_toml_image:
 # the case for a human fix instead of attempting an in-pipeline repair.
 # The adapter scripts stay in adapters/ for manual use.)
 
-# Per-case pre-check 2: no Chinese text in the task content. The benchmark is
-# English-only; CJK characters in instruction/README/tests/solution/toml are a
-# production-side leak (comments, descriptions) that must not reach HF.
-# Scans text files only (NUL byte in the first 8KB = binary, skipped), and
-# skips the same dirs materialize never ships (.factory/trials/jobs/...).
-# FAIL lists up to 10 offending files with the first matching line each.
-check_no_chinese:
-  env: [PATH, HOME]
-  script: |
-    set -euo pipefail
-    python3 - "$CASE_DIR" "$CASE_LABEL" <<'PY'
-    import os, re, sys
-    case_dir, label = sys.argv[1], sys.argv[2]
-    SKIP_DIRS = {".factory", "trials", "jobs", ".triage", ".casefactory", "reject"}
-    # CJK ideographs (incl. ext-A, compat) + CJK punctuation + fullwidth forms
-    CJK = re.compile(r"[㐀-䶿一-鿿豈-﫿　-〿＀-￠]")
-    hits = []
-    for root, dirs, files in os.walk(case_dir):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-        for fn in sorted(files):
-            p = os.path.join(root, fn)
-            try:
-                data = open(p, "rb").read()
-            except OSError:
-                continue
-            if b"\x00" in data[:8192]:
-                continue  # binary
-            try:
-                text = data.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            for i, line in enumerate(text.splitlines(), 1):
-                if CJK.search(line):
-                    hits.append((os.path.relpath(p, case_dir), i, line.strip()[:80]))
-                    break  # first hit per file is enough to flag it
-    if hits:
-        print(f"check_no_chinese: FAIL {label} -- Chinese text in {len(hits)} file(s):", file=sys.stderr)
-        for rel, ln, ex in hits[:10]:
-            print(f"  {rel}:{ln}: {ex}", file=sys.stderr)
-        sys.exit(1)
-    print(f"check_no_chinese: ok {label}")
-    PY
-
-# Per-case pre-check 3: cyber-gate acc-quality-audit (11-point verifier-trust-boundary).
+# Per-case pre-check 2: cyber-gate acc-quality-audit (11-point verifier-trust-boundary).
 # Invokes the acc-quality-audit skill via `claude -p` (subagent reads case files
 # statically and checks S1-S11: candidate code isolation, privilege drop,
 # self-report, mutable oracle, fd forgery, PoC compile bypass, etc.).
@@ -142,10 +99,6 @@ check_no_chinese:
 # CYBER_GATE_ROOT  path to the cyber-gate source tree (default: /home/foo/project/cyber-gate).
 check_quality:
   uses: adapters/acc-quality-audit.sh
-  # Two audit attempts (20m cap + 30s kill window each) plus the gateway
-  # preflight must fit inside this -- the document-wide 30m default killed
-  # the adapter mid-retry and cached the infra failure as a rejection.
-  timeout: 50m
   # Which endpoint the audit subagent talks to is a submission setting, not
   # ambient state: without llm_spec the adapter falls through to whatever
   # ANTHROPIC_* the environment happens to carry (the interactive claude
@@ -207,45 +160,34 @@ ship_week2_trajectories:
 ---
 # The audit/fix subagents' endpoint (check_quality, fix_quality_audit).
 # Same spec tc-batch1 declares: the local tingly gateway fronting kimi-k3.
-# 2026-08-30: model moved kimi-k3 -> kimi-k2.7-code. kimi-k3 deterministically
-# stalled ~15 bytes into the dnsmasq-982faf4 audit (3 watch attempts + 1
-# manual run, all timeout-killed at the 20m cap; gateway otherwise healthy,
-# every other case audited fine). k2.7-code completed the same audit in one
-# pass (PROMOTE-WITH-WARNINGS, 11/11 static CLEAN).
 kind: LLMSpec
 name: quality-audit-llm
 provider: anthropic
 base_url: http://localhost:12584/tingly/anthropic
-model: kimi-k2.7-code
+model: kimi-k3
 api_key_env: ANTHROPIC_AUTH_TOKEN
 ---
 kind: Experiment
-name: tc-batch2-smoke
+name: tc-batch2-regate7
 
 case_defaults:
   source: local
 
-# TEMPORARY: scoped to the 13 still-rejected cases from the full 24-case batch,
-# plus bind9-891c50a (re-added now that its trial layout has been repaired --
-# see tc_batch2 commit 08f0ba49e), to exercise the new check_quality
-# fix:/fix_writeback: auto-repair without re-touching the 10 already-admitted
-# cases' gate-cache/admission results. Restore the full 24-case list
-# afterward (backup: /tmp/tc-batch2-smoke.yaml.full-backup).
+# TEMPORARY (2026-08-28): parallel re-gate of the 7 cases watch21 had not
+# cleanly processed when it was killed -- two false-rejected by infrastructure
+# failures (2620992: audit hit the 64k output-token cap; 577512f: audit killed
+# with the watch), four never reached in the serial queue, one re-gate after
+# the R1/S4 fixes (bc0daf9/d8a352b). Ship steps are REMOVED: admitted cases
+# are materialized locally only, and are pushed to HF by hand after the user
+# signs off. Delete this file once the batch lands.
 cases:
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/bind9-891c50a-commit-921043b-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-ce552bd-issue-103630-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/dnsmasq-5b99eae-commit-a90f09db-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/gstreamer-763d2bb-commit-b268b27-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/mariadb-eb41c11-commit-7741065-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-a152c63-commit-e66bd49-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nginx-31620d1-commit-b19bc2e-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nginx-61690b5-commit-66fde99-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nginx-6446f99-commit-bcb41c9-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-312da26-commit-d9e1036-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-d04899f-commit-1c5c3b1-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-ea97ab6-commit-50f969c-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-62ba7ba-commit-3bb5a4b-t4
-  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tcpdump-0dd0132-commit-80deba1-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-2620992-commit-fc17c0a-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-577512f-commit-dd038bf-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-5de2c7a-commit-92a56d0-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-56bf35a-bug-1985765-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-bc0daf9-commit-dd0ac81-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-d8a352b-commit-51d0a9b-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/unbound-5eb362a-commit-a05d460-t4
 
 matrix:
   agents:
@@ -258,7 +200,7 @@ concurrency: 8
 max_attempts: 1
 
 pipeline:
-  per_case_concurrency: 4
+  per_case_concurrency: 7
   per_case:
     # 0. reject an oversized case (packaging mistake) before any container work.
     - uses: check_case_size
@@ -267,10 +209,6 @@ pipeline:
     #    (Autofix removed 2026-08-27: fix_toml_image's build+push+backfill is
     #    better run by hand than by a loop that also re-gates on adapter churn.)
     - uses: check_toml_image
-      on_failure: skip
-    # 1b. no Chinese text in task content -- cheap, catches production-side
-    #    leaks before spending 10min on the quality audit.
-    - uses: check_no_chinese
       on_failure: skip
     # 2. acc-quality-audit (11-point verifier-trust-boundary AI review via claude -p).
     #    Autofix removed 2026-08-27: fix_quality_audit's repair quality was poor
@@ -310,13 +248,8 @@ pipeline:
     # nothing to ship.
     - uses: materialize_week2_trial
 
-    # Single atomic HF commit: task/week2 + trajectory in one push, scoped to
-    # the shared materialized/ parent of this trial's two trees.
-    - uses: ship
-      with:
-        using: ship_week2_atomic
-        path: "{{steps.materialize_week2_trial.outputs.materialized_dir}}"
-        dest: tinglydev/cyber-xianjin
+    # NO ship step in this file (2026-08-28): HF pushes go through the user.
+    # Admitted cases' materialized/ trees sit in their trial OUT_DIRs, ready
+    # for a manual ship_week2_atomic once approved.
 
-  per_experiment:
-    - uses: record_progress
+  per_experiment: []

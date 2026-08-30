@@ -1,3 +1,6 @@
 /rollout-man
 test/smoke/fail-cases/*/tests/.attempted
 /runs/
+.cache/
+__pycache__/
+/Progress.md

@@ -7,22 +7,35 @@
 # in per_experiment. If either source tree is empty the upload is skipped
 # entirely (consistent with the single-tree guards in the individual adapters).
 #
+# The source root may name its two trees either way: accepted-cases/
+# accepted-trajectories/ (what the batch materializer writes) or task/
+# trajectory/ (what the per-trial materializer writes inside a trial's own
+# OUT_DIR/materialized -- named after where they publish). Same two trees,
+# same two destinations.
+#
 # ENV (set by rollout-man ship builtin or per_experiment env):
-#   LOCAL_PATH   the run directory (contains accepted-cases/ and
-#                accepted-trajectories/ as siblings)
+#   LOCAL_PATH   the root directory (contains the two trees as siblings)
 #   KEY          HF repo id, e.g. tinglydev/cyber-xianjin
 #   HF_REVISION  (opt) branch/revision, default repo default branch
 #   HF_PRIVATE   (opt) "1" (default) to create private repo if new
 #   HF_TOKEN     (opt) overrides hf auth login credential
-#   ROLLOUT_MAN_SHIP_HF_ADAPTER (opt) alternate ship-hf.sh path (ignored here;
-#                this script always uses huggingface_hub directly for atomicity)
+#   ROLLOUT_MAN_SHIP_HF_ADAPTER (opt) alternate ship-hf.sh path; when set it
+#                is used per tree instead of huggingface_hub -- atomicity is
+#                traded for the override, which exists for stubbed smoke tests.
 set -euo pipefail
 
 : "${LOCAL_PATH:?ship-hf-week2-atomic needs LOCAL_PATH=run directory}"
 : "${KEY:?ship-hf-week2-atomic needs KEY=hf-repo-id}"
 
-cases_dir="$LOCAL_PATH/accepted-cases"
-trajs_dir="$LOCAL_PATH/accepted-trajectories"
+pick_dir() { # pick_dir <preferred> <fallback>
+  if [ -d "$LOCAL_PATH/$1" ]; then printf '%s' "$1"
+  elif [ -d "$LOCAL_PATH/$2" ]; then printf '%s' "$2"
+  else printf '%s' "$1"; fi
+}
+cases_name=$(pick_dir accepted-cases task)
+trajs_name=$(pick_dir accepted-trajectories trajectory)
+cases_dir="$LOCAL_PATH/$cases_name"
+trajs_dir="$LOCAL_PATH/$trajs_name"
 
 cases_empty=true
 trajs_empty=true
@@ -38,6 +51,17 @@ if $cases_empty && $trajs_empty; then
   exit 0
 fi
 
+if [ -n "${ROLLOUT_MAN_SHIP_HF_ADAPTER:-}" ]; then
+  echo "ship-hf-week2-atomic: ROLLOUT_MAN_SHIP_HF_ADAPTER set -- shipping each tree via $ROLLOUT_MAN_SHIP_HF_ADAPTER (not atomic)"
+  if ! $cases_empty; then
+    HF_PATH_IN_REPO=task/week2 "$ROLLOUT_MAN_SHIP_HF_ADAPTER"
+  fi
+  if ! $trajs_empty; then
+    HF_PATH_IN_REPO=trajectory "$ROLLOUT_MAN_SHIP_HF_ADAPTER"
+  fi
+  exit 0
+fi
+
 if $cases_empty; then
   echo "ship-hf-week2-atomic: WARN accepted-cases/ is empty but accepted-trajectories/ is not -- uploading trajectories only" >&2
 fi
@@ -45,7 +69,7 @@ if $trajs_empty; then
   echo "ship-hf-week2-atomic: WARN accepted-trajectories/ is empty but accepted-cases/ is not -- uploading cases only" >&2
 fi
 
-msg="${HF_COMMIT_MESSAGE:-rollout-man: ${EXPERIMENT:-batch} ${RUN_ID:-}}"
+msg="${HF_COMMIT_MESSAGE:-rollout-man: ${EXPERIMENT:-batch} ${TRIAL_ID:-$RUN_ID}}"
 private="${HF_PRIVATE:-1}"
 revision="${HF_REVISION:-}"
 

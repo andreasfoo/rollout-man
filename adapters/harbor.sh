@@ -22,6 +22,14 @@ CASE_SNAPSHOT="$WORK_DIR/case"
 rm -rf "$JOBS" "$CASE_SNAPSHOT"
 mkdir -p "$JOBS" "$CASE_SNAPSHOT"
 
+# OUT_DIR is keyed by trial ID, which is stable across retries of the same
+# admission probe -- so a failure.txt/reward.txt left behind by an earlier,
+# now-irrelevant attempt would otherwise still be sitting there for score()
+# to read in preference to this attempt's own result (readFailure() is
+# checked before reward.txt). Clear it so this run's outcome is the only one
+# on disk when we're done.
+rm -f "$OUT_DIR/failure.txt" "$OUT_DIR/reward.txt"
+
 # A casefactory case directory can accumulate .factory state and previous
 # Harbor trials. Those are mutable runtime artifacts (sometimes owned by the
 # container user), not part of task input; Harbor snapshots its --path and

@@ -1,0 +1,190 @@
+# Week1 pipeline for tc_batch1: 50 pre-accepted cases (SELECTED-50.md, ranked
+# by agent-trajectory step length) → HF publish, task files only.
+#
+# These cases already have accepted verdicts and packaged trajectories
+# (jobs/) from case-forge -- unlike a fresh batch, there is no LLM
+# case-forge-fuzz lifecycle to run here. forge_flow_fuzz_mock (same adapter
+# tc_batch2 uses) skips it entirely: it maps the existing jobs/ tree into the
+# trials/ layout materialize_week2 expects and writes reward=0.0.
+#
+# check_toml_image / check_quality / admission / check_traj_layout are the
+# exact 4 gate steps tc-batch2-smoke.yaml runs, unmodified (same commands) -- they re-judge each case's *current* state rather than
+# trusting AUDIT-REPORT.md's 2026-08-22 snapshot. That report found 30/75
+# DO NOT PROMOTE cases (mostly S1 root-run-candidate, S2 python-module-shadow)
+# and recorded fixes for all of them same-day; the gate re-checking now, with
+# on_failure: skip per case, means a case that is still broken drops itself
+# instead of being hand-filtered out in advance and possibly missed.
+#
+# check_quality / fix_quality_audit each run an LLM subagent (`claude -p`);
+# llm_spec: quality-audit-llm (below) points both at a specific endpoint/model
+# instead of whatever ANTHROPIC_* happens to be ambient on the host -- a
+# quality-audit run at batch scale is its own rate-limit budget, separate
+# from whatever the operator's own `claude` session is using.
+#
+# Unlike tc_batch2, only accepted-cases/ is published (task/week1) --
+# accepted-trajectories/ is built by materialize_week2 as always but never
+# shipped. ship_hf_task_cases is a generic KEY="repo::path" adapter (not a
+# fixed-path copy per week) so future weeks reuse it by changing dest: only.
+#
+# Preconditions:
+#   export HF_TOKEN=...
+#   export PROGRESS_FILE=<path to a markdown progress doc>   (optional, appended)
+#
+# Run:
+#   go build -o rollout-man ./cmd/rollout-man
+#   ./rollout-man run experiments/tc-batch1-week1.yaml
+---
+kind: LLMSpec
+name: quality-audit-llm
+provider: anthropic
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Commands
+timeout: 30m
+max_attempts: 1
+inherit_env: false
+
+# Per-case pre-check 1: task.toml must carry a docker_image field, and the
+# case must have a top-level environment/ directory. Same rationale/wording
+# as tc-batch2-smoke.yaml's check_toml_image -- see there for the Harbor
+# dataset-mode fallthrough this specifically guards against.
+check_toml_image:
+  env: [PATH, HOME]
+  script: |
+    set -euo pipefail
+    toml="$CASE_DIR/task.toml"
+    [ -f "$toml" ] || { echo "check_toml_image: FAIL -- task.toml not found" >&2; exit 1; }
+    if ! grep -qE '^\s*docker_image\s*=' "$toml"; then
+      echo "check_toml_image: FAIL $CASE_LABEL -- no docker_image field" >&2; exit 1
+    fi
+    val=$(grep -E '^\s*docker_image\s*=' "$toml" | head -1 | sed 's/.*=\s*//' | tr -d '"'"'"' ')
+    [ -n "$val" ] || { echo "check_toml_image: FAIL $CASE_LABEL -- docker_image is empty" >&2; exit 1; }
+    if [ ! -d "$CASE_DIR/environment" ]; then
+      echo "check_toml_image: FAIL $CASE_LABEL -- no environment/ directory (harbor run --path" \
+        "requires task.toml + environment/ to treat this dir as a single task, otherwise it" \
+        "falls through to dataset-mode and admission fails with 'Either datasets or tasks" \
+        "must be provided')" >&2
+      exit 1
+    fi
+    echo "check_toml_image: ok $CASE_LABEL -- $val"
+
+# Per-case pre-check 2: cyber-gate acc-quality-audit (11-point verifier-trust-boundary).
+# quality-audit-llm (kimi-k3 via the free OpenRouter tier) is out of daily
+# quota as of 2026-08-26 -- for this one-off varnish retry, fall through to
+# the ambient ANTHROPIC_* creds (ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL) instead,
+# per acc-quality-audit.sh's own documented fallback. No llm_spec: override,
+# and the ambient vars are added to env: since inherit_env: false above.
+check_quality:
+  uses: adapters/acc-quality-audit.sh
+  env: [PATH, HOME, CYBER_GATE_ROOT, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL]
+
+# Auto-fix for a blocking check_quality verdict. Same fallback as check_quality above.
+fix_quality_audit:
+  uses: adapters/fix-quality-audit.sh
+  env: [PATH, HOME, CYBER_GATE_ROOT, ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL]
+
+# Admission oracle/nop trials use the real Harbor adapter.
+check_traj_layout:
+  uses: adapters/check-traj-layout.sh
+  env: [PATH, HOME]
+
+harbor:
+  uses: adapters/harbor.sh
+  env: [DOCKER_HOST, PATH, HOME]
+
+# Mock adapter: skips the LLM (no case-forge-fuzz lifecycle -- these cases are
+# already acc), replays jobs/ trials, writes reward=0.0.
+forge_flow_fuzz_mock:
+  uses: adapters/forge-flow-fuzz-mock.sh
+  env: [PATH, HOME, DOCKER_HOST, ROLLOUT_MAN_HARBOR_ADAPTER]
+
+materialize_week2:
+  uses: adapters/materialize-forge-week2.sh
+  env: [PATH, HOME]
+
+record_progress:
+  uses: adapters/record-forge-progress.sh
+  env: [PATH, HOME, PROGRESS_FILE]
+
+# Generic HF-dataset-path publisher: KEY = "<repo_id>::<path_in_repo>".
+# Reused across weeks by changing dest:, not by copying the script.
+ship_hf_task_cases:
+  uses: adapters/ship-hf-task-cases.sh
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
+        ROLLOUT_MAN_SHIP_HF_ADAPTER]
+---
+kind: Experiment
+name: tc-batch1-week1-retry2
+
+case_defaults:
+  source: local
+
+# The 50 cases in tc_batch1/SELECTED-50.md, ranked by agent-trajectory step
+# length (hardest-fought first). All 50 verified present on disk.
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch1/varnish-d1e3ffa-commit-20319dd6-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 1
+
+# 50 cases × 1 trial each. Admission (oracle+nop) runs two harbor trials per
+# case; only admission is parallelised heavily. Mock trials are near-instant.
+concurrency: 8
+max_attempts: 1
+
+pipeline:
+  per_case_concurrency: 4
+  per_case:
+    # 1. task.toml must have docker_image -- catches packaging defects early.
+    - uses: check_toml_image
+      on_failure: skip
+    # 2. acc-quality-audit (11-point verifier-trust-boundary AI review).
+    #    Re-judges current state -- not the AUDIT-REPORT.md 2026-08-22
+    #    snapshot -- so a case whose S1/S2 fix from that pass did not fully
+    #    hold gets caught here rather than silently promoted.
+    - uses: check_quality
+      on_failure: skip
+      fix: fix_quality_audit
+      fix_writeback: true
+    # 3. admission -- oracle must score 1.0, nop must score 0.0.
+    #    on_failure: skip so one case's rejection drops just that case
+    #    instead of aborting the whole per_case run.
+    - uses: admission
+      on_failure: skip
+      with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
+    # 4. trajectory layout -- jobs/ must have agent/trajectory.json per trial.
+    - uses: check_traj_layout
+      on_failure: skip
+
+  per_trial:
+    - uses: forge_flow_fuzz_mock
+
+    # Mock always writes 0.0 but guard stays for structural consistency.
+    - uses: guard
+      name: terminal-acc-only
+      with: {max_reward_exclusive: 0.6, require_measured: true}
+      on_violation: drop
+
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+  per_experiment:
+    # Builds accepted-cases/ + accepted-trajectories/ from accepted rows.
+    # Despite the "week2" name (historical -- the script just does the
+    # generic accepted-rows-to-two-trees materialization), it is reused as-is
+    # here; only accepted-cases/ gets shipped below.
+    - uses: materialize_week2
+
+    # Only task files (accepted-cases/) publish this round -- no trajectory
+    # upload. path: scopes ship to that one subtree of the run directory.
+    - uses: ship
+      with:
+        using: ship_hf_task_cases
+        dest: "tinglydev/cyber-xianjin::task/week1"
+        path: accepted-cases
+
+    - uses: record_progress

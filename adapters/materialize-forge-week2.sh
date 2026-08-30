@@ -13,32 +13,21 @@ import json, os, re, shutil, sys
 run, cases, trajs = map(os.path.abspath, sys.argv[1:])
 
 # The published task.toml must not leak which network a live task actually
-# saw. [agent] network_mode/allowed_hosts name the proxy IP (e.g. the Kimi
-# proxy) the case's real agent sandbox is wired to; [verifier.environment]
-# network_mode and [environment] network_mode/allowed_hosts name the
-# verifier/candidate-environment's own live network config (e.g. an
-# allowlisted egress IP) -- same class of leak, different sections. Keys are
+# saw. network_mode/allowed_hosts (in [agent], [verifier], [environment],
+# [verifier.environment]) name the proxy IP (e.g. the Kimi proxy) or the
+# verifier/candidate-environment's own live egress config; allow_internet
+# (in [environment]) reveals the sandbox egress policy. Same class of leak,
+# any section -- so the keys are scrubbed globally, not per-table. Keys are
 # dropped outright (not masked): a stray "allowed_hosts = [...]" with no
 # hosts left behind is itself a tell, so the line goes, not just its value.
-SCRUB = {
-    'agent': {'network_mode', 'allowed_hosts'},
-    'verifier.environment': {'network_mode'},
-    'environment': {'network_mode', 'allowed_hosts'},
-}
+SCRUB_KEYS = ('network_mode', 'allow_internet', 'allowed_hosts')
+SCRUB_RE = re.compile(r'\s*(' + '|'.join(SCRUB_KEYS) + r')\s*=')
 
 def scrub_network(path):
     if not os.path.isfile(path):
         return
     lines = open(path).read().splitlines(keepends=True)
-    out, section = [], None
-    for line in lines:
-        m = re.match(r'\s*\[([^\]]+)\]\s*$', line)
-        if m:
-            section = m.group(1)
-        keys = SCRUB.get(section, ())
-        if keys and re.match(r'\s*(' + '|'.join(keys) + r')\s*=', line):
-            continue
-        out.append(line)
+    out = [line for line in lines if not SCRUB_RE.match(line)]
     open(path, 'w').writelines(out)
 
 for line in open(os.path.join(run, 'results.jsonl')):

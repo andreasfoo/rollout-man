@@ -2,7 +2,9 @@
 # Append an idempotent rollout-man terminal ledger to the requested progress doc.
 set -euo pipefail
 : "${LOCAL_PATH:?record command needs LOCAL_PATH=run directory}"
-: "${PROGRESS_FILE:?set PROGRESS_FILE to FIREFOX-PROGRESS.md (or a campaign progress document)}"
+# No PROGRESS_FILE given: fall back to ./Progress.md rather than failing the
+# whole per_experiment tail. A missing ledger target is a default, not an error.
+PROGRESS_FILE="${PROGRESS_FILE:-Progress.md}"
 python3 - "$LOCAL_PATH" "$PROGRESS_FILE" <<'PY'
 import datetime, json, os, sys
 run, progress = sys.argv[1:]

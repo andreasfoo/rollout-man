@@ -19,6 +19,24 @@ timeout: 8h
 max_attempts: 1
 inherit_env: false
 
+# Per-case pre-check: reject a case whose on-disk footprint exceeds 100MB
+# before admission ever spins up a container for it. Cheap and host-only, so
+# it runs first -- a case this large (e.g. a full source-tree tarball baked
+# into environment/, see spidermonkey-7f081dc-commit-4143afd1-t4 in week1)
+# is a packaging mistake worth catching before burning an admission trial on it.
+check_case_size:
+  env: [PATH, HOME]
+  script: |
+    set -euo pipefail
+    limit_mb=100
+    size_bytes=$(du -sb "$CASE_DIR" | cut -f1)
+    size_mb=$((size_bytes / 1024 / 1024))
+    if [ "$size_mb" -gt "$limit_mb" ]; then
+      echo "check_case_size: FAIL $CASE_LABEL -- case is ${size_mb}MB, exceeds ${limit_mb}MB limit" >&2
+      exit 1
+    fi
+    echo "check_case_size: ok $CASE_LABEL -- ${size_mb}MB"
+
 # Ordinary Harbor is used solely by the admission builtin (oracle=1, nop=0).
 harbor:
   uses: adapters/harbor.sh
@@ -32,6 +50,14 @@ forge_flow_fuzz:
 
 materialize_week2:
   uses: adapters/materialize-forge-week2.sh
+  env: [PATH, HOME]
+
+# Per-trial materializer: builds this trial's slice of the two HF trees
+# inside its own OUT_DIR/materialized/{cases,trajectories}, so the ship steps
+# that follow it in per_trial land this trial's data on HF the moment it is
+# accepted.
+materialize_week2_trial:
+  uses: adapters/materialize-forge-week2-trial.sh
   env: [PATH, HOME]
 
 record_progress:
@@ -84,6 +110,11 @@ max_attempts: 1
 pipeline:
   concurrency: 2
   per_case:
+    # 0. reject an oversized case (packaging mistake) before it ever reaches
+    #    admission -- see check_case_size above.
+    - uses: check_case_size
+      on_failure: skip
+
     # Gate *before* invoking the skill: a case with a broken oracle or a nop
     # hole is not a valid accept/reject candidate.
     - uses: admission
@@ -105,21 +136,25 @@ pipeline:
     - uses: redact
       with: {keys: required, ips: {traj: true, logs: true}}
 
-  per_experiment:
-    # Produce exactly two trees: complete accepted task cases and their trails.
-    - uses: materialize_week2
+    # This trial's slice of the two trees, inside its own OUT_DIR. Rejected
+    # trials never wrote OUT_DIR/case, so the step exits 0 and there is
+    # nothing to ship.
+    - uses: materialize_week2_trial
 
-    # Separate commits under the requested paths in the same dataset repo.
+    # Separate commits under the requested paths in the same dataset repo --
+    # one per accepted trial, so data is visible incrementally rather than
+    # after the slowest case in the batch finishes.
     - uses: ship
       with:
         using: ship_week2_cases
-        path: accepted-cases
+        path: "{{steps.materialize_week2_trial.outputs.cases_dir}}"
         dest: tinglydev/cyber-xianjin
     - uses: ship
       with:
         using: ship_week2_trajectories
-        path: accepted-trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
         dest: tinglydev/cyber-xianjin
 
+  per_experiment:
     # Append a run-idempotent terminal ledger after successful publication.
     - uses: record_progress
