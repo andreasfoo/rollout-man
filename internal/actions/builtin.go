@@ -126,7 +126,10 @@ func (redactAction) Validate(a config.Action) error {
 
 // distributable names the artifacts that leave the team. Addresses are scrubbed
 // from those and kept in the rest: what ships and what you debug with want
-// opposite things, and an IPv4 regex eats version numbers for breakfast.
+// opposite things. Case content under OUT_DIR/case (the author's Dockerfiles,
+// changelogs, oracle binaries) is a third tier: only exact runner secrets may
+// be rewritten there -- pattern/IP rules on source material rewrote version
+// numbers and corrupted binaries on HF (2026-08-28).
 var distributable = map[string]redact.Class{
 	"traj.jsonl":  redact.Distributable,
 	"result.json": redact.Distributable,
@@ -149,13 +152,26 @@ func (redactAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
+		// Only regular files carry scrubbable bytes. A symlink ships as a
+		// link (materialize copies symlinks=True), so scrubbing through it
+		// would edit whatever it points at -- possibly outside this trial's
+		// tree -- and a link to a directory fails the read outright ("is a
+		// directory", as a stray env-link -> environment did, 2026-08-30).
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		rel, _ := filepath.Rel(c.Trial.OutDir, p)
 		class := redact.Debug
-		if cl, ok := distributable[d.Name()]; ok {
-			class = cl
+		switch {
+		case rel == "case" || strings.HasPrefix(rel, "case"+string(filepath.Separator)):
+			class = redact.Task
+		default:
+			if cl, ok := distributable[d.Name()]; ok {
+				class = cl
+			}
 		}
 		h, serr := s.ScrubFile(p, class)
 		if serr != nil {
-			rel, _ := filepath.Rel(c.Trial.OutDir, p)
 			return fail.Wrap(fail.RedactFailed, "scrub "+rel, serr)
 		}
 		total.Exact += h.Exact
@@ -516,16 +532,28 @@ func (shipAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 		return fmt.Errorf("no command named %q is configured", using)
 	}
 	local := c.RunDir
-	if p := a.Str("path", ""); p != "" {
-		local = filepath.Join(c.RunDir, p)
+	if p := expand(a.Str("path", ""), c); p != "" {
+		if filepath.IsAbs(p) {
+			// An absolute path (a {{steps.*.outputs.*}} expansion, typically)
+			// names the tree itself; filepath.Join would not collapse it
+			// under RunDir but nest it -- /run/dir + /abs/tree -> /run/dir/abs/tree.
+			local = p
+		} else {
+			local = filepath.Join(c.RunDir, p)
+		}
 	} else if c.Scope == PerTrial {
 		local = c.Trial.OutDir
 	}
 	dest := expand(a.Str("dest", ""), c)
-	if _, err := runStep(ctx, c, a, using, map[string]string{
+	vars := map[string]string{
 		"LocalPath": local, "Key": dest,
 		"Experiment": c.Experiment, "RunId": c.RunID, "RunDir": c.RunDir,
-	}); err != nil {
+	}
+	if c.Trial != nil {
+		// So a per-trial ship can tell its commits apart from the batch's.
+		vars["TrialId"] = c.Trial.ID
+	}
+	if _, err := runStep(ctx, c, a, using, vars); err != nil {
 		return err
 	}
 	c.Logf("shipped %s -> %s", local, dest)

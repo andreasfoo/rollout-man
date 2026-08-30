@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"sort"
 	"strings"
 
@@ -138,6 +139,24 @@ var registry = map[string]Action{}
 // on_failure: skip. The runner interprets it as "exclude this case, continue
 // with the next one" rather than aborting the whole run.
 var ErrSkipCase = errors.New("case skipped")
+
+// ExitTempfail is the exit code a command uses to declare "I failed because
+// of the environment, not because of the thing being checked" -- a gateway
+// timeout, a killed subagent, an upstream 500. It bypasses on_failure
+// entirely: a tempfail is not a verdict, so it must never be converted into
+// a skip (which the gate would record as a rejection and cache). RunList
+// returns it as an ordinary hard error instead, and the caller's retry
+// posture (watch re-gates the case on a later poll, a batch run aborts)
+// applies. (First consumer: adapters/acc-quality-audit.sh, whose subagent
+// rides a flaky inference gateway; a hung or 500'd audit cached as
+// "rejected" poisoned three cases before this protocol existed.)
+const ExitTempfail = 75 // EX_TEMPFAIL
+
+// isTempfail reports whether err wraps a command exit with code ExitTempfail.
+func isTempfail(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == ExitTempfail
+}
 
 func register(a Action) { registry[a.Name()] = a }
 
@@ -262,6 +281,12 @@ func RunList(ctx context.Context, c *Ctx, list []config.Action, cmds *cmdrun.Run
 			err = act.Run(ctx, c, a)
 		}
 		if err != nil {
+			// A tempfail bypasses on_failure: it is the environment failing,
+			// not the unit being checked, so recording a verdict (warn/skip)
+			// would cache an outcome the case never earned.
+			if isTempfail(err) {
+				return fmt.Errorf("%s: %w", a.Label(), err)
+			}
 			if a.Warns() {
 				c.Logf("%s: %s failed (on_failure: warn): %v", c.Where(), a.Label(), err)
 				continue

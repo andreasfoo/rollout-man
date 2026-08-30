@@ -35,6 +35,11 @@ type Command struct {
 	// LLM_API_KEY, so which endpoint an adapter like acc-quality-audit.sh
 	// talks to is a submission setting, not something baked into the script.
 	LLMSpec string `yaml:"llm_spec"`
+	// Timeout overrides the document-wide timeout: for this command. A command
+	// like an audit subagent legitimately needs longer than the batch default
+	// (two capped retries must fit), and stretching the default for everything
+	// else just to fit it would weaken the hang guard on every other command.
+	Timeout Duration `yaml:"timeout"`
 }
 
 // UnmarshalYAML rejects keys a command does not have. Plain struct decoding
@@ -47,12 +52,12 @@ func (c *Command) UnmarshalYAML(n *yaml.Node) error {
 	type plain Command
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		switch k := n.Content[i].Value; k {
-		case "run", "script", "uses", "env", "llm_spec":
+		case "run", "script", "uses", "env", "llm_spec", "timeout":
 		case "sha256":
 			return fmt.Errorf("sha256: on a command is no longer used -- remove it")
 		default:
 			return fmt.Errorf("unknown key %q in a command; "+
-				"a command takes run, script, uses, env, llm_spec", k)
+				"a command takes run, script, uses, env, llm_spec, timeout", k)
 		}
 	}
 	return n.Decode((*plain)(c))

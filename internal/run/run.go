@@ -285,19 +285,31 @@ func sortedCmdNames(m map[string]config.Command) []string {
 
 // ------------------------------------------------------------- per_case ---
 
-// gateCacheEntry is one case's outcome from a previous run of per_case, keyed
-// so that it is only ever reused when both the case and the checks are
-// provably the same as when it was recorded.
+// gateStepVerdict is one per_case step's cached outcome. A verdict is reused
+// only when the step's own fingerprint still matches, so editing or adding
+// one step never disturbs the cached verdicts of the steps around it.
+type gateStepVerdict struct {
+	Fingerprint string `json:"fp"`
+	Passed      bool   `json:"ok"`
+}
+
+// gateCacheEntry is one case's outcome from a previous run of per_case, at
+// per-step granularity: each step is only ever reused when both the case and
+// that step's own definition are provably the same as when it was recorded.
 type gateCacheEntry struct {
-	// Fingerprint covers the per_case pipeline config itself (uses:, with:,
-	// on_failure:, and every command it can resolve to, including sha256
-	// pins and inline scripts). A changed check invalidates every entry that
-	// used it, not just the one that happens to be re-hashed by hand.
-	Fingerprint string `json:"fingerprint"`
+	// Steps maps a step's perStepKey (its uses: name) to its verdict. Steps a
+	// gate never reached (it stopped at an earlier rejection) are absent, and
+	// a rejection at step N keeps the cached passes of steps 0..N-1, so a
+	// re-gate after the case is fixed re-runs only from the failing step on.
+	Steps map[string]gateStepVerdict `json:"steps,omitempty"`
 	// Admitted is false when this case was rejected (on_failure: skip) last
 	// time; a rejection is exactly as cacheable as an admission; it is still
 	// the same expensive audit landing on the same answer.
 	Admitted bool `json:"admitted"`
+	// Fingerprint is the legacy whole-pipeline fingerprint (pre per-step
+	// cache). An entry carrying only it has no per-step verdicts to reuse and
+	// is simply re-gated when the case next changes.
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // caseCounter numbers cases as they are gated. The gate can be the slowest
@@ -348,35 +360,57 @@ func (r *Runner) saveGateCache() {
 	}
 }
 
-// perCaseFingerprint hashes everything that changing would make a cached
-// per_case verdict wrong: the step list itself and, for every step that
-// resolves to a configured command, that command's script/uses-file pin.
+// perStepKeys names each per_case step by its uses: -- stable under
+// insertion and reordering, unlike an index, so adding a step never shifts
+// the cached verdicts of the steps around it. A repeated uses: gets a #2/#3
+// suffix so its occurrences stay distinct.
+func perStepKeys(steps []config.Action) []string {
+	seen := map[string]int{}
+	out := make([]string, len(steps))
+	for i, a := range steps {
+		seen[a.Uses]++
+		k := a.Uses
+		if seen[a.Uses] > 1 {
+			k = fmt.Sprintf("%s#%d", a.Uses, seen[a.Uses])
+		}
+		out[i] = k
+	}
+	return out
+}
+
+// perStepFingerprint hashes everything that changing would make one step's
+// cached verdict wrong: the step itself (uses:, with:, on_failure:, fix:) and
+// the command its uses:/fix: resolve to (script or uses-file pin). The
+// executor is part of every step's fingerprint: admission probes run through
+// it, and passing the gate is supposed to prove the whole chain works here,
+// so a verdict reached through one executor says nothing about another.
 // A case's own content is not part of this -- it is folded in separately, per
 // case, via its SHA256.
-func perCaseFingerprint(ex *config.Experiment, cmds map[string]config.Command, executor string) string {
+func perStepFingerprint(a config.Action, ex *config.Experiment, cmds map[string]config.Command, executor string) string {
 	h := sha256.New()
 	enc := json.NewEncoder(h)
-	_ = enc.Encode(ex.Pipeline.PerCase)
-	// The execution chain is part of the verdict. Admission probes run through
-	// the executor, and passing the gate is supposed to prove the whole chain
-	// works here -- so a verdict reached through one executor says nothing
-	// about another. Both the resolved name (--executor can override the
-	// file) and the step itself go in.
+	_ = enc.Encode(a)
 	_ = enc.Encode(executor)
-	seen := map[string]bool{}
-	steps := append([]config.Action{}, ex.Pipeline.PerCase...)
 	if x, err := ex.Pipeline.Executor(); err == nil {
 		_ = enc.Encode(x)
-		steps = append(steps, x)
 	}
-	for _, a := range steps {
-		for _, uses := range []string{a.Uses, a.Fix} {
-			if uses == "" || seen[uses] {
-				continue
-			}
-			seen[uses] = true
-			if cmd, ok := cmds[uses]; ok {
-				_ = enc.Encode(cmd)
+	for _, uses := range []string{a.Uses, a.Fix} {
+		if uses == "" {
+			continue
+		}
+		if cmd, ok := cmds[uses]; ok {
+			_ = enc.Encode(cmd)
+			// A uses: file's config entry names the path, not its bytes --
+			// without the content hash, editing an adapter would leave the
+			// fingerprint unchanged and serve stale verdicts for checks
+			// that no longer exist. (A parser fix to acc-quality-audit
+			// once shipped behind a cached FAIL for exactly this reason.)
+			if cmd.Uses != "" {
+				sum, err := cmdrun.Pin(cmd)
+				if err != nil {
+					sum = "pin-error: " + err.Error()
+				}
+				_ = enc.Encode(sum)
 			}
 		}
 	}
@@ -455,15 +489,19 @@ func (r *Runner) perCase(ctx context.Context) ([]*casesrc.Case, error) {
 // per_case step failing without on_failure: skip.
 func (r *Runner) GateOne(ctx context.Context, raw config.CaseRef) (c *casesrc.Case, admitted bool, err error) {
 	ex := &r.File.Experiment
-	fp := perCaseFingerprint(ex, r.File.Commands.Cmds, r.executorName())
+	steps := ex.Pipeline.PerCase
+	keys := perStepKeys(steps)
+	executor := r.executorName()
 
 	// Run() calls loadGateCache before perCase's goroutines start, so this is
-	// only ever nil for a caller (watch) that never went through Run -- and
-	// watch calls GateOne one case at a time, so this lazy init races with
-	// nothing.
+	// only ever nil for a caller (watch) that never went through Run. Watch
+	// can gate several cases concurrently, so the lazy init takes r.mu --
+	// the same lock that guards every gateCache read/write below.
+	r.mu.Lock()
 	if r.gateCache == nil {
 		r.loadGateCache()
 	}
+	r.mu.Unlock()
 
 	ref := raw.Merge(ex.CaseDefaults)
 	c, err = r.Res.Resolve(ctx, ref)
@@ -474,12 +512,13 @@ func (r *Runner) GateOne(ctx context.Context, raw config.CaseRef) (c *casesrc.Ca
 
 	key := c.SHA256
 	r.mu.Lock()
-	cached, ok := r.gateCache[key]
+	ent := r.gateCache[key]
 	r.mu.Unlock()
-	if ok && cached.Fingerprint == fp && !r.Regate {
-		r.logf("case %s: per_case gate cached (%s)", c.Label,
-			map[bool]string{true: "admitted", false: "rejected"}[cached.Admitted])
-		return c, cached.Admitted, nil
+	// A legacy entry (whole-pipeline fingerprint, no per-step verdicts) has
+	// nothing to reuse; the case is simply re-gated below.
+	verdicts := map[string]gateStepVerdict{}
+	for k, v := range ent.Steps {
+		verdicts[k] = v
 	}
 
 	actx := r.actionCtx(actions.PerCase)
@@ -487,8 +526,60 @@ func (r *Runner) GateOne(ctx context.Context, raw config.CaseRef) (c *casesrc.Ca
 	actx.Probe = func(ctx context.Context, kind string, n int) ([]float64, error) {
 		return r.probe(ctx, c, rexec.AgentKind(kind), n)
 	}
+
 	isAdmitted := true
-	gateErr := actions.RunList(ctx, actx, ex.Pipeline.PerCase, r.Cmds)
+	reused, ran := 0, 0
+	for i, a := range steps {
+		sk := keys[i]
+		sfp := perStepFingerprint(a, ex, r.File.Commands.Cmds, executor)
+		if sv, ok := verdicts[sk]; ok && sv.Fingerprint == sfp && !r.Regate {
+			if !sv.Passed {
+				// A cached rejection short-circuits exactly like a fresh one:
+				// the steps behind it never ran last time either.
+				isAdmitted = false
+				break
+			}
+			reused++
+			continue
+		}
+		ran++
+		stepErr := actions.RunList(ctx, actx, []config.Action{a}, r.Cmds)
+		if stepErr != nil {
+			if !errors.Is(stepErr, actions.ErrSkipCase) {
+				// A hard failure aborts the gate, but the steps that
+				// genuinely completed before it are still worth keeping --
+				// the retry (next watch poll, next run) re-runs only from
+				// the failing step on.
+				r.persistGateVerdicts(key, c, verdicts, isAdmitted)
+				return c, false, stepErr
+			}
+			// A skip caused by the caller's cancellation is not a verdict: the
+			// step died because the process is stopping (e.g. Ctrl-C killing an
+			// audit subagent mid-stream reads as a step failure), not because
+			// the case failed its checks. Caching "rejected" here would poison
+			// the case for every later run -- an interrupted step simply does
+			// not record, so the next run judges it fresh. The steps that
+			// genuinely completed before it are still kept below.
+			if ctx.Err() != nil {
+				r.persistGateVerdicts(key, c, verdicts, isAdmitted)
+				return c, false, ctx.Err()
+			}
+			r.logf("case %s: skipped by per_case check %s (on_failure: skip)", c.Label, sk)
+			verdicts[sk] = gateStepVerdict{Fingerprint: sfp, Passed: false}
+			isAdmitted = false
+			break
+		}
+		verdicts[sk] = gateStepVerdict{Fingerprint: sfp, Passed: true}
+	}
+
+	if ran == 0 {
+		r.logf("case %s: per_case gate cached (%s)", c.Label,
+			map[bool]string{true: "admitted", false: "rejected"}[isAdmitted])
+		return c, isAdmitted, nil
+	}
+	if reused > 0 {
+		r.logf("case %s: per_case gate reused %d cached step(s)", c.Label, reused)
+	}
 
 	// A fix step edits the case in place, so the bytes that will be measured
 	// are not necessarily the bytes that were hashed above. Re-hash before
@@ -502,23 +593,29 @@ func (r *Runner) GateOne(ctx context.Context, raw config.CaseRef) (c *casesrc.Ca
 		c.SHA256 = sha
 	}
 
-	if gateErr != nil {
-		if !errors.Is(gateErr, actions.ErrSkipCase) {
-			return c, false, gateErr
-		}
-		r.logf("case %s: skipped by per_case check (on_failure: skip)", c.Label)
-		isAdmitted = false
-	}
-	entry := gateCacheEntry{Fingerprint: fp, Admitted: isAdmitted}
+	r.persistGateVerdicts(key, c, verdicts, isAdmitted)
+	return c, isAdmitted, nil
+}
+
+// persistGateVerdicts records a case's per-step gate verdicts under both its
+// pre- and post-repair content hashes: the repaired bytes so the next run
+// finds the verdicts without redoing the audit, and the original so restoring
+// the directory does not re-run checks already judged. Verdicts this gate
+// never reached (it stopped at a rejection) but whose cached fingerprint is
+// unchanged stay valid and are carried over.
+func (r *Runner) persistGateVerdicts(key string, c *casesrc.Case, verdicts map[string]gateStepVerdict, admitted bool) {
+	entry := gateCacheEntry{Admitted: admitted, Steps: verdicts}
 	r.mu.Lock()
-	// Under both hashes: the repaired bytes so the next run finds this verdict
-	// without redoing the audit, and the original so restoring the directory
-	// does not re-run a repair that has already been judged.
-	r.gateCache[key] = entry
-	r.gateCache[c.SHA256] = entry
+	for hash, old := range map[string]gateCacheEntry{key: r.gateCache[key], c.SHA256: r.gateCache[c.SHA256]} {
+		for k, v := range old.Steps {
+			if _, ok := entry.Steps[k]; !ok {
+				entry.Steps[k] = v
+			}
+		}
+		r.gateCache[hash] = entry
+	}
 	r.mu.Unlock()
 	r.saveGateCache()
-	return c, isAdmitted, nil
 }
 
 // probe runs an admission probe through the ordinary execution path. Going the
@@ -647,41 +744,118 @@ func (r *Runner) runAll(ctx context.Context, trials []*trial) {
 				return
 			}
 			exec <- struct{}{}
-			r.progress.Step(t.ID, t.Case.Label, r.executorName())
+			r.step(t.ID, t.Case.Label, r.executorName())
 			res := r.attempts(ctx, t)
 			<-exec
 
 			post <- struct{}{}
-			outDir := filepath.Join(r.Dir, "trials", t.ID, "out")
-			if err := r.postTrial(ctx, t, &res, outDir, r.secretsFor(ctx, t)); err != nil {
-				if res.OK() {
-					// A post step that fails on a measured trial is a real
-					// failure: it is what stands between the artifacts and
-					// whoever receives them.
-					code := fail.Of(err)
-					res.Reward = nil
-					res.Code, res.Category, res.Message = code, string(code.Category()), err.Error()
-				} else {
-					r.logf("%s: post-trial steps on a failed trial: %v", t.ID, err)
-				}
-			}
+			r.execTrial(ctx, t, &res)
 			<-post
 
-			r.append(res)
-			r.progress.Finish(t.ID, t.Case.Label, res.OK(), res.Dropped)
-			snap := r.progress.Snapshot()
-			at := fmt.Sprintf("[%d/%d]", snap.Done, snap.Total)
-			switch {
-			case res.OK() && res.Dropped:
-				r.logf("%s %s: reward %.3f (%.1fs, dropped)", at, t.ID, *res.Reward, res.Seconds)
-			case res.OK():
-				r.logf("%s %s: reward %.3f (%.1fs)", at, t.ID, *res.Reward, res.Seconds)
-			default:
-				r.logf("%s %s: %s %s", at, t.ID, res.Code, firstLine(res.Message))
-			}
+			r.reportTrial(t, res)
 		}(t)
 	}
 	wg.Wait()
+}
+
+// RunOneTrial runs a single already-gated case through the matrix's one
+// (agent, trial) combination and its full pipeline.per_trial, recording a
+// results.jsonl row exactly as a full Run() would for the same case. It is
+// how `watch --full` turns "gate passed" into a real, shipped result without
+// waiting for a batch. Refuses a matrix with more than one agent or more
+// than one trial per agent -- "one newly discovered case" only has one sane
+// trial to run.
+func (r *Runner) RunOneTrial(ctx context.Context, c *casesrc.Case) (Result, error) {
+	ex := &r.File.Experiment
+	if len(ex.Matrix.Agents) > 1 {
+		return Result{}, fmt.Errorf("RunOneTrial needs a matrix with exactly one agent, %s declares %d",
+			ex.Name, len(ex.Matrix.Agents))
+	}
+	for _, a := range ex.Matrix.Agents {
+		if n := a.Rollouts(ex.Matrix.Trials); n != 1 {
+			return Result{}, fmt.Errorf("RunOneTrial needs a matrix of one trial per agent, %s declares %d for %s",
+				ex.Name, n, a.Name)
+		}
+	}
+	trials := expand(ex, []*casesrc.Case{c})
+	if len(trials) != 1 {
+		return Result{}, fmt.Errorf("RunOneTrial: matrix expanded to %d trials for case %s", len(trials), c.Label)
+	}
+	t := trials[0]
+	r.loadDoneOnce()
+	if r.done[t.ID] {
+		return Result{}, fmt.Errorf("RunOneTrial: trial %s is already recorded in %s", t.ID, r.resultsPath())
+	}
+	r.step(t.ID, t.Case.Label, r.executorName())
+	res := r.attempts(ctx, t)
+	r.execTrial(ctx, t, &res)
+	r.reportTrial(t, res)
+	return res, nil
+}
+
+// loadDoneOnce loads results.jsonl the first time it is asked about. Run()
+// calls loadDone before any trial starts; RunOneTrial -- reached through
+// watch, outside Run's lifecycle -- needs the same "already recorded" answer
+// before it appends, and needs it exactly once.
+func (r *Runner) loadDoneOnce() {
+	if r.done != nil {
+		return
+	}
+	if err := r.loadDone(); err != nil {
+		// A results.jsonl that cannot be read is treated as an empty one, the
+		// same posture Run() takes through append: the run directory is not a
+		// protocol, it is a record.
+		r.done = map[string]bool{}
+	}
+}
+
+// execTrial runs everything in per_trial after the executor: scrub, guard,
+// pack, materialize, ship -- whatever the submission asked for. It is where a
+// trial stops being a number and becomes an artifact somebody else can read.
+func (r *Runner) execTrial(ctx context.Context, t *trial, res *Result) {
+	outDir := filepath.Join(r.Dir, "trials", t.ID, "out")
+	if err := r.postTrial(ctx, t, res, outDir, r.secretsFor(ctx, t)); err != nil {
+		if res.OK() {
+			// A post step that fails on a measured trial is a real
+			// failure: it is what stands between the artifacts and
+			// whoever receives them.
+			code := fail.Of(err)
+			res.Reward = nil
+			res.Code, res.Category, res.Message = code, string(code.Category()), err.Error()
+		} else {
+			r.logf("%s: post-trial steps on a failed trial: %v", t.ID, err)
+		}
+	}
+}
+
+// reportTrial records the result and says so. progress is nil for a trial run
+// outside Run()'s lifecycle (watch's RunOneTrial): watch keeps its own record
+// of what it has seen, and a one-trial progress.json is not something anyone
+// reads.
+func (r *Runner) reportTrial(t *trial, res Result) {
+	r.append(res)
+	at := ""
+	if r.progress != nil {
+		r.progress.Finish(t.ID, t.Case.Label, res.OK(), res.Dropped)
+		snap := r.progress.Snapshot()
+		at = fmt.Sprintf("[%d/%d] ", snap.Done, snap.Total)
+	}
+	switch {
+	case res.OK() && res.Dropped:
+		r.logf("%s%s: reward %.3f (%.1fs, dropped)", at, t.ID, *res.Reward, res.Seconds)
+	case res.OK():
+		r.logf("%s%s: reward %.3f (%.1fs)", at, t.ID, *res.Reward, res.Seconds)
+	default:
+		r.logf("%s%s: %s %s", at, t.ID, res.Code, firstLine(res.Message))
+	}
+}
+
+// step says what a trial is doing right now. progress is nil outside Run()'s
+// lifecycle; see reportTrial.
+func (r *Runner) step(trialID, caseLabel, step string) {
+	if r.progress != nil {
+		r.progress.Step(trialID, caseLabel, step)
+	}
 }
 
 // secretsFor re-resolves the values that must not survive into an artifact.
@@ -766,8 +940,9 @@ func (r *Runner) postTrial(ctx context.Context, t *trial, res *Result, outDir st
 		return nil
 	}
 	c := r.actionCtx(actions.PerTrial)
+	c.CaseLabel, c.CaseDir, c.CaseSHA = t.Case.Label, t.Case.Dir, t.Case.SHA256
 	c.Secrets = secrets
-	c.Enter = func(step string) { r.progress.Step(t.ID, t.Case.Label, step) }
+	c.Enter = func(step string) { r.step(t.ID, t.Case.Label, step) }
 	c.Trial = &actions.Trial{
 		ID: t.ID, Case: t.Case.Label, CaseSHA: t.Case.SHA256, Agent: t.Agent,
 		LLMSpec: t.LLMSpec, Index: t.Index, Reward: res.Reward, Code: string(res.Code),

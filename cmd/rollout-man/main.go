@@ -71,11 +71,16 @@ func usage() {
          resolve every case and print its content hash.
 
   watch  <dir> <file.yaml> [--interval 15s] [--runs DIR] [--commands FILE]
+         [--full]
          poll <dir> for case subdirectories (each with its own task.toml).
          A new one is gated through <file.yaml>'s pipeline.per_case (quality
          audit, admission, ...) automatically; per_experiment (ship) never
          runs. A case that already ran and then changes is only reported --
          re-gate it yourself with the same command once you're ready.
+         With --full, a case that passes the gate is also run through the
+         file's per_trial pipeline (in the background, bounded by its
+         concurrency:) -- one trial per admitted case, recorded in the run
+         directory's results.jsonl as if a run had produced it.
 `)
 	os.Exit(2)
 }

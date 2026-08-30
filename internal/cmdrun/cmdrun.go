@@ -120,7 +120,15 @@ func (r *Runner) RunOnce(ctx context.Context, name string, vars map[string]strin
 		return Result{}, fmt.Errorf("command %q is not configured", name)
 	}
 	if timeout <= 0 {
-		timeout = r.Timeout
+		// A command's own timeout: beats the document-wide default -- two
+		// capped audit retries must fit inside it, which the default 30m
+		// did not (the adapter was killed mid-retry and the infra failure
+		// was cached as a case rejection).
+		if t := c.Timeout.D(); t > 0 {
+			timeout = t
+		} else {
+			timeout = r.Timeout
+		}
 	}
 	return r.once(ctx, name, c, vars, timeout)
 }
