@@ -7,12 +7,15 @@ package redact
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"io"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -23,6 +26,14 @@ const (
 	Distributable Class = "distributable"
 	// Debug stays for troubleshooting: the various logs.
 	Debug Class = "debug"
+	// Task is case content copied into the trial dir for shipping (OUT_DIR/case):
+	// the author's Dockerfiles, changelogs, oracle binaries. Only exact runner
+	// secrets are scrubbed there -- pattern/IP rules exist for runtime-produced
+	// artifacts (trajectories, logs), and running them over source material
+	// rewrites version numbers (ch-base:26.3.12.3 became a broken FROM line on
+	// HF) and corrupts binaries (an 88MB oracle ELF lost its planted
+	// DEDUP_TOKEN string to the "token[:=]" pattern).
+	Task Class = "task"
 )
 
 const (
@@ -40,10 +51,19 @@ var patterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(tempauth|authkey|sig|signature|x-amz-signature|x-amz-credential|access_token)=[^&\s"']+`),
 }
 
-var (
-	ipv4 = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
-	ipv6 = regexp.MustCompile(`\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b`)
-)
+// IP detection delegates "is this an address" to the stdlib: candidate
+// tokens are maximal runs of address characters, then netip.ParseAddr /
+// ParseAddrPort decide. No hand-rolled octet regex -- the old one ate
+// version numbers for breakfast (libtool 2.4.2.418 in a changelog, a
+// ch-base:26.3.12.3 image tag in a Dockerfile). Version strings now survive
+// for free: they are not parseable addresses.
+
+// isIPTokChar reports whether c can appear inside an IP-looking token.
+// Hex letters are included for IPv6; '%' for zones; ':' for v6 and ports.
+func isIPTokChar(c byte) bool {
+	return c == '.' || c == ':' || c == '%' ||
+		(c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
 
 type Hits struct {
 	Exact   int `json:"exact"`
@@ -100,8 +120,29 @@ func variants(s string) []string {
 	}
 }
 
+// isBinary sniffs the first 8KB for a NUL byte, like grep -I. Binary files
+// are never rewritten: a mask is a different length than the bytes it
+// replaces, so any hit would corrupt offsets and checksums -- a Roboto TTF
+// lost 24 bytes to "IPs" that were font tables, and an oracle ELF shrank by
+// the length of its planted DEDUP_TOKEN string. A real runner secret inside
+// a binary is accepted as a leak risk: case binaries are oracle artifacts,
+// and silently corrupting them is the worse failure.
+func isBinary(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var buf [8192]byte
+	n, _ := f.Read(buf[:])
+	return bytes.IndexByte(buf[:n], 0) >= 0
+}
+
 // ScrubFile rewrites path in place and reports what was hit.
 func (s *Redactor) ScrubFile(path string, class Class) (Hits, error) {
+	if isBinary(path) {
+		return Hits{}, nil
+	}
 	in, err := os.Open(path)
 	if err != nil {
 		return Hits{}, err
@@ -180,20 +221,75 @@ func (s *Redactor) scrubExact(line string) (string, Hits) {
 
 func (s *Redactor) scrubPatterns(line string, class Class) (string, Hits) {
 	var h Hits
+	// Task content is the case author's source material: only exact runner
+	// secrets (handled by scrubExact) may be rewritten there. Pattern and IP
+	// rules exist for artifacts the RUN produced (trajectories, logs).
+	if class == Task {
+		return line, h
+	}
 	all := append(append([]*regexp.Regexp{}, patterns...), s.extra...)
 	for _, re := range all {
 		line = re.ReplaceAllStringFunc(line, func(m string) string { h.Pattern++; return keyMask })
 	}
 	if s.RedactIPs[class] {
-		repl := func(m string) string {
-			if s.ipAllow[m] {
-				return m
-			}
-			h.IP++
-			return ipMask
-		}
-		line = ipv4.ReplaceAllStringFunc(line, repl)
-		line = ipv6.ReplaceAllStringFunc(line, repl)
+		line = s.scrubIPs(line, &h)
 	}
 	return line, h
+}
+
+// scrubIPs masks tokens the stdlib validates as IP addresses. A token that
+// fails ParseAddr and ParseAddrPort is not an address and is left alone --
+// that is the whole fix for version strings: "2.4.2.418" (418 > 255),
+// "1.26.3.12.3" (five parts) and the "e:26.3.12.3" fragment of an image tag
+// all fail to parse, so changelogs and Dockerfiles keep their versions
+// while "dial 10.0.0.9:8080" still loses the address.
+func (s *Redactor) scrubIPs(line string, h *Hits) string {
+	var b strings.Builder
+	pos := 0
+	i := 0
+	for i < len(line) {
+		if !isIPTokChar(line[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(line) && isIPTokChar(line[j]) {
+			j++
+		}
+		// Trailing punctuation ("routed to 10.0.0.9.") is not part of the
+		// address; trim it before asking the parser.
+		tok := strings.TrimRight(line[i:j], ".:")
+		if rep, ok := s.maskIP(tok, h); ok {
+			b.WriteString(line[pos:i])
+			b.WriteString(rep)
+			pos = i + len(tok)
+		}
+		i = j
+	}
+	b.WriteString(line[pos:])
+	return b.String()
+}
+
+// maskIP returns the replacement for tok when tok is a non-allowlisted
+// address. AddrPort keeps the ":port" suffix readable -- only the address
+// is sensitive.
+func (s *Redactor) maskIP(tok string, h *Hits) (string, bool) {
+	if !strings.ContainsAny(tok, ".:") {
+		return "", false // a plain number or hex word is never an address
+	}
+	if a, err := netip.ParseAddr(tok); err == nil {
+		if s.ipAllow[a.String()] {
+			return "", false
+		}
+		h.IP++
+		return ipMask, true
+	}
+	if ap, err := netip.ParseAddrPort(tok); err == nil {
+		if s.ipAllow[ap.Addr().String()] {
+			return "", false
+		}
+		h.IP++
+		return ipMask + ":" + strconv.Itoa(int(ap.Port())), true
+	}
+	return "", false
 }
