@@ -1,0 +1,31 @@
+# Bug-location smoke: one case through the new buglocation action.
+# Verifies the full chain -- action -> command -> llm_spec env -> adapter ->
+# subagent -> schema-validated JSON -- before running all 63.
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: buglocation-smoke
+
+case_defaults:
+  source: local
+
+cases:
+  # allegro5: admission trajectory exists under jobs/, small image-addon case.
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/allegro5-477bf8b-commit-3f2dbd4-t4
+
+matrix:
+  agents:
+    - name: nop
+  trials: 1
+
+pipeline:
+  per_case:
+    - uses: buglocation
+      with: {using: buglocate_kimi}
+  per_trial: []
+  per_experiment: []

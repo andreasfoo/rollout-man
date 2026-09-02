@@ -22,6 +22,7 @@ import (
 	rexec "github.com/andreasfoo/rollout-man/internal/exec"
 	"github.com/andreasfoo/rollout-man/internal/fail"
 	"github.com/andreasfoo/rollout-man/internal/progress"
+	"github.com/andreasfoo/rollout-man/internal/redact"
 	"github.com/andreasfoo/rollout-man/internal/run"
 )
 
@@ -45,6 +46,8 @@ func main() {
 		os.Exit(cmdCases(os.Args[2:]))
 	case "watch":
 		os.Exit(cmdWatch(os.Args[2:]))
+	case "redact-audit":
+		os.Exit(cmdRedactAudit(os.Args[2:]))
 	default:
 		usage()
 	}
@@ -81,6 +84,14 @@ func usage() {
          file's per_trial pipeline (in the background, bounded by its
          concurrency:) -- one trial per admitted case, recorded in the run
          directory's results.jsonl as if a run had produced it.
+
+  redact-audit <dir> [--secret VALUE]...
+         two-way redact check over real artifacts: scrub every text file
+         twice -- full pattern/IP rules vs exact secrets only -- and print
+         every line where the two differ. A difference is a mask location no
+         known secret covers: a false positive to fix, or a policy-class hit
+         (any IP address) to review. Secrets default to ANTHROPIC_AUTH_TOKEN
+         and ANTHROPIC_BASE_URL from the environment.
 `)
 	os.Exit(2)
 }
@@ -140,7 +151,16 @@ func build(f *config.File, executor, commandsFile string) (*cmdrun.Runner, rexec
 		if err != nil {
 			return nil, nil, err
 		}
+		// A rollout step delegates to the command its using: names; the
+		// executor is that command, not "rollout" itself.
 		selected = a.Uses
+		if selected == "rollout" {
+			selected = a.Str("using", "")
+			if selected == "" {
+				return nil, nil, fmt.Errorf(
+					"pipeline.per_trial[0] (rollout): using: is required -- it names the trial command")
+			}
+		}
 	}
 	ex, err := pick(selected, cmds)
 	return cmds, ex, err
@@ -528,4 +548,43 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+type strsFlag []string
+
+func (s *strsFlag) String() string { return strings.Join(*s, ",") }
+func (s *strsFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
+// cmdRedactAudit runs the two-way redact check over real artifacts: full
+// rules vs exact secrets only, reporting every line where they diverge.
+func cmdRedactAudit(args []string) int {
+	fs := flag.NewFlagSet("redact-audit", flag.ExitOnError)
+	var secrets strsFlag
+	fs.Var(&secrets, "secret", "exact secret value (repeatable); default: ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL from the environment")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		usage()
+	}
+	sec := []string(secrets)
+	if len(sec) == 0 {
+		for _, e := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"} {
+			if v := os.Getenv(e); v != "" {
+				sec = append(sec, v)
+			}
+		}
+	}
+	rep, err := redact.Audit(fs.Arg(0), sec, 3)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	for _, d := range rep.Samples {
+		fmt.Printf("%s:%d [%s]\n  full : %.160s\n  exact: %.160s\n", d.Path, d.Line, d.Class, d.Full, d.Exact)
+	}
+	fmt.Printf("scanned=%d divergent-files=%d (divergence = a mask location no exact secret covers; IP masks are the intended policy class)\n",
+		rep.Scanned, rep.DivergentFiles)
+	return 0
 }

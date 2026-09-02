@@ -25,6 +25,8 @@ func init() {
 	register(archiveAction{})
 	register(datasetAction{})
 	register(shipAction{})
+	register(rolloutAction{})
+	register(buglocationAction{})
 	register(checkCaseAction{})
 	register(reportAction{})
 	register(shipGitHubAction{})
@@ -124,16 +126,12 @@ func (redactAction) Validate(a config.Action) error {
 	return nil
 }
 
-// distributable names the artifacts that leave the team. Addresses are scrubbed
-// from those and kept in the rest: what ships and what you debug with want
-// opposite things. Case content under OUT_DIR/case (the author's Dockerfiles,
-// changelogs, oracle binaries) is a third tier: only exact runner secrets may
-// be rewritten there -- pattern/IP rules on source material rewrote version
-// numbers and corrupted binaries on HF (2026-08-28).
-var distributable = map[string]redact.Class{
-	"traj.jsonl":  redact.Distributable,
-	"result.json": redact.Distributable,
-}
+// The tiering (Task/Distributable/Debug per OUT_DIR-relative path) lives in
+// redact.ClassifyPath so the two-way audit classifies identically.
+// Addresses are scrubbed from the distributable tier per the submission's
+// ips: flags; case content is exact-secrets-only because pattern/IP rules on
+// source material rewrote version numbers and corrupted binaries on HF
+// (2026-08-28).
 
 func (redactAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 	if _, err := os.Stat(c.Trial.OutDir); err != nil {
@@ -161,16 +159,7 @@ func (redactAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 			return nil
 		}
 		rel, _ := filepath.Rel(c.Trial.OutDir, p)
-		class := redact.Debug
-		switch {
-		case rel == "case" || strings.HasPrefix(rel, "case"+string(filepath.Separator)):
-			class = redact.Task
-		default:
-			if cl, ok := distributable[d.Name()]; ok {
-				class = cl
-			}
-		}
-		h, serr := s.ScrubFile(p, class)
+		h, serr := s.ScrubFile(p, redact.ClassifyPath(rel))
 		if serr != nil {
 			return fail.Wrap(fail.RedactFailed, "scrub "+rel, serr)
 		}
@@ -613,13 +602,115 @@ func expandStepOutputs(s string, c *Ctx) string {
 	})
 }
 
+// --------------------------------------------------------------- rollout ---
+
+// rollout is the step that runs the agent. It sits in the executor slot --
+// first in per_trial -- and delegates the actual run to a configured command
+// named by using:, exactly as ship delegates publishing.
+//
+// The point of the built-in (over a bare `uses: <command>`) is the env
+// contract: the executor machinery already feeds CASE_DIR / OUT_DIR / WORK_DIR
+// / TRIAL_ID / AGENT_KIND / AGENT_NAME plus the task.toml limits to the
+// trial command and reads back $OUT_DIR/reward.txt or failure.txt. A bare
+// command step gets CaseDir/OutDir too, but not the limits or the agent
+// identity -- and nothing stops it being placed second in the list, after the
+// trial it was supposed to produce. Naming it makes both mistakes load errors.
+//
+// The command it names is still an ordinary adapter: harbor (a fresh run of
+// the case), or a campaign adapter like kimi3_rollout (same harbor, agent
+// config pinned by the command's env) -- the action is the vocabulary, the
+// command is the wiring.
+type rolloutAction struct{}
+
+func (rolloutAction) Name() string    { return "rollout" }
+func (rolloutAction) Scopes() []Scope { return []Scope{PerTrial} }
+
+func (rolloutAction) Validate(a config.Action) error {
+	if err := unknown(a, "using"); err != nil {
+		return err
+	}
+	if a.Str("using", "") == "" {
+		return fmt.Errorf("using: is required -- it names the command that runs the trial")
+	}
+	return nil
+}
+
+func (rolloutAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
+	using := expand(a.Str("using", ""), c)
+	if !c.Cmds.Has(using) {
+		return fmt.Errorf("no command named %q is configured", using)
+	}
+	vars := map[string]string{
+		"Experiment": c.Experiment, "RunId": c.RunID, "RunDir": c.RunDir,
+		"TrialId": c.Trial.ID, "OutDir": c.Trial.OutDir,
+		"LocalPath": c.Trial.OutDir,
+		"CaseDir":   c.CaseDir, "CaseLabel": c.CaseLabel, "CaseSha": c.CaseSHA,
+	}
+	for k, v := range a.With {
+		if s, ok := v.(string); ok {
+			vars[camel(k)] = expandStepOutputs(s, c)
+		}
+	}
+	if _, err := runStep(ctx, c, a, using, vars); err != nil {
+		return err
+	}
+	c.Logf("%s: rollout via %s", c.Where(), using)
+	return nil
+}
+
+// ------------------------------------------------------------ buglocation ---
+//
+// Per-case bug localization: `uses: buglocation / with: {using: <command>}`.
+// Produces the corpus-standard solution/bug_location.json ({task, entrypoint,
+// critical_code, root_cause, cwe} -- see batch4's 31 shipped files and
+// tc_week1.py's REQUIRED_CASE_PATHS) without touching the case directory:
+// watch content-hashes the case tree, and solution/ is inside that hash, so
+// the adapter writes to $RUN_DIR/buglocation/<case>.json and shipping into
+// the HF task tree is a separate explicit step. Like rollout, the action is
+// vocabulary and the command is wiring (which endpoint, which model).
+type buglocationAction struct{}
+
+func (buglocationAction) Name() string    { return "buglocation" }
+func (buglocationAction) Scopes() []Scope { return []Scope{PerCase} }
+
+func (buglocationAction) Validate(a config.Action) error {
+	if err := unknown(a, "using"); err != nil {
+		return err
+	}
+	if a.Str("using", "") == "" {
+		return fmt.Errorf("using: is required -- it names the command that writes the bug-location report")
+	}
+	return nil
+}
+
+func (buglocationAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
+	using := expand(a.Str("using", ""), c)
+	if !c.Cmds.Has(using) {
+		return fmt.Errorf("no command named %q is configured", using)
+	}
+	vars := map[string]string{
+		"Experiment": c.Experiment, "RunId": c.RunID, "RunDir": c.RunDir,
+		"WorkDir":   filepath.Join(c.RunDir, "work"),
+		"CaseDir":   c.CaseDir, "CaseLabel": c.CaseLabel, "CaseSha": c.CaseSHA,
+	}
+	for k, v := range a.With {
+		if s, ok := v.(string); ok {
+			vars[camel(k)] = expandStepOutputs(s, c)
+		}
+	}
+	if _, err := runStep(ctx, c, a, using, vars); err != nil {
+		return err
+	}
+	c.Logf("%s: buglocation via %s", c.Where(), using)
+	return nil
+}
+
 // --------------------------------------------------------------- command ---
 
 // command is the fallback: `uses:` that names a configured command rather than
 // a built-in. This is how a custom step is written, and it is deliberately the
 // same machinery -- pin, env allowlist, timeout -- as every other command.
 type command struct{ cmd string }
-
 func (c command) Name() string { return c.cmd }
 func (command) Scopes() []Scope {
 	return []Scope{PerCase, PerTrial, PerExperiment}
