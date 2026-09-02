@@ -166,6 +166,29 @@ check_traj_layout:
   uses: adapters/check-traj-layout.sh
   env: [PATH, HOME]
 
+# Hard gate: no CJK text in any file this trial is about to ship. Two-tier
+# (2026-08-31): a cheap codepoint scan first, then a deterministic gb2312
+# check (>=2 common-Chinese chars = real Chinese, blocked model-free,
+# 2026-09-01) with fasttext lid.176 adjudicating only single/rare-codepoint
+# runs -- a raw disassembly dump whose bytes decode to CJK glyphs passes,
+# real Chinese still blocks. Ported from commands.yaml because this
+# experiment carries its command defs inline (no --commands). Without it,
+# watch --full shipped short-run Chinese (spidermonkey-81ef425 "几十") to HF.
+# TRAJ_DIR comes from the step's with:.
+check_no_chinese_traj:
+  uses: adapters/check-no-chinese-traj.sh
+  env: [PATH, HOME]
+
+# Hard gate: no API-failure shapes in the trajectory's stream-json
+# transcripts (2026-08-31). A trial whose claude CLI retried through
+# 429s/overloads can still "succeed" and then ship a poisoned/truncated
+# transcript; this parses the transcripts and fails on api-error events or a
+# claude-code.txt with no result event. Ship-side backstop. TRAJ_DIR comes
+# from the step's with:.
+check_no_api_error_traj:
+  uses: adapters/check-no-api-error-traj.sh
+  env: [PATH, HOME]
+
 harbor:
   uses: adapters/harbor.sh
   env: [DOCKER_HOST, PATH, HOME]
@@ -204,6 +227,17 @@ ship_week2_trajectories:
   uses: adapters/ship-hf-week2-trajectories.sh
   env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
         ROLLOUT_MAN_SHIP_HF_ADAPTER]
+
+# Bug localization per accepted case (2026-08-31). kimi-k3 per user
+# direction -- deliberately NOT the quality-audit spec: this is a different
+# task (structured localization vs 11-point audit) and k3 completed it fine
+# in the 2026-08-31 allegro5 smoke (correct function/lines/fix-commit/CWE).
+buglocate_kimi:
+  uses: adapters/buglocation.sh
+  # Two 20m subagent attempts + 90s preflight, same envelope as check_quality.
+  timeout: 45m
+  llm_spec: buglocation-llm
+  env: [PATH, HOME, LLM_BASE_URL, LLM_MODEL, LLM_API_KEY]
 ---
 # The audit/fix subagents' endpoint (check_quality, fix_quality_audit).
 # Same spec tc-batch1 declares: the local tingly gateway fronting kimi-k3.
@@ -217,6 +251,15 @@ name: quality-audit-llm
 provider: anthropic
 base_url: http://localhost:12584/tingly/anthropic
 model: kimi-k2.7-code
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+# Bug localization endpoint (2026-08-31). kimi-k3 per user direction; the
+# 2026-08-31 allegro5 smoke completed cleanly in one pass.
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
 api_key_env: ANTHROPIC_AUTH_TOKEN
 ---
 kind: Experiment
@@ -292,14 +335,26 @@ pipeline:
     #    on_failure: skip drops the case rather than aborting the whole run.
     - uses: check_traj_layout
       on_failure: skip
+    # 5. bug localization (2026-08-31) -- RUN_DIR/buglocation/<case>.json in
+    #    the corpus-standard solution/bug_location.json shape. Never writes
+    #    into the case dir (solution/ is inside the watch content hash).
+    #    kimi-k3, per user direction; uses the case's own admission
+    #    trajectory as evidence. on_failure: skip -- a localization failure
+    #    must not re-gate or block admission of a good case.
+    - uses: buglocation
+      with: {using: buglocate_kimi}
+      on_failure: skip
 
   per_trial:
     - uses: forge_flow_fuzz_mock
 
-    # Mock always writes 0.0 but guard stays for structural consistency.
+    # No reward filter: for rollout collection every completed attempt is
+    # useful data -- even a 1.0 is a good trajectory. Only require_measured
+    # stays, so an infra-killed (unscored) trial never ships. (Mock always
+    # writes 0.0, but watch --full runs the real forge_flow_fuzz.)
     - uses: guard
-      name: terminal-acc-only
-      with: {max_reward_exclusive: 0.6, require_measured: true}
+      name: measured-only
+      with: {require_measured: true}
       on_violation: drop
 
     - uses: redact
@@ -309,6 +364,21 @@ pipeline:
     # trials never wrote OUT_DIR/case, so the step exits 0 and there is
     # nothing to ship.
     - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship (2026-09-01). skip =
+    # this trial's ship step is skipped; the CJK-bearing trajectory stays in
+    # OUT_DIR for manual triage. Without this, watch --full shipped short-run
+    # Chinese to HF (spidermonkey-81ef425 "几十").
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree: a trial that fought through
+    # 429s/overloads "succeeds" with a poisoned/truncated transcript -- skip
+    # its ship.
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
 
     # Single atomic HF commit: task/week2 + trajectory in one push, scoped to
     # the shared materialized/ parent of this trial's two trees.

@@ -1,0 +1,186 @@
+# kimi-k3 trajectory campaign for tc_batch2 (2026-08-31).
+#
+# 63 accepted cases x 3 fresh kimi-k3 rollouts each. The product is the
+# TRAJECTORY (agent attempts against already-admitted tasks), not a new gate:
+# no check_quality / admission / check_traj_layout here -- the cases are
+# unchanged on disk and were admitted hours ago; re-running those would only
+# burn a kimi audit budget per case before the campaign even starts.
+#
+# Agent wiring: adapters/kimi3-rollout.sh runs `harbor run -c agent-kimi3.yaml`
+# -- the same ClaudeCodeThirdParty -> kimi-k3 tingly-proxy agent the factory's
+# gen trials use (single source of truth for model/key/egress). Cases are
+# tar-snapshotted so nothing writes into the watched tc_batch2 tree.
+#
+# Ship: trajectories ONLY (trajectory/<case>/jobs/...), per trial, via
+# materialize_week2_trial + ship_week2_trajectories -- task/week2 already
+# holds all 63. materialize sanitizes + leak-gates every shipped file (IPs,
+# proxy URL, keys), and check_no_chinese_traj blocks any CJK content from the
+# freshly generated agent output before it can ship. Both are hard gates.
+# Every completed rollout ships regardless of reward (2026-08-31 policy).
+#
+# New-path-only HF writes: each ship appends under
+# trajectory/<case>/jobs/<new-stamp>/<new-trial-name>/ -- timestamps and
+# harbor's random trial suffixes make collisions with existing HF content
+# impossible; no existing file is ever overwritten.
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   ./rollout-man run experiments/tc-batch2-kimi3-x3.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts,
+# NOT the quality-audit k2.7-code spec.
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch2-kimi3-x3
+
+case_defaults:
+  source: local
+
+# The 63 accepted cases (jobs/ staged, admitted+shipped on HF batch2) as of
+# 2026-08-31 10:30. Generated; keep in sync if the accepted set changes.
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/allegro5-477bf8b-commit-3f2dbd4-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/aria2-442e460-commit-570bc24-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/bind9-891c50a-commit-921043b-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-166a63c-issue-48343-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-2165cc1-issue-64543-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-a22b95a-issue-98523-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-ce552bd-issue-103630-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/clickhouse-e9a9df4-issue-78299-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/dnsdist-4becceb-commit-76a72b6-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/dnsmasq-5b99eae-commit-a90f09db-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/dnsmasq-982faf4-commit-04b0ac0-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/dovecot-d344c33-commit-b012cfb3-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/dropbear-d35cf53-commit-e40e93f-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/duckdb-097ce70-issue-7348-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/duckdb-8dabba981e-issue-21623-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/exiv2-3b9fcb4-issue-2178-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/exiv2-a14510a-issue-3443-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/f2fs-d87fc37-commit-b79c3ba-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/gecko-278da6f-bug-877523-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/gecko-31e2eff-commit-47c65d8-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/gnuplot-71bfce2-commit-08629c0-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/gstreamer-55efff3-commit-51deb71-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/gstreamer-763d2bb-commit-b268b27-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/lighttpd-a2cc330-commit-df8e4f9-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/lighttpd-f2b33e7-commit-c42b280-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/mariadb-eb41c11-commit-7741065-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/mattermost-7201f42-commit-1346cf5-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/memcached-f352f0e-commit-838fda3-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/mnn-0614272-commit-1eaa7a6-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nbd-ec9d483-commit-6b02564-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/net_snmp-f797268-commit-f3e807-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-2620992-commit-fc17c0a-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-577512f-commit-dd038bf-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-5de2c7a-commit-92a56d0-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nghttp2-a152c63-commit-e66bd49-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nginx-31620d1-commit-b19bc2e-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nginx-61690b5-commit-66fde99-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/nginx-6446f99-commit-bcb41c9-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/ocserv-8aa1022-commit-7709744-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/rizin-d7e7bae-commit-b8213b0-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/rsyslog-492c929-commit-7900d93-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/rsyslog-5e019ed-commit-80be65d-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-312da26-commit-d9e1036-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-d04899f-commit-1c5c3b1-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/sdl-ea97ab6-commit-50f969c-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-471019c-bug-2013573-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-5644818-bug-1238935-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-56bf35a-bug-1985765-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-5ee29af-bug-746103-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-685230b-bug-2013543-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-81ef425-bug-2027357-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-a76a888-bug-1744663-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/spidermonkey-c27183f-bug-1966549-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/squid-06a5d8-commit-06a5d871-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/squid-8617e9-commit-8617e90a-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/squid-8d77a37-commit-4bddcf0-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-2dbe1dc-commit-58c7b79-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-62ba7ba-commit-3bb5a4b-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-797c04f-commit-d529082-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-bc0daf9-commit-dd0ac81-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tarantool-d8a352b-commit-51d0a9b-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/tcpdump-0dd0132-commit-80deba1-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/unbound-5eb362a-commit-a05d460-t4
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 3
+
+# 63 cases x 3 trials = 189 harbor runs, each up to agent timeout (3600s for
+# 59 cases, 2400s for 4) + verifier + docker overhead. 6 concurrent keeps
+# ~6 docker compose stacks live -- the host ran 4 factory slots plus audits
+# comfortably, and has 128 cores / 500G. max_attempts 2 (Commands) retries
+# HOST_ERROR-class failures (proxy hiccups) once at the command layer.
+# 2026-09-02 wave 4 (15 re-rolls): raised 6 -> 12. Wave-3 observed ~10-15G
+# per stack, so 12 stacks fit in the 400G headroom, and the relaxed
+# API-error gate + max_attempts absorb the extra proxy 429 pressure. Not
+# used for a full 189-trial campaign -- proxy throughput is the real cap
+# there; fine for a 15-trial mop-up.
+concurrency: 12
+max_attempts: 2
+
+pipeline:
+  # Buglocation is one kimi-k3 subagent call per case; serial gating made the
+  # 2026-08-31 resume spend ~2h redoing uncached localizations before a single
+  # trial could start. The proxy already serves 6 concurrent rollouts.
+  per_case_concurrency: 4
+  # Per-case bug localization (2026-08-31): writes RUN_DIR/buglocation/<case>.json
+  # in the corpus-standard solution/bug_location.json shape. Does NOT write into
+  # the case dir -- watch content-hashes solution/ and would re-gate. on_failure:
+  # skip: a localization failure skips this case's trials' ship steps, but the
+  # rollout trajectories still record.
+  per_case:
+    - uses: buglocation
+      with: {using: buglocate_kimi}
+      on_failure: skip
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # 2026-08-31 policy change: NO reward filter. All 63 cases ship here are
+    # already admitted, and the campaign's product is the kimi-k3 attempt
+    # itself -- every completed rollout ships, whatever its reward. (The
+    # admission-time accepted trajectory is already on HF; these 3 extras
+    # per case are the new data.)
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Trajectory-only materialization + sanitization + leak gate. The task
+    # tree is also rebuilt inside the trial OUT_DIR (harmless, unpublished).
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship. skip = this trial's
+    # ship step is skipped (a skipped trial cannot ship); the CJK-bearing
+    # trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree (2026-08-31): a trial that
+    # fought through 429s/overloads "succeeds" with a poisoned or truncated
+    # transcript -- skip its ship. The executor-level hook in
+    # kimi3-rollout.sh already RE-RUNS such trials under max_attempts; this
+    # gate catches anything that still slips through (e.g. attempts
+    # exhausted) and keeps it off the dataset.
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
+        dest: tinglydev/cyber-xianjin
+
+  per_experiment:
+    - uses: record_progress

@@ -108,6 +108,9 @@ concurrency: 4
 max_attempts: 1
 
 pipeline:
+  # per_case steps (audit, buglocation) are independent per case -- run
+  # them 3 at a time instead of serially.
+  per_case_concurrency: 3
   concurrency: 2
   per_case:
     # 0. reject an oversized case (packaging mistake) before it ever reaches

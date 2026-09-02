@@ -45,10 +45,23 @@ var patterns = []*regexp.Regexp{
 	regexp.MustCompile(`sk-[A-Za-z0-9_\-]{16,}`),
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
 	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{20,}`),
-	regexp.MustCompile(`(?i)(authorization|x-api-key|api[_-]?key|token)\s*[:=]\s*["']?[A-Za-z0-9._\-]{12,}["']?`),
+	// Quoted value after a credential-ish key (JSON/YAML/config dumps):
+	//   "ANTHROPIC_API_KEY": "sk-..."   api_key = 'abc123...'
+	// The opening quote is required: an unquoted lowercase assignment is
+	// ordinary code, not a credential (2026-09-01: a shipped nghttp2
+	// trajectory lost the C line `token = lookup_token(nv->name, ...)` to
+	// this pattern). No \b on the key: "ANTHROPIC_API_KEY" must match via
+	// its "_API_KEY" tail, and the quote requirement is the real guard.
+	// Groups 1+2 are kept by the replacement so the key name survives and
+	// only the value is masked.
+	regexp.MustCompile(`(?i)(authorization|x-api-key|api[_-]?key|token)(["']?\s*[:=]\s*["'])[A-Za-z0-9._\-]{12,}`),
+	// Shell-style env assignment needs no quote: API_KEY=abc... Kept
+	// case-sensitive and space-free around '=' so C code like
+	// `token = lookup_token(...)` can never match.
+	regexp.MustCompile(`(AUTHORIZATION|X-API-KEY|API[_-]?KEY|TOKEN)(=)[A-Za-z0-9._\-]{16,}`),
 	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-]{12,}`),
 	// credential parameters carried inside pre-authorised URLs
-	regexp.MustCompile(`(?i)(tempauth|authkey|sig|signature|x-amz-signature|x-amz-credential|access_token)=[^&\s"']+`),
+	regexp.MustCompile(`(?i)(tempauth|authkey|sig|signature|x-amz-signature|x-amz-credential|access_token)(=)[^&\s"']+`),
 }
 
 // IP detection delegates "is this an address" to the stdlib: candidate
@@ -229,7 +242,15 @@ func (s *Redactor) scrubPatterns(line string, class Class) (string, Hits) {
 	}
 	all := append(append([]*regexp.Regexp{}, patterns...), s.extra...)
 	for _, re := range all {
-		line = re.ReplaceAllStringFunc(line, func(m string) string { h.Pattern++; return keyMask })
+		if n := len(re.FindAllStringIndex(line, -1)); n == 0 {
+			continue
+		} else {
+			h.Pattern += n
+		}
+		// Groups 1+2 (key name + separator, where the pattern has them) are
+		// kept; only the value is masked. Patterns without groups replace
+		// the whole match, as before.
+		line = re.ReplaceAllString(line, "${1}${2}"+keyMask)
 	}
 	if s.RedactIPs[class] {
 		line = s.scrubIPs(line, &h)
@@ -256,9 +277,27 @@ func (s *Redactor) scrubIPs(line string, h *Hits) string {
 		for j < len(line) && isIPTokChar(line[j]) {
 			j++
 		}
+		// An address-shaped run embedded in a longer word is not an address:
+		// 'e' is a hex digit, so the "::e" of C++ scope resolution
+		// ("ToYearImpl::execute") parses as IPv6 -- as does "::b" of
+		// "st::bind_front" and "::c" of "ColumnString::create". A shipped
+		// clickhouse trajectory (2026-08-31) lost hundreds of those to this.
+		// Require non-word characters on both sides of the token.
+		if (i > 0 && isWordChar(line[i-1])) || (j < len(line) && isWordChar(line[j])) {
+			i = j
+			continue
+		}
 		// Trailing punctuation ("routed to 10.0.0.9.") is not part of the
 		// address; trim it before asking the parser.
 		tok := strings.TrimRight(line[i:j], ".:")
+		// A dotted quad right after a version marker is a release number,
+		// not an address ("Version 4.2.1.9" in a shipped clickhouse
+		// trajectory, 2026-08-31). IPs are still masked wherever else they
+		// appear -- publication must not carry ANY address, public included.
+		if strings.Contains(tok, ".") && !strings.Contains(tok, ":") && isVersionContext(line, i) {
+			i = j
+			continue
+		}
 		if rep, ok := s.maskIP(tok, h); ok {
 			b.WriteString(line[pos:i])
 			b.WriteString(rep)
@@ -272,7 +311,9 @@ func (s *Redactor) scrubIPs(line string, h *Hits) string {
 
 // maskIP returns the replacement for tok when tok is a non-allowlisted
 // address. AddrPort keeps the ":port" suffix readable -- only the address
-// is sensitive.
+// is sensitive. Every parseable address is masked, public ones included:
+// artifacts published to HF/GitHub must not carry any address at all --
+// a public IP can still name the runner's or the proxy's infrastructure.
 func (s *Redactor) maskIP(tok string, h *Hits) (string, bool) {
 	if !strings.ContainsAny(tok, ".:") {
 		return "", false // a plain number or hex word is never an address
@@ -292,4 +333,29 @@ func (s *Redactor) maskIP(tok string, h *Hits) (string, bool) {
 		return ipMask + ":" + strconv.Itoa(int(ap.Port())), true
 	}
 	return "", false
+}
+
+// isVersionContext reports whether the token starting at i is preceded by a
+// version marker -- "Version 4.2.1.9", "release 1.2.3.4" -- in which case a
+// dotted quad is a release number, not an address. Callers apply it to
+// dotted quads only; IPv6-shaped tokens have no version-string doppelganger.
+func isVersionContext(line string, i int) bool {
+	k := i - 1
+	for k >= 0 && (line[k] == ' ' || line[k] == '\t') {
+		k--
+	}
+	end := k + 1
+	for k >= 0 && isWordChar(line[k]) {
+		k--
+	}
+	switch strings.ToLower(line[k+1 : end]) {
+	case "version", "ver", "release":
+		return true
+	}
+	return false
+}
+
+func isWordChar(c byte) bool {
+	return c == '_' ||
+		(c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }

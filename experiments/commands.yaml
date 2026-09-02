@@ -40,6 +40,26 @@ announce_case:
   script: 'echo "=== case ${CASE_LABEL} (${CASE_SHA})"'
 
 # ── where results go ───────────────────────────────────────────────────────
+# Live kimi-k3 rollout: harbor run with the agent-under-test config pinned by
+# the command's env (agent-kimi3.yaml + PYTHONPATH so harbor imports the
+# maintained agent module, not the stale site-packages copy). Used via the
+# builtin rollout action: `- uses: rollout / with: {using: kimi3_rollout}`.
+kimi3_rollout:
+  uses: adapters/kimi3-rollout.sh
+  env: [PATH, HOME, DOCKER_HOST, ROLLOUT_MAN_HARBOR_ADAPTER,
+        KIMI3_HARBOR_CONFIG, KIMI3_HARBOR_CWD]
+
+# Bug localization for accepted cases: writes RUN_DIR/buglocation/<case>.json
+# (corpus-standard solution/bug_location.json shape). Needs an llm_spec'd
+# endpoint; uses the case's own admission trajectory as evidence.
+buglocate_kimi:
+  uses: adapters/buglocation.sh
+  llm_spec: buglocation-llm
+  # Two 20m subagent attempts + preflight, same envelope as acc_quality_audit.
+  timeout: 45m
+  env: [PATH, HOME, LLM_BASE_URL, LLM_MODEL, LLM_API_KEY]
+
+
 ship_local:
   uses: adapters/ship-local.sh
   env: [SHIP_ROOT, HOME, PATH]
@@ -67,6 +87,31 @@ ship_rclone:
 # experiment overrides one of these by redefining it; the rest still come
 # from here.
 
+# Hard gate: no CJK text in any file this trial is about to ship. Two-tier
+# (2026-08-31): a cheap codepoint scan first, then fasttext lid.176
+# language-ID adjudication on any CJK-bearing line -- a raw disassembly
+# dump whose bytes decode to CJK glyphs (clickhouse-e9a9df4) passes, real
+# Chinese sentences still block. kimi-k3 sometimes answers in Chinese, and
+# that must not land on the dataset. TRAJ_DIR comes from the step's with:.
+check_no_chinese_traj:
+  uses: adapters/check-no-chinese-traj.sh
+  env: [PATH, HOME]
+
+# Hard gate: no API-failure shapes in the trajectory's stream-json
+# transcripts (2026-08-31). A trial whose claude CLI retried through
+# 429s/overloads/connection drops can still "succeed" -- harbor's result.json
+# only surfaces TERMINAL API errors -- and then a poisoned or truncated
+# transcript would ship. This parses the transcripts event by event and fails
+# on isApiErrorMessage, system/api_error, non-success result, assistant text
+# naming an API failure, or a claude-code.txt with no result event at all
+# (truncated: the CLI died mid-run). kimi3-rollout.sh also calls it at the
+# executor level, where the failure is HOST_ERROR and the trial RE-RUNS under
+# max_attempts; as a per_trial step it is the ship-side backstop. TRAJ_DIR
+# comes from the step's with:.
+check_no_api_error_traj:
+  uses: adapters/check-no-api-error-traj.sh
+  env: [PATH, HOME]
+
 check_toml_image:
   env: [PATH, HOME]
   script: |
@@ -78,6 +123,20 @@ check_toml_image:
     fi
     val=$(grep -E '^\s*docker_image\s*=' "$toml" | head -1 | sed 's/.*=\s*//' | tr -d '"'"'"' ')
     [ -n "$val" ] || { echo "check_toml_image: FAIL $CASE_LABEL -- docker_image is empty" >&2; exit 1; }
+    # Pullability, not just presence (2026-09-01: tarantool-2dbe1dc passed the
+    # field check with an image tag that existed nowhere -- every trial then
+    # died in 9s on "manifest unknown"). Local store OR registry must resolve
+    # it. Digest-pinned refs skip the registry probe: the pin IS the proof.
+    case "$val" in
+      *@sha256:*) : ;;
+      *)
+        if ! docker image inspect "$val" >/dev/null 2>&1 && \
+           ! docker manifest inspect "$val" >/dev/null 2>&1; then
+          echo "check_toml_image: FAIL $CASE_LABEL -- image $val neither in local store nor on registry" >&2
+          exit 1
+        fi
+        ;;
+    esac
     if [ ! -d "$CASE_DIR/environment" ]; then
       echo "check_toml_image: FAIL $CASE_LABEL -- no environment/ directory (harbor run --path" \
         "requires task.toml + environment/ to treat this dir as a single task, otherwise it" \

@@ -1,0 +1,95 @@
+# kimi-k3 trajectory campaign for tc_batch2 (2026-08-31).
+#
+# 63 accepted cases x 3 fresh kimi-k3 rollouts each. The product is the
+# TRAJECTORY (agent attempts against already-admitted tasks), not a new gate:
+# no check_quality / admission / check_traj_layout here -- the cases are
+# unchanged on disk and were admitted hours ago; re-running those would only
+# burn a kimi audit budget per case before the campaign even starts.
+#
+# Agent wiring: adapters/kimi3-rollout.sh runs `harbor run -c agent-kimi3.yaml`
+# -- the same ClaudeCodeThirdParty -> kimi-k3 tingly-proxy agent the factory's
+# gen trials use (single source of truth for model/key/egress). Cases are
+# tar-snapshotted so nothing writes into the watched tc_batch2 tree.
+#
+# Ship: trajectories ONLY (trajectory/<case>/jobs/...), per trial, via
+# materialize_week2_trial + ship_week2_trajectories -- task/week2 already
+# holds all 63. materialize sanitizes + leak-gates every shipped file (IPs,
+# proxy URL, keys), and check_no_chinese_traj blocks any CJK content from the
+# freshly generated agent output before it can ship. Both are hard gates.
+#
+# New-path-only HF writes: each ship appends under
+# trajectory/<case>/jobs/<new-stamp>/<new-trial-name>/ -- timestamps and
+# harbor's random trial suffixes make collisions with existing HF content
+# impossible; no existing file is ever overwritten.
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   ./rollout-man run experiments/tc-batch2-kimi3-x3.yaml --commands experiments/commands.yaml
+---
+kind: Experiment
+name: kimi3-smoke1
+
+case_defaults:
+  source: local
+
+# The 63 accepted cases (jobs/ staged, admitted+shipped on HF batch2) as of
+# 2026-08-31 10:30. Generated; keep in sync if the accepted set changes.
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch2/memcached-f352f0e-commit-838fda3-t4
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 1
+
+# 63 cases x 3 trials = 189 harbor runs, each up to agent timeout (3600s for
+# 59 cases, 2400s for 4) + verifier + docker overhead. 6 concurrent keeps
+# ~6 docker compose stacks live -- the host ran 4 factory slots plus audits
+# comfortably, and has 128 cores / 500G. max_attempts 2 (Commands) retries
+# HOST_ERROR-class failures (proxy hiccups) once at the command layer.
+concurrency: 1
+max_attempts: 2
+
+pipeline:
+  per_case: []          # no gates: cases are already admitted; see header
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter: for rollout collection every completed attempt is
+    # useful data -- even a 1.0 is a good trajectory. Only require_measured
+    # stays, so an infra-killed (unscored) trial never ships.
+    - uses: guard
+      name: measured-only
+      with: {require_measured: true}
+      on_violation: drop
+
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Trajectory-only materialization + sanitization + leak gate. The task
+    # tree is also rebuilt inside the trial OUT_DIR (harmless, unpublished).
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship. skip = this trial's
+    # ship step is skipped (a skipped trial cannot ship); the CJK-bearing
+    # trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree (2026-08-31): a trial that
+    # fought through 429s/overloads "succeeds" with a poisoned or truncated
+    # transcript -- skip its ship. The executor-level hook in
+    # kimi3-rollout.sh already RE-RUNS such trials under max_attempts; this
+    # gate catches anything that still slips through (e.g. attempts
+    # exhausted) and keeps it off the dataset.
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+
+  per_experiment:
+    - uses: record_progress

@@ -869,7 +869,10 @@ func (r *Runner) secretsFor(ctx context.Context, t *trial) []string {
 	if err != nil || llm.APIKey == "" {
 		return nil
 	}
-	return []string{llm.APIKey}
+	// The base URL is a secret too: it embeds the proxy's address
+	// (which must never reach a published artifact), and exact
+	// matching is the ground truth the pattern/IP rules are audited against.
+	return []string{llm.APIKey, llm.BaseURL}
 }
 
 // attempts retries only what could plausibly succeed on a second run. An agent
