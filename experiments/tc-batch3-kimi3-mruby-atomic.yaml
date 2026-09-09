@@ -1,0 +1,114 @@
+# kimi-k3 first-trajectory + task-tree ship for mruby-431d4bb (2026-09-03).
+#
+# mruby is the last week3 case with task_files=0 on HF. It was admitted by
+# watch at 16:0x today, but its single watch trial died HOST_ERROR
+# (UnknownApiError, old npm ClaudeCodeThirdParty agent) before
+# materialization, so ship_week2_atomic never ran and no task tree was
+# published. Watch does not re-trial an admitted case whose trial completed
+# (even with an infra error), and the trajectory-only shipper used by the
+# top-up campaigns requires an existing task tree -- chicken-and-egg.
+#
+# This campaign breaks it: ONE trial through the standard per_trial
+# pipeline, shipping with ship_week2_atomic (task tree + first trajectory
+# in one commit), exactly as watch would have. Admission itself is not
+# re-run -- the case is unchanged since watch admitted it (per_case gate
+# cache hit), and the ccbin agent that replaced the npm one (#105) is what
+# this campaign's kimi3_rollout uses, so the HOST_ERROR class that killed
+# the first trial is gone.
+#
+# After this lands (task tree + 1 trajectory on week3), the case joins the
+# +3 top-up to reach 4 trajectories like every other week3 case.
+#
+# bug_location.json: the materializer grafts it from
+# $RUN_DIR/buglocation/<case>.json; watch's admission wrote it to
+# runs/watch-tc_batch3/buglocation/, so that file is COPIED into this run's
+# buglocation/ dir before launch (see run note below) -- otherwise the
+# published task tree would lack the corpus-convention file.
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   mkdir -p runs/tc-batch3-kimi3-mruby-atomic/buglocation
+#   cp runs/watch-tc_batch3/buglocation/mruby-431d4bb-commit-a6b55e7-t4.json \
+#      runs/tc-batch3-kimi3-mruby-atomic/buglocation/
+#   ./rollout-man run experiments/tc-batch3-kimi3-mruby-atomic.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts.
+# Declared for schema completeness; no per_case buglocation step below
+# (admission already wrote solution/bug_location.json for every case).
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch3-kimi3-mruby-atomic
+
+case_defaults:
+  source: local
+
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/mruby-431d4bb-commit-a6b55e7-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 1
+
+# 1 case x 1 trial. max_attempts 2 absorbs proxy-hiccup HOST_ERRORs at the
+# command layer (batch2/batch3 x3 precedent) -- this trial is the case's
+# only path to a task tree, so give it the retry.
+concurrency: 1
+max_attempts: 2
+
+pipeline:
+  # Campaign-wide destination settings, declared once: every step's command
+  # inherits these as env vars. week3 is the HF branch batch3 publishes to;
+  # trajectory/ lives at the repo root next to task/.
+  with:
+    hf_revision: week3
+    hf_task_path: task/week3
+
+  # No per_case steps: admitted case (watch, 2026-09-03 16:0x) with
+  # buglocation output already on disk; re-running gates would only re-burn
+  # audit budget against unchanged bytes.
+  per_case_concurrency: 1
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter (2026-08-31 policy): every completed rollout ships.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Task tree + trajectory materialization + sanitization + leak gate.
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship; skip = this trial
+    # cannot ship, the trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree (poisoned/truncated
+    # transcripts from proxy 429 fights must not reach the dataset).
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # ATOMIC ship: task tree + first trajectory in one commit. This is the
+    # only shipper that publishes a task tree; ship_week2_trajectories
+    # requires one to exist already.
+    - uses: ship
+      with:
+        using: ship_week2_atomic
+        path: "{{steps.materialize_week2_trial.outputs.materialized_dir}}"
+        dest: tinglydev/cyber-xianjin
+        # hf_revision/hf_task_path come from pipeline.with above.
+
+  per_experiment:
+    - uses: record_progress

@@ -1,0 +1,130 @@
+# kimi-k3 trajectory top-up for the four SHORT week3 cases (2026-09-03).
+#
+# Closes the last gap between local tc_batch3 and HF week3: every local case
+# published with 4 kimi trajectories. The other 18 batch3 cases reached 4 via
+# tc-batch3-kimi3-x3.yaml; these four lagged for case-specific reasons and are
+# finished here.
+#
+# Per-case starting point and what this campaign adds:
+#
+#   yara-d5ae8ef        1 traj on HF -> +3
+#   kamailio-05b2da1    1 traj (watch atomic ship) -> +3
+#   mruby-431d4bb       1 traj (watch atomic ship) -> +3
+#   spidermonkey-6d489cb 1 traj (watch atomic ship) -> +3
+#
+# HARD PRECONDITION -- each case must already have its task tree on HF week3.
+# This campaign ships with ship_week2_trajectories, which writes ONLY under
+# trajectory/<case>/ and assumes task/week3/<case>/ exists. Three of these
+# four had task_files=0 on week3 as of 18:20 today; they get their task tree
+# from watch's ship_week2_atomic (tc-batch3-smoke.yaml per_trial), which
+# commits task tree + first trajectory together. Launching this campaign
+# before that lands would publish trajectories for a case with no task --
+# verify with the preflight in the run note below, not by assumption.
+#
+# Agent wiring: adapters/kimi3-rollout.sh runs `harbor run -c
+# agent-ccbin-kimi3.yaml` -- ClaudeCodeBinThirdParty (native claude binary
+# uploaded to /usr/bin/claude, zero egress for agent setup, only the LLM
+# proxy allowlisted). This replaced ClaudeCodeThirdParty (agent-kimi3.yaml),
+# whose in-container npm/nvm bootstrap intermittently lost whole trials to
+# HOST_ERROR/UnknownApiError -- exactly how mruby-431d4bb's only trial died
+# on 2026-09-03. The adapter also passes CLAUDE_CODE_PROMPT_VIA_STDIN=1
+# (prompt via stdin, not argv, so an agent's `pkill -f /opt/vuln/<target>`
+# cannot SIGTERM the CLI) and --allow-agent-host for the proxy CIDR, which
+# is injected at runtime and never written into a published task.toml.
+#
+# Ship: trajectories ONLY, per trial, via materialize_week2_trial +
+# ship_week2_trajectories to hf_revision week3. New-path-only HF writes
+# (timestamps + harbor random suffixes make collisions impossible); every
+# completed rollout ships regardless of reward (2026-08-31 policy).
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   ./rollout-man run experiments/tc-batch3-kimi3-topup4.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts.
+# Declared for schema completeness; no per_case buglocation step below
+# (admission already wrote solution/bug_location.json for every case).
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch3-kimi3-topup4
+
+case_defaults:
+  source: local
+
+# The four cases short of 4 trajectories on week3 as of 2026-09-03 18:20.
+# spidermonkey-commit-7f081dc-t4 is NOT here: parked by owner decision
+# (R3 too-easy, reward 1.00 violates the reward<0.6 precondition), deferred
+# pending the factory tag-stage verdict. Week3 target is 22 cases, not 23.
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/kamailio-05b2da1-commit-f98c37a-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/mruby-431d4bb-commit-a6b55e7-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/spidermonkey-6d489cb-bug-2064093-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/yara-d5ae8ef-commit-7b7c796-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 3
+
+# 4 cases x 3 trials = 12 harbor runs (up to 3600s agent timeout each +
+# verifier + docker overhead). Concurrency 4 (below the x3 campaign's 6):
+# watch is still live and its own trials take priority, and spidermonkey
+# builds are heavy. max_attempts 2 absorbs proxy-hiccup HOST_ERRORs at the
+# command layer (batch2/batch3 x3 precedent).
+concurrency: 4
+max_attempts: 2
+
+pipeline:
+  # Campaign-wide destination settings, declared once: every step's command
+  # inherits these as env vars. week3 is the HF branch batch3 publishes to;
+  # trajectory/ lives at the repo root next to task/.
+  with:
+    hf_revision: week3
+    hf_task_path: task/week3
+
+  # No per_case steps: these four are admitted cases with
+  # solution/bug_location.json already written by watch's buglocate_kimi.
+  # Re-running admission gates would only re-burn audit budget against
+  # unchanged bytes.
+  per_case_concurrency: 4
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter (2026-08-31 policy): every completed rollout ships.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Trajectory-only materialization + sanitization + leak gate.
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship; skip = this trial
+    # cannot ship, the trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree (poisoned/truncated
+    # transcripts from proxy 429 fights must not reach the dataset).
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
+        dest: tinglydev/cyber-xianjin
+        # hf_revision/hf_task_path come from pipeline.with above.
+
+  per_experiment:
+    - uses: record_progress

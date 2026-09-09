@@ -7,5 +7,9 @@ if ! find "${LOCAL_PATH:?ship command needs LOCAL_PATH}" -mindepth 1 -print -qui
   echo "nothing accepted under $LOCAL_PATH; skipping HF upload"
   exit 0
 fi
-export HF_PATH_IN_REPO=task/week2
+# The repo path is task/week2 by default, overridable so later weeks reuse
+# this adapter unchanged: HF_PATH_IN_REPO=task/week3 (host env via the
+# command's allowlist, or a with: entry on the step -- with: entries reach
+# commands as env vars).
+export HF_PATH_IN_REPO="${HF_PATH_IN_REPO:-task/week2}"
 exec "${ROLLOUT_MAN_SHIP_HF_ADAPTER:-adapters/ship-hf.sh}"

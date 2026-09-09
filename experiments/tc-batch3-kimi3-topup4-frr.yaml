@@ -1,0 +1,104 @@
+# kimi-k3 trajectory top-up for frr-5ae0b26 (2026-09-04).
+#
+# Clone of tc-batch3-kimi3-topup4-mruby.yaml with the case path and names
+# swapped. frr is a new factory case: watch rejected it on check_toml_image
+# (no docker_image) at first sweep, then after the image backfill (#116 --
+# build/push/digest-pin, all 15 layers cached from the factory's own build)
+# it re-gated 23:59:37 -> audit PROMOTE -> oracle/nop PASS -> admitted
+# 2026-09-04 00:21:10. Its trial (attempt 2 after a HOST_ERROR attempt 1)
+# completed at reward 0.000 -- a normal zero-reward trial, not an infra
+# failure -- and ship_week2_atomic committed the task tree + first
+# trajectory to origin/week3 at 01:17:11 (verified via hfcase git ls-tree:
+# 15 task files + 1 jobs stamp + solution/bug_location.json).
+#
+#   frr-5ae0b26   1 traj on HF -> +3   (target 4)
+#
+# Everything else -- agent wiring, gates, ship destination -- is inherited
+# verbatim from tc-batch3-kimi3-topup4-mruby.yaml; see that file's header
+# and tc-batch3-kimi3-topup4.yaml for the ccbin/stdin-prompt/
+# --allow-agent-host rationale. Concurrency 2 (one case x 3 trials) since
+# watch is live (kamailio re-gate in flight) and its trials take priority.
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   ./rollout-man run experiments/tc-batch3-kimi3-topup4-frr.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts.
+# Declared for schema completeness; no per_case buglocation step below
+# (admission already wrote solution/bug_location.json for every case).
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch3-kimi3-topup4-frr
+
+case_defaults:
+  source: local
+
+# frr only -- kamailio is still mid re-gate (task tree not yet on week3).
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/frr-5ae0b26-commit-0dc9691-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 3
+
+# 1 case x 3 trials = 3 harbor runs (up to 3600s agent timeout each +
+# verifier + docker overhead). max_attempts 2 absorbs proxy-hiccup
+# HOST_ERRORs at the command layer (batch2/batch3 x3 precedent).
+concurrency: 2
+max_attempts: 2
+
+pipeline:
+  # Campaign-wide destination settings, declared once: every step's command
+  # inherits these as env vars. week3 is the HF branch batch3 publishes to;
+  # trajectory/ lives at the repo root next to task/.
+  with:
+    hf_revision: week3
+    hf_task_path: task/week3
+
+  # No per_case steps: admitted case (watch, 2026-09-03 16:0x) with
+  # solution/bug_location.json already written by watch's buglocate_kimi.
+  # Re-running admission gates would only re-burn audit budget against
+  # unchanged bytes.
+  per_case_concurrency: 1
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter (2026-08-31 policy): every completed rollout ships.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Trajectory-only materialization + sanitization + leak gate.
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship; skip = this trial
+    # cannot ship, the trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree (poisoned/truncated
+    # transcripts from proxy 429 fights must not reach the dataset).
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
+        dest: tinglydev/cyber-xianjin
+        # hf_revision/hf_task_path come from pipeline.with above.
+
+  per_experiment:
+    - uses: record_progress

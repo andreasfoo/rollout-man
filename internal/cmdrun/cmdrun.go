@@ -169,6 +169,24 @@ func (r *Runner) once(ctx context.Context, name string, c config.Command, vars m
 		cmd = exec.CommandContext(ctx, shell(), "-c", c.Script)
 	}
 	cmd.Env = append(r.hostEnv(c), envPairs(vars)...)
+	// A step's with: entries arrive as env vars, and a legitimately named
+	// input can collide with a fundamental one: ship's `with: {path: ...}`
+	// became PATH=<materialized tree> appended AFTER the host PATH, and the
+	// ship adapter's `#!/usr/bin/env bash` could no longer find bash
+	// (batch3 watch 2026-09-03: five ships died "exit 127 bash not found").
+	// hostEnv's values win for the variables every command depends on; a
+	// with: key that wants to override PATH can use the command's env:
+	// allowlist instead, which is an explicit, visible declaration.
+	for i, kv := range cmd.Env {
+		if k, _, ok := strings.Cut(kv, "="); ok && (k == "PATH" || k == "HOME") {
+			for _, host := range r.hostEnv(c) {
+				if hk, _, ok2 := strings.Cut(host, "="); ok2 && hk == k {
+					cmd.Env[i] = host
+					break
+				}
+			}
+		}
+	}
 	if c.LLMSpec != "" {
 		llmEnv, err := r.resolveLLM(ctx, c.LLMSpec)
 		if err != nil {

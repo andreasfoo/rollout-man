@@ -448,6 +448,12 @@ func (a Action) Unknown(known ...string) []string {
 // per_trial runs per trial, ship under per_experiment runs once when the batch
 // is done. Position is timing; there is no separate switch.
 type Pipeline struct {
+	// With is pipeline-wide with: entries, shared by every step in every
+	// stage: campaign-wide constants (which HF branch this batch ships to,
+	// which repo path) are named once here instead of repeated on each
+	// step. A step's own with: overrides an entry of the same name.
+	With map[string]any `yaml:"with"`
+
 	// Concurrency bounds post-trial processing. It is deliberately not the
 	// same number as Experiment.Concurrency: that one answers "how many
 	// containers fit on this machine", this one answers "how many trials can

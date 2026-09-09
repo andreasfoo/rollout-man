@@ -129,6 +129,14 @@ concurrency: 12
 max_attempts: 2
 
 pipeline:
+  # Campaign-wide destination settings, declared once: every step's command
+  # inherits these as env vars (a step's own with: can override). week3 is
+  # the HF branch this batch publishes to (created 2026-09-02 from main
+  # 702b2c5be); task/week3 is the cases tree's repo path.
+  with:
+    hf_revision: week3
+    hf_task_path: task/week3
+
   # Buglocation is one kimi-k3 subagent call per case; serial gating made the
   # 2026-08-31 resume spend ~2h redoing uncached localizations before a single
   # trial could start. The proxy already serves 6 concurrent rollouts.
@@ -181,6 +189,7 @@ pipeline:
         using: ship_week2_trajectories
         path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
         dest: tinglydev/cyber-xianjin
+        # hf_revision/hf_task_path come from pipeline.with above.
 
   per_experiment:
     - uses: record_progress

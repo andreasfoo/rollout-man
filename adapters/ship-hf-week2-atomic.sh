@@ -1,28 +1,25 @@
-#!/usr/bin/env bash
-# Atomically publish accepted-cases (task/week2) and accepted-trajectories
-# (trajectory) to HF in a single commit so the two trees are never partially
-# uploaded.
-#
-# Replaces the two separate ship_week2_cases / ship_week2_trajectories steps
-# in per_experiment. If either source tree is empty the upload is skipped
-# entirely (consistent with the single-tree guards in the individual adapters).
-#
-# The source root may name its two trees either way: accepted-cases/
-# accepted-trajectories/ (what the batch materializer writes) or task/
-# trajectory/ (what the per-trial materializer writes inside a trial's own
-# OUT_DIR/materialized -- named after where they publish). Same two trees,
-# same two destinations.
-#
-# ENV (set by rollout-man ship builtin or per_experiment env):
-#   LOCAL_PATH   the root directory (contains the two trees as siblings)
-#   KEY          HF repo id, e.g. tinglydev/cyber-xianjin
-#   HF_REVISION  (opt) branch/revision, default repo default branch
-#   HF_PRIVATE   (opt) "1" (default) to create private repo if new
-#   HF_TOKEN     (opt) overrides hf auth login credential
-#   ROLLOUT_MAN_SHIP_HF_ADAPTER (opt) alternate ship-hf.sh path; when set it
-#                is used per tree instead of huggingface_hub -- atomicity is
-#                traded for the override, which exists for stubbed smoke tests.
+#!/bin/bash
+# NOTE: absolute bash, not `/usr/bin/env bash`. The ship builtin forwards its
+# step params as env vars, and the `path:` param becomes PATH=<materialized
+# dir> (upperSnake) appended after the real PATH -- os/exec keeps the LAST
+# duplicate, so the shebang's env lookup cannot find bash (exit 127, sngrep
+# forge-flow-fuzz-1 2026-09-02 23:43). With an absolute interpreter the
+# script starts anyway, and the guard below restores the machine PATH before
+# any command is invoked. Remove both when the runner stops forwarding
+# param-named vars (task #83).
 set -euo pipefail
+
+# PATH guard: the clobbered PATH (see above) points at the materialized tree,
+# which contains no executables. Restore a working default rather than trust
+# the inherited value.
+case ":$PATH:" in
+  *:/usr/bin:*) : ;;
+  *) # ~/.local/bin must lead the restored PATH: this host's python3 (with
+     # huggingface_hub) is a uv-managed install there, and /usr/bin/python3
+     # lacks the module -- appended, the system one wins the lookup
+     # (haproxy-6fe6018 ship, 2026-09-03 00:33 ModuleNotFoundError).
+     export PATH="${HOME:+$HOME/.local/bin:}/usr/local/bin:/usr/bin:/bin" ;;
+esac
 
 : "${LOCAL_PATH:?ship-hf-week2-atomic needs LOCAL_PATH=run directory}"
 : "${KEY:?ship-hf-week2-atomic needs KEY=hf-repo-id}"
@@ -51,10 +48,16 @@ if $cases_empty && $trajs_empty; then
   exit 0
 fi
 
+# The repo path is task/week2 by default, overridable so later weeks reuse
+# this adapter unchanged: HF_TASK_PATH=task/week3 (host env via the command's
+# allowlist, or a with: entry on the step -- with: entries reach commands as
+# env vars). Applies to both the atomic and the adapter-override path below.
+task_path="${HF_TASK_PATH:-task/week2}"
+
 if [ -n "${ROLLOUT_MAN_SHIP_HF_ADAPTER:-}" ]; then
   echo "ship-hf-week2-atomic: ROLLOUT_MAN_SHIP_HF_ADAPTER set -- shipping each tree via $ROLLOUT_MAN_SHIP_HF_ADAPTER (not atomic)"
   if ! $cases_empty; then
-    HF_PATH_IN_REPO=task/week2 "$ROLLOUT_MAN_SHIP_HF_ADAPTER"
+    HF_PATH_IN_REPO="$task_path" "$ROLLOUT_MAN_SHIP_HF_ADAPTER"
   fi
   if ! $trajs_empty; then
     HF_PATH_IN_REPO=trajectory "$ROLLOUT_MAN_SHIP_HF_ADAPTER"
@@ -69,7 +72,9 @@ if $trajs_empty; then
   echo "ship-hf-week2-atomic: WARN accepted-trajectories/ is empty but accepted-cases/ is not -- uploading cases only" >&2
 fi
 
-msg="${HF_COMMIT_MESSAGE:-rollout-man: ${EXPERIMENT:-batch} ${TRIAL_ID:-$RUN_ID}}"
+# ${VAR:-} on both sides of the inner default: set -u evaluates the word
+# unconditionally, and an unset RUN_ID (hand-invocation) used to abort here.
+msg="${HF_COMMIT_MESSAGE:-rollout-man: ${EXPERIMENT:-batch} ${TRIAL_ID:-${RUN_ID:-manual}}}"
 private="${HF_PRIVATE:-1}"
 revision="${HF_REVISION:-}"
 
@@ -101,7 +106,7 @@ def add_tree(local_root, hf_prefix):
         path_in_repo = f"{hf_prefix}/{rel}".lstrip("/")
         ops.append(CommitOperationAdd(path_in_repo=path_in_repo, path_or_fileobj=str(p)))
 
-add_tree(cases_dir, "task/week2")
+add_tree(cases_dir, os.environ.get("HF_TASK_PATH", "task/week2"))
 add_tree(trajs_dir, "trajectory")
 
 if not ops:

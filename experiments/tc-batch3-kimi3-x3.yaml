@@ -1,0 +1,131 @@
+# kimi-k3 trajectory top-up for tc_batch3 / week3 (2026-09-03).
+#
+# 18 accepted cases x 3 fresh kimi-k3 rollouts each (tc_batch3 holds 19
+# dirs; the 19th, spidermonkey-commit-7f081dc-t4, is parked — R3 too-easy,
+# deferred 2026-09-03 pending the factory tag-stage verdict). The product is
+# the TRAJECTORY: watch (tc-batch3-smoke.yaml) already admitted these cases
+# and shipped each with its first kimi trajectory; this campaign adds the 3
+# extras per case that bring week3 to 4 trajectories each (batch2 reached
+# the same shape with tc-batch2-kimi3-x3.yaml).
+#
+# No admission logic here: no check_quality / oracle / nop / check_toml_image
+# -- the cases are unchanged on disk and admitted; re-running gates would
+# only burn audit budget. The one case excluded is
+# spidermonkey-commit-7f081dc-t4 (rejected too-easy, R3, pending owner
+# decision); glib/mupdf/haproxy-1115fc3/smcroute are included because their
+# admission repairs landed 2026-09-03 and watch admitted or is re-gating
+# them -- if any is still mid-gate at launch, its rollout simply runs
+# against the admitted bytes (case content is snapshotted per trial).
+#
+# Agent wiring: adapters/kimi3-rollout.sh runs `harbor run -c
+# agent-kimi3.yaml` -- same ClaudeCodeThirdParty -> kimi-k3 tingly-proxy
+# agent as the factory (single source of truth for model/key/egress).
+#
+# Ship: trajectories ONLY, per trial, via materialize_week2_trial +
+# ship_week2_trajectories to hf_revision week3. New-path-only HF writes
+# (timestamps + harbor random suffixes make collisions impossible);
+# every completed rollout ships regardless of reward (2026-08-31 policy).
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   ./rollout-man run experiments/tc-batch3-kimi3-x3.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts.
+# Declared for schema completeness; no per_case buglocation step below
+# (admission already wrote solution/bug_location.json for every case).
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch3-kimi3-x3
+
+case_defaults:
+  source: local
+
+# The 18 non-parked batch3 cases (2026-09-03). spidermonkey-commit-7f081dc
+# excluded: R3 too-easy rejection, deferred pending dataset-owner decision.
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/brlcad-515d0bf-commit-e44c88c-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/ds389-46ad803-commit-7046a1-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/glib-d0ffee8-commit-1920b55-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/haproxy-1115fc3-commit-665703d-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/haproxy-6fe6018-commit-4602363-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/haproxy-782a1b5-commit-0667329-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/harfbuzz-6310943-hangul-uaf-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/hyperion-47e21ff-commit-ffab985-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/imagemagick-e0a9b4d-commit-f12746c-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/keydb-dde2c27-commit-a77548e-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/mairix-7b9d1ee-commit-12e921a-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/mariadb-e2088ce-commit-9749d71-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/mupdf-e4693b0-commit-bf0c4e6-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/smcroute-2c6a1f2-commit-86738c1-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/sngrep-99a535b-commit-1ff74ee-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/spidermonkey-4a37b61-bug-1763883-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/spidermonkey-f7d4da5-bug-1773628-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/yices2-220acdf-commit-8ee51ce-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 3
+
+# 17 cases x 3 trials = 51 harbor runs (up to 3600s agent timeout each +
+# verifier + docker overhead). 6 concurrent keeps ~6 compose stacks live
+# alongside the still-running watch (whose own trials take priority);
+# 128 cores / 500G host. max_attempts 2 absorbs proxy-hiccup HOST_ERRORs
+# at the command layer (batch2 x3 precedent).
+concurrency: 6
+max_attempts: 2
+
+pipeline:
+  # Campaign-wide destination settings, declared once: every step's command
+  # inherits these as env vars. week3 is the HF branch batch3 publishes to;
+  # trajectory/ lives at the repo root next to task/ (task/week3 already
+  # holds the cases from watch's atomic ships).
+  with:
+    hf_revision: week3
+    hf_task_path: task/week3
+
+  # No per_case steps: bug_location.json was written at admission
+  # (buglocate_kimi in tc-batch3-smoke.yaml); re-running it would only
+  # re-burn kimi budget against unchanged cases.
+  per_case_concurrency: 4
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter (2026-08-31 policy): every completed rollout ships.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Trajectory-only materialization + sanitization + leak gate.
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship; skip = this trial
+    # cannot ship, the trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree (poisoned/truncated
+    # transcripts from proxy 429 fights must not reach the dataset).
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
+        dest: tinglydev/cyber-xianjin
+        # hf_revision/hf_task_path come from pipeline.with above.
+
+  per_experiment:
+    - uses: record_progress

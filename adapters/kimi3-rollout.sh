@@ -2,12 +2,16 @@
 # Real kimi-k3 rollout adapter (trajectory generation campaign, 2026-08-31).
 #
 # Unlike forge-flow-fuzz-mock (which only replays existing jobs/), this runs a
-# LIVE harbor trial of the case with the same agent-under-test the factory
-# uses: ClaudeCodeThirdParty -> kimi-k3 via the tingly proxy, exactly as
-# case_forge/trial.py's harbor_config path invokes it
-# (`harbor run -c agent-kimi3.yaml -p <case>`). The yaml is the single source
-# of truth for the agent (model, base URL, key, egress allowlist) -- this
-# adapter never reads or injects the credential itself.
+# LIVE harbor trial of the case with kimi-k3 via the tingly proxy. The agent
+# is ClaudeCodeBinThirdParty (agent-ccbin-kimi3.yaml): harbor uploads a bundled
+# native claude binary to /usr/bin/claude (a cp), so the container needs ZERO
+# egress for agent setup -- only the LLM proxy is allowlisted. This replaces
+# the old ClaudeCodeThirdParty (agent-kimi3.yaml), which bootstrapped
+# node/nvm/npm-installed claude inside the container at runtime; that setup
+# path intermittently surfaced as HOST_ERROR/UnknownApiError and lost whole
+# trials (2026-09-03 mruby-431d4bb). The yaml is the single source of truth
+# for the agent (model, base URL, key, egress allowlist) -- this adapter never
+# reads or injects the credential itself.
 #
 # Cases are pre-accepted: no stage1/stage2 skill lifecycle, no caseforge
 # mutation -- just one fresh solve attempt whose trajectory is the product.
@@ -49,11 +53,40 @@ esac
 [ "${AGENT_NAME:-}" = "forge-flow-fuzz" ] || \
   fail HOST_ERROR "expected AGENT_NAME=forge-flow-fuzz, got ${AGENT_NAME:-}"
 
-HARBOR_CONFIG="${KIMI3_HARBOR_CONFIG:-/home/foo/project/casefactory-goloopx/harbor-config/agent-kimi3.yaml}"
-HARBOR_CWD="${KIMI3_HARBOR_CWD:-/home/foo/project/casefactory-goloopx}"
+HARBOR_CONFIG="${KIMI3_HARBOR_CONFIG:-/home/foo/project/casefactory-goloopx/harbor-config/agent-ccbin-kimi3.yaml}"
+HARBOR_CWD="${KIMI3_HARBOR_CWD:-/home/foo/project/cyber-gate}"
 [ -f "$HARBOR_CONFIG" ] || fail ENV_FAILED "harbor config not found: $HARBOR_CONFIG"
-# agent_cc_third_party.py must be importable (PYTHONPATH from the same root).
-[ -f "$HARBOR_CWD/agent_cc_third_party.py" ] || fail ENV_FAILED "agent module not found in $HARBOR_CWD"
+# The agent class must be importable with $HARBOR_CWD on sys.path (see the
+# PYTHONPATH export below). agent-ccbin-kimi3.yaml uses
+# `import_path: cyber_harbor:ClaudeCodeBinThirdParty` -- a package under the
+# cyber-gate root, not a root-level module file -- so probe importability of
+# the package rather than stat'ing a specific .py. (The prior npm agent,
+# agent_cc_third_party:ClaudeCodeThirdParty, lived as a single .py at the
+# casefactory root; an override pointing back at it still passes this check
+# because that root is then on sys.path and the module imports.)
+#
+# The probe MUST run under harbor's own interpreter, not whatever `python3`
+# PATH resolves to. `cyber_harbor` imports `harbor`, and harbor is installed
+# as a uv tool in its own venv (~/.local/share/uv/tools/harbor); the ambient
+# python3 here is an unrelated 3.11 that has never had harbor on its path.
+# Probing with it raises ModuleNotFoundError('harbor') and fails the trial
+# ENV_FAILED before harbor is ever invoked -- a pure false negative, since
+# the class imports cleanly under the interpreter that actually runs it
+# (2026-09-03: spidermonkey-6d489cb died this way immediately after being
+# admitted, and every case would have followed). Derive the interpreter from
+# harbor's shebang so the probe tests the real import environment.
+HARBOR_BIN=$(command -v harbor) || fail ENV_FAILED "harbor not on PATH"
+HARBOR_PY=$(sed -n '1s/^#!//p' "$HARBOR_BIN")
+[ -x "$HARBOR_PY" ] || fail ENV_FAILED "could not derive harbor interpreter from $HARBOR_BIN (got '${HARBOR_PY:-}')"
+PYTHONPATH="$HARBOR_CWD${PYTHONPATH:+:$PYTHONPATH}" "$HARBOR_PY" - "$HARBOR_CONFIG" <<'PY' || fail ENV_FAILED "agent import_path not importable from $HARBOR_CWD (see stderr)"
+import importlib, re, sys
+cfg = open(sys.argv[1]).read()
+m = re.search(r'import_path:\s*([\w.]+):(\w+)', cfg)
+if not m:
+    sys.exit("no import_path in harbor config")
+mod, cls = m.groups()
+getattr(importlib.import_module(mod), cls)
+PY
 
 JOBS="$WORK_DIR/harbor"
 CASE_SNAPSHOT="$WORK_DIR/case"
@@ -92,25 +125,42 @@ tar --exclude='./.git' --exclude='./.factory' --exclude='./trials' --exclude='./
 # the vulnerable binary (/opt/vuln/<target>), and `pkill -f /opt/vuln/<target>`
 # -- the agent's natural way to restart a hung daemon -- matches FULL command
 # lines, claude's own included, SIGTERM-ing the CLI mid-attempt (exit 143;
-# 2026-08-31 memcached smoke died this way 20s after finding the crash).
-# The agent module import: agent-kimi3.yaml says
-# `import_path: agent_cc_third_party:ClaudeCodeThirdParty`, resolved by plain
-# importlib -- i.e. sys.path order: harbor's bin dir, PYTHONPATH, site-packages.
-# A STALE fork of the module (2026-08-21, diverged from the maintained
-# casefactory copy) lives in harbor's site-packages and silently wins without
-# this pin (2026-08-31 smoke2 traceback: site-packages/agent_cc_third_party.py,
-# old command shape). PYTHONPATH outranks site-packages, so this makes the
-# $HARBOR_CWD copy -- the one agent-kimi3.yaml's comments and env contract are
-# written against, and the one carrying the stdin-prompt fix -- authoritative.
+# 2026-08-31 memcached smoke died this way 20s after finding the crash). Both
+# the npm agent (casefactory/agent_cc_third_party.py) and the bin agent
+# (cyber_harbor:ClaudeCodeBinThirdParty) honor this env flag; the env pass
+# below reaches whichever one the active HARBOR_CONFIG selects.
+#
+# The agent module import: agent-ccbin-kimi3.yaml says
+# `import_path: cyber_harbor:ClaudeCodeBinThirdParty`. Harbor's plain-import
+# sys.path order is bin-dir, PYTHONPATH, site-packages, and the
+# `cyber_harbor` package itself is installed via a venv .pth file at
+# site-packages/zz_cyber_gate_local.pth pointing at /home/foo/project/cyber-gate
+# (the .pth is the durable import fix; a harbor reinstall/venv wipe loses it
+# and must be re-created). PYTHONPATH is exported here too as belt-and-suspenders:
+# PYTHONPATH outranks site-packages, so a venv that DOES have cyber_harbor on
+# its .pth AND in $HARBOR_CWD always picks $HARBOR_CWD's copy (the one the
+# active yaml's env contract is written against, and the one carrying the
+# stdin-prompt fix). This makes $HARBOR_CWD authoritative.
 export PYTHONPATH="$HARBOR_CWD${PYTHONPATH:+:$PYTHONPATH}"
 
 cd "$HARBOR_CWD"
+# --allow-agent-host injects the tingly LLM proxy CIDR into the agent-phase
+# egress allowlist AT RUNTIME, so the published task.toml can carry an empty
+# allowed_hosts (the materializer normalizes it to []): the proxy IP is a
+# local-network secret and must never be written into a shipped file. The
+# case's own task.toml sets network_mode="allowlist" with allowed_hosts=[];
+# this flag (a run-specific CIDR harbor merges into that allowlist) is what
+# lets kimi reach ANTHROPIC_BASE_URL at 143.89.191.124 during agent.run().
+# 143.89.0.0/16 (not a bare host) matches the active agent yaml's
+# extra_allowed_hosts -- a CIDR, since wildcards in harbor are hostname-only
+# (*.domain).
 setsid harbor run \
   -c "$HARBOR_CONFIG" \
   -p "$CASE_SNAPSHOT" \
   --job-name "$TRIAL_ID" \
   --jobs-dir "$JOBS" \
   --n-concurrent 1 \
+  --allow-agent-host 143.89.0.0/16 \
   --agent-env CLAUDE_CODE_PROMPT_VIA_STDIN=1 \
   --agent-kwarg disallowed_tools=WebSearch,WebFetch \
   --yes --quiet > "$OUT_DIR/harbor.log" 2>&1 || rc=$?
@@ -124,7 +174,18 @@ fi
 
 # Build the materializer's expected layout: OUT_DIR/case/trials/<trial_name>/.
 # The job dir itself IS the trial dir (result.json + agent/ + verifier/).
+# The claude CLI inside the container writes its session jsonl as the
+# container's agent uid (host uid 1000) mode 600 across harbor's bind
+# mount; when this adapter's uid differs (foo=1007 here) cp -a dies with
+# "Permission denied" and the whole trial becomes a bogus ENV_FAILED
+# (mupdf-e4693b0 forge-flow-fuzz-1, 2026-09-03 04:40). We are in the
+# docker group: a throwaway root container chown's the trial tree back
+# to the invoking uid so the copy (and every later gate reading it)
+# succeeds. Best-effort: without docker the copy proceeds and surfaces
+# its own error if it truly cannot read the tree.
 trial_name=$(basename "$trial")
+docker run --rm -v "$JOBS/$TRIAL_ID:/j:ro" alpine:3 sh -c \
+    "chown -R $(id -u):$(id -g) /j" 2>/dev/null || true
 mkdir -p "$OUT_DIR/case/trials"
 cp -a "$trial" "$OUT_DIR/case/trials/$trial_name"
 

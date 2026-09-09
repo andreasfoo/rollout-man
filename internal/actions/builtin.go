@@ -503,9 +503,11 @@ func (shipAction) Name() string    { return "ship" }
 func (shipAction) Scopes() []Scope { return []Scope{PerTrial, PerExperiment} }
 
 func (shipAction) Validate(a config.Action) error {
-	if err := unknown(a, "using", "dest", "path"); err != nil {
-		return err
-	}
+	// with: is how a ship step names destination-side settings that are not
+	// worth a key of their own -- hf_revision, hf_task_path -- so which
+	// branch a campaign publishes to is a submission setting, not something
+	// an adapter bakes in. Validate lets any with: through; the values are
+	// checked where they are used, same as the command action's with:.
 	if a.Str("using", "") == "" {
 		return fmt.Errorf("using: is required -- it names the command that does the shipping")
 	}
@@ -541,6 +543,14 @@ func (shipAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 	if c.Trial != nil {
 		// So a per-trial ship can tell its commits apart from the batch's.
 		vars["TrialId"] = c.Trial.ID
+	}
+	// with: entries reach the shipping command as env vars, the same way the
+	// command action forwards them -- one configuration vocabulary for both,
+	// and destination-side settings (HF_REVISION, HF_TASK_PATH) live in the
+	// submission instead of the adapter. The pipeline's own with: is the
+	// base layer; a step-level entry of the same name wins.
+	for k, v := range WithVars(c, a) {
+		vars[k] = v
 	}
 	if _, err := runStep(ctx, c, a, using, vars); err != nil {
 		return err
@@ -646,10 +656,9 @@ func (rolloutAction) Run(ctx context.Context, c *Ctx, a config.Action) error {
 		"LocalPath": c.Trial.OutDir,
 		"CaseDir":   c.CaseDir, "CaseLabel": c.CaseLabel, "CaseSha": c.CaseSHA,
 	}
-	for k, v := range a.With {
-		if s, ok := v.(string); ok {
-			vars[camel(k)] = expandStepOutputs(s, c)
-		}
+	// with: over the pipeline-wide base layer (see WithVars).
+	for k, v := range WithVars(c, a) {
+		vars[k] = v
 	}
 	if _, err := runStep(ctx, c, a, using, vars); err != nil {
 		return err
@@ -693,10 +702,9 @@ func (buglocationAction) Run(ctx context.Context, c *Ctx, a config.Action) error
 		"WorkDir":   filepath.Join(c.RunDir, "work"),
 		"CaseDir":   c.CaseDir, "CaseLabel": c.CaseLabel, "CaseSha": c.CaseSHA,
 	}
-	for k, v := range a.With {
-		if s, ok := v.(string); ok {
-			vars[camel(k)] = expandStepOutputs(s, c)
-		}
+	// with: over the pipeline-wide base layer (see WithVars).
+	for k, v := range WithVars(c, a) {
+		vars[k] = v
 	}
 	if _, err := runStep(ctx, c, a, using, vars); err != nil {
 		return err
@@ -733,10 +741,9 @@ func (cm command) Run(ctx context.Context, c *Ctx, a config.Action) error {
 	// custom step is configured the same way every other command is.
 	// String values may reference {{steps.<label>.outputs.<key>}} from an
 	// earlier step in the same pipeline list.
-	for k, v := range a.With {
-		if s, ok := v.(string); ok {
-			vars[camel(k)] = expandStepOutputs(s, c)
-		}
+	// with: over the pipeline-wide base layer (see WithVars).
+	for k, v := range WithVars(c, a) {
+		vars[k] = v
 	}
 	res, err := runStep(ctx, c, a, cm.cmd, vars)
 	if len(res.Outputs) > 0 {

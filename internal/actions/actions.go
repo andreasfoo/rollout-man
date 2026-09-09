@@ -99,6 +99,11 @@ type Ctx struct {
 	// step's label (name: if set, else uses:). A later step in the same list
 	// reads ${{ steps.<label>.outputs.<key> }} in its with: values.
 	StepOutputs map[string]map[string]string
+
+	// BaseWith is the pipeline-wide with: (pipeline.with in the submission).
+	// Actions fold it under their own with: via WithVars, so campaign-wide
+	// constants are declared once and every step's command inherits them.
+	BaseWith map[string]any
 }
 
 func (c *Ctx) Note(k string, v any) {
@@ -106,6 +111,23 @@ func (c *Ctx) Note(k string, v any) {
 		c.Notes = map[string]any{}
 	}
 	c.Notes[k] = v
+}
+
+// WithVars folds a step's with: into template/env vars, over the pipeline's
+// own with: (Ctx.BaseWith) as the base layer. String values may reference
+// {{steps.<label>.outputs.<key>}} from an earlier step in the same list --
+// which is why the base layer cannot be resolved once at ctx build time: a
+// step-level override can carry an expansion the base entry never had.
+func WithVars(c *Ctx, a config.Action) map[string]string {
+	vars := map[string]string{}
+	for _, src := range []map[string]any{c.BaseWith, a.With} {
+		for k, v := range src {
+			if s, ok := v.(string); ok {
+				vars[camel(k)] = expandStepOutputs(s, c)
+			}
+		}
+	}
+	return vars
 }
 
 func (c *Ctx) Logf(f string, a ...any) {
@@ -135,9 +157,11 @@ type Action interface {
 
 var registry = map[string]Action{}
 
-// ErrSkipCase is returned by RunList when a per_case step fails with
-// on_failure: skip. The runner interprets it as "exclude this case, continue
-// with the next one" rather than aborting the whole run.
+// ErrSkipCase is returned by RunList when a step fails with on_failure: skip.
+// The runner interprets it as "exclude this case, continue with the next one"
+// rather than aborting the whole run. In per_trial it is a publication veto on
+// a measured trial, not a failure: which gate skipped is recorded in the
+// skipped_by note, not in the error.
 var ErrSkipCase = errors.New("case skipped")
 
 // ExitTempfail is the exit code a command uses to declare "I failed because
@@ -293,6 +317,11 @@ func RunList(ctx context.Context, c *Ctx, list []config.Action, cmds *cmdrun.Run
 			}
 			if a.Skips() {
 				c.Logf("%s: %s failed (on_failure: skip): %v", c.Where(), a.Label(), err)
+				// The note is how the runner records WHICH gate skipped, on a
+				// trial that was measured: postTrial copies notes to the
+				// results row even on this error path (guard's dropped_by is
+				// the precedent).
+				c.Note("skipped_by", a.Label())
 				return ErrSkipCase
 			}
 			return fmt.Errorf("%s: %w", a.Label(), err)

@@ -173,6 +173,16 @@ ship_week2_cases:
   env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
         ROLLOUT_MAN_SHIP_HF_ADAPTER]
 
+# Task tree + first trajectory in one commit -- the only shipper that can
+# publish a case's task tree (ship_week2_trajectories requires one to exist).
+# Mirrors the definition the smoke yamls carry inline; needed here so
+# campaigns launched with --commands experiments/commands.yaml (e.g.
+# tc-batch3-kimi3-mruby-atomic, whose first ship died HOST_ERROR on the
+# missing name, 2026-09-03) can use it.
+ship_week2_atomic:
+  uses: adapters/ship-hf-week2-atomic.sh
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH]
+
 ship_week2_trajectories:
   uses: adapters/ship-hf-week2-trajectories.sh
   env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,

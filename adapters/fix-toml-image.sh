@@ -71,14 +71,25 @@ toml_path, digest = sys.argv[1:]
 lines = open(toml_path).read().splitlines(keepends=True)
 out, replaced = [], False
 for line in lines:
-    if line.lstrip().startswith('docker_image') and '=' in line:
-        out.append(f'docker_image = "{digest}"\n')
-        replaced = True
-    else:
-        out.append(line)
-        if not replaced and line.strip() == '[environment]':
+    is_docker_image = line.lstrip().startswith('docker_image') and '=' in line
+    if is_docker_image:
+        # Exactly one docker_image line survives. The first occurrence
+        # becomes the pin; any later one (or one already emitted under
+        # [environment] below) is dropped rather than echoed -- two
+        # docker_image keys in the same table is a hard TOML parse error
+        # ("Key 'environment.docker_image' has already been defined"),
+        # which fails the case at gate time rather than at write time
+        # (2026-09-03: kamailio-05b2da1, whose task.toml shipped an empty
+        # docker_image = "" AFTER its [environment] header, so the header
+        # branch injected the pin and the original line was then echoed).
+        if not replaced:
             out.append(f'docker_image = "{digest}"\n')
             replaced = True
+        continue
+    out.append(line)
+    if not replaced and line.strip() == '[environment]':
+        out.append(f'docker_image = "{digest}"\n')
+        replaced = True
 if not replaced:
     # No [environment] section at all: append one (a case without environment
     # config would not have passed check_toml_image's environment/ check, but

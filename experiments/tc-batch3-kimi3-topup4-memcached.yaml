@@ -1,0 +1,110 @@
+# kimi-k3 trajectory top-up for memcached-aa35238 (2026-09-04).
+#
+# Clone of tc-batch3-kimi3-topup4-kamailio.yaml with the case path and names
+# swapped. memcached-aa35238 arrived from the factory 03:22, was rejected on
+# its first audit (04:10, DO NOT PROMOTE S2 module-shadow + S6/S9 log-text
+# forgery incl. an agent-run-daemon route + S8 preseedable extract), and was
+# repaired the same day: python -I in root contexts, ASAN_OPTIONS=log_path
+# provenance anchor into a root-owned 700 dir (scored tokens only from
+# asan_report.*), run-server.sh --no-reuse verifier mode (busy port fails
+# CLOSED), /tmp/verifier_output hygiene. The run-server.sh fix is baked, so
+# the image was rebuilt as :r1 and task.toml re-pinned to its digest. A
+# premature gate cycle on the half-repaired tree rejected at 04:51:55 and was
+# un-poisoned via hash bump; the honest re-gate started 04:58:20 on hash
+# ba74d4448122.
+#
+#   memcached-aa35238   1 traj on HF -> +3   (target 4)
+#
+# PRECONDITION: watch's ship_week2_atomic must have landed the task tree +
+# first trajectory on origin/week3 (ship_week2_trajectories requires an
+# existing task tree). Do not launch before verifying via hfcase git ls-tree.
+#
+# Everything else -- agent wiring, gates, ship destination -- is inherited
+# verbatim from tc-batch3-kimi3-topup4-kamailio.yaml; see that file's header
+# and tc-batch3-kimi3-topup4.yaml for the ccbin/stdin-prompt/
+# --allow-agent-host rationale. Concurrency 2 (one case x 3 trials) since
+# watch is live and its trials take priority.
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   ./rollout-man run experiments/tc-batch3-kimi3-topup4-memcached.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts.
+# Declared for schema completeness; no per_case buglocation step below
+# (admission already wrote solution/bug_location.json for every case).
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch3-kimi3-topup4-memcached
+
+case_defaults:
+  source: local
+
+# memcached only -- see the header for the atomic-ship precondition.
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/memcached-aa35238-commit-7eeac6e9-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 3
+
+# 1 case x 3 trials = 3 harbor runs (up to 3600s agent timeout each +
+# verifier + docker overhead). max_attempts 2 absorbs proxy-hiccup
+# HOST_ERRORs at the command layer (batch2/batch3 x3 precedent).
+concurrency: 2
+max_attempts: 2
+
+pipeline:
+  # Campaign-wide destination settings, declared once: every step's command
+  # inherits these as env vars. week3 is the HF branch batch3 publishes to;
+  # trajectory/ lives at the repo root next to task/.
+  with:
+    hf_revision: week3
+    hf_task_path: task/week3
+
+  # No per_case steps: admitted case (watch, 2026-09-03 16:0x) with
+  # solution/bug_location.json already written by watch's buglocate_kimi.
+  # Re-running admission gates would only re-burn audit budget against
+  # unchanged bytes.
+  per_case_concurrency: 1
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter (2026-08-31 policy): every completed rollout ships.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Trajectory-only materialization + sanitization + leak gate.
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship; skip = this trial
+    # cannot ship, the trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree (poisoned/truncated
+    # transcripts from proxy 429 fights must not reach the dataset).
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
+        dest: tinglydev/cyber-xianjin
+        # hf_revision/hf_task_path come from pipeline.with above.
+
+  per_experiment:
+    - uses: record_progress

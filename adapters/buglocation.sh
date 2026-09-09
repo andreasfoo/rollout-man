@@ -55,9 +55,15 @@ fi
 # The case's admission trajectory is the evidence: the freshest job under
 # jobs/ carries agent/claude-code.txt (the stream that found the crash) and
 # verifier output. Point the subagent at it rather than making it re-derive
-# the defect from source alone.
+# the defect from source alone. Cases without jobs/ (batch3-style intakes,
+# where the admission rollout's jobs land under RUN_DIR, not the case tree)
+# simply get no hint: the subagent localizes from the case package alone.
+# `find ... || true` because find exits 1 on a missing start dir, which
+# pipefail + set -e would turn into a silent exit-1 failure of the whole
+# adapter (first seen 2026-09-02: glib/brlcad rejected 9s into buglocation,
+# stderr swallowed by the redirect).
 traj_hint=""
-latest_job=$(find "$CASE_DIR/jobs" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort | tail -1)
+latest_job=$( { find "$CASE_DIR/jobs" -mindepth 2 -maxdepth 2 -type d 2>/dev/null || true; } | sort | tail -1)
 if [ -n "$latest_job" ] && [ -d "$latest_job/agent" ]; then
   traj_hint=" The case's own admission rollout already found the crash; its agent stream and verifier output are under $latest_job (agent/claude-code.txt names the crashing file/function and the sanitizer report). Use them as primary evidence, then confirm against the source tree paths named in instruction.md."
 fi

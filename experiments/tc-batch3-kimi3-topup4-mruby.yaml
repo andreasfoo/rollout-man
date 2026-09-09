@@ -1,0 +1,102 @@
+# kimi-k3 trajectory top-up for mruby-431d4bb (2026-09-03).
+#
+# Split out of tc-batch3-kimi3-topup4.yaml, which batches four short week3
+# cases behind one preflight. kamailio-05b2da1 still has task_files=0 on HF
+# week3 (its verifier repair is mid re-gate) and stays BLOCKED until watch's
+# ship_week2_atomic lands its task tree. mruby is not: its task tree + first
+# trajectory were committed to origin/week3 at 23:4x today by a manual replay
+# of the tc-batch3-kimi3-mruby-atomic materialized tree (the campaign's ship
+# step had died HOST_ERROR on the then-missing ship_week2_atomic command
+# name; the tree itself was complete). Verified via hfcase git ls-tree:
+# 12 task files + 1 jobs stamp + solution/bug_location.json.
+#
+#   mruby-431d4bb   1 traj on HF -> +3   (target 4)
+#
+# Everything else -- agent wiring, gates, ship destination -- is inherited
+# verbatim from tc-batch3-kimi3-topup4.yaml; see that file's header for the
+# ccbin/stdin-prompt/--allow-agent-host rationale. Concurrency 2 (one case x
+# 3 trials) since watch is live and its trials take priority.
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   ./rollout-man run experiments/tc-batch3-kimi3-topup4-mruby.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts.
+# Declared for schema completeness; no per_case buglocation step below
+# (admission already wrote solution/bug_location.json for every case).
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch3-kimi3-topup4-mruby
+
+case_defaults:
+  source: local
+
+# mruby only -- see the header for why kamailio is held back.
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch3/mruby-431d4bb-commit-a6b55e7-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 3
+
+# 1 case x 3 trials = 3 harbor runs (up to 3600s agent timeout each +
+# verifier + docker overhead). max_attempts 2 absorbs proxy-hiccup
+# HOST_ERRORs at the command layer (batch2/batch3 x3 precedent).
+concurrency: 2
+max_attempts: 2
+
+pipeline:
+  # Campaign-wide destination settings, declared once: every step's command
+  # inherits these as env vars. week3 is the HF branch batch3 publishes to;
+  # trajectory/ lives at the repo root next to task/.
+  with:
+    hf_revision: week3
+    hf_task_path: task/week3
+
+  # No per_case steps: admitted case (watch, 2026-09-03 16:0x) with
+  # solution/bug_location.json already written by watch's buglocate_kimi.
+  # Re-running admission gates would only re-burn audit budget against
+  # unchanged bytes.
+  per_case_concurrency: 1
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter (2026-08-31 policy): every completed rollout ships.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Trajectory-only materialization + sanitization + leak gate.
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship; skip = this trial
+    # cannot ship, the trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree (poisoned/truncated
+    # transcripts from proxy 429 fights must not reach the dataset).
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
+        dest: tinglydev/cyber-xianjin
+        # hf_revision/hf_task_path come from pipeline.with above.
+
+  per_experiment:
+    - uses: record_progress

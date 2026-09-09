@@ -815,14 +815,26 @@ func (r *Runner) loadDoneOnce() {
 func (r *Runner) execTrial(ctx context.Context, t *trial, res *Result) {
 	outDir := filepath.Join(r.Dir, "trials", t.ID, "out")
 	if err := r.postTrial(ctx, t, res, outDir, r.secretsFor(ctx, t)); err != nil {
-		if res.OK() {
+		switch {
+		case errors.Is(err, actions.ErrSkipCase) && res.OK():
+			// on_failure: skip on a measured trial is a publication veto, not
+			// a failure: the gate refused to let this trial's artifacts ship
+			// (RunList stopped the pipeline before ship), the measurement
+			// stands. Same posture as a guard's drop; converting it to a
+			// failure row is how a measured reward became a bogus HOST_ERROR
+			// "case skipped" (dnsdist-4becbeb fuzz-2, 2026-09-02).
+			res.Dropped = true
+			r.markDropped(t.ID)
+			r.logf("%s: measured but not shipped: skipped by %s (on_failure: skip)",
+				t.ID, res.Notes["skipped_by"])
+		case res.OK():
 			// A post step that fails on a measured trial is a real
 			// failure: it is what stands between the artifacts and
 			// whoever receives them.
 			code := fail.Of(err)
 			res.Reward = nil
 			res.Code, res.Category, res.Message = code, string(code.Category()), err.Error()
-		} else {
+		default:
 			r.logf("%s: post-trial steps on a failed trial: %v", t.ID, err)
 		}
 	}
@@ -984,9 +996,12 @@ func (r *Runner) actionCtx(scope actions.Scope) *actions.Ctx {
 		Scope: scope, Experiment: r.File.Experiment.Name,
 		RunID: filepath.Base(r.Dir), RunDir: r.Dir,
 		Cmds: r.Cmds, Log: r.Log,
-		Trials:  r.snapshot,
-		Dropped: r.isDropped,
-		Wrote:   r.markWrote,
+		// The pipeline-wide with: -- every step's command inherits these as
+		// its base layer (overridden by the step's own with:).
+		BaseWith: r.File.Experiment.Pipeline.With,
+		Trials:   r.snapshot,
+		Dropped:  r.isDropped,
+		Wrote:    r.markWrote,
 	}
 }
 
