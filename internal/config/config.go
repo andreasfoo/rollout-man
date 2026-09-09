@@ -587,6 +587,17 @@ func loadCommandsFile(path string, seen map[string]bool) (Commands, error) {
 }
 
 func Load(path string) (*File, error) {
+	return load(path, false)
+}
+
+// LoadForWatch accepts an empty static case list because watch discovers its
+// cases by scanning the supplied directory. All other submission validation
+// stays identical to Load, so batch commands still reject an empty roster.
+func LoadForWatch(path string) (*File, error) {
+	return load(path, true)
+}
+
+func load(path string, allowEmptyCases bool) (*File, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -640,15 +651,15 @@ func Load(path string) (*File, error) {
 	if !seen {
 		return nil, fmt.Errorf("no kind: Experiment in %s", path)
 	}
-	return f, f.validate()
+	return f, f.validate(allowEmptyCases)
 }
 
-func (f *File) validate() error {
+func (f *File) validate(allowEmptyCases bool) error {
 	e := &f.Experiment
 	if e.Name == "" {
 		return fmt.Errorf("experiment has no name")
 	}
-	if len(e.Cases) == 0 {
+	if len(e.Cases) == 0 && !allowEmptyCases {
 		return fmt.Errorf("experiment has no cases")
 	}
 	if e.Matrix.Trials <= 0 {

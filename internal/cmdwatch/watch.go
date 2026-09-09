@@ -218,7 +218,7 @@ func Cmd(args []string, d Deps) int {
 	}
 	defer release()
 
-	f, err := config.Load(file)
+	f, err := config.LoadForWatch(file)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "load:", err)
 		return 1

@@ -1,0 +1,535 @@
+# Week4 admission pipeline for tc_batch4: 18 fresh cases -> gate -> HF task/week4.
+#
+# Differences from tc-batch2-smoke (the week2 predecessor):
+#   - per_trial runs a LIVE kimi-k3 rollout (kimi3_rollout), not the mock:
+#     batch4 cases arrive with no jobs/ tree (only spidermonkey-commit-7f081dc
+#     carries a factory-gen trajectory), so there is nothing to replay -- the
+#     first trajectory each case ships is the one this pipeline generates.
+#   - check_traj_layout dropped: there is no pre-existing jobs/ layout to
+#     check; transcript integrity is enforced per trial by
+#     check_no_api_error_traj over exactly what would ship.
+#   - destination is week4 via pipeline.with (hf_revision/hf_task_path), the
+#     global layer every step's command inherits (2026-09-02).
+#
+# Image pre-step (2026-09-02): the 13 Dockerfile-only cases arrived with no
+# usable docker_image (12 absent + yices2 empty) and haproxy-1115fc3 pointed
+# at a local-only tag; their images were built+pushed and the tomls
+# digest-pinned BEFORE this watch starts. A case whose toml still lacks a
+# pullable image is dropped cheaply by check_toml_image (2026-09-01
+# hardening: pullability, not just presence) and re-gates automatically once
+# the backfill lands (week2 aria2 precedent).
+#
+# Preconditions (env of the watch process):
+#   HF_TOKEN=...        (ship)
+#   PROGRESS_FILE       optional (record_progress)
+# Run:
+#   go build -o rollout-man ./cmd/rollout-man
+#   ./rollout-man watch <tc_batch4 dir> experiments/tc-batch4-watch.yaml --full
+---
+kind: Commands
+timeout: 120m
+max_attempts: 2
+inherit_env: false
+
+# Per-case pre-check 0: reject a case whose on-disk footprint exceeds 100MB
+# before admission ever spins up a container for it. Same wording/rationale as
+# forge-flow-fuzz-week2.yaml's check_case_size -- a case this large is usually
+# a source tarball baked into environment/ (see spidermonkey-7f081dc in week1,
+# 97% of the whole dataset), a packaging mistake worth catching cheaply.
+check_case_size:
+  env: [PATH, HOME]
+  script: |
+    set -euo pipefail
+    limit_mb=100
+    size_bytes=$(du -sb "$CASE_DIR" | cut -f1)
+    size_mb=$((size_bytes / 1024 / 1024))
+    if [ "$size_mb" -gt "$limit_mb" ]; then
+      echo "check_case_size: FAIL $CASE_LABEL -- case is ${size_mb}MB, exceeds ${limit_mb}MB limit" >&2
+      exit 1
+    fi
+    echo "check_case_size: ok $CASE_LABEL -- ${size_mb}MB"
+
+# Per-case pre-check 1: reject a case name already published under any week*
+# branch and task/week* path. This runs before every local/Docker/LLM operation
+# so a dataset duplicate never consumes an audit, admission, or rollout slot.
+# HF lookup failures exit 75 rather than becoming a cached rejection.
+check_hf_week_duplicate:
+  env: [PATH, HOME, HF_TOKEN, HF_HOME]
+  script: |
+    set -euo pipefail
+    python3 - "$CASE_DIR" <<'PY'
+    import os, sys
+    try:
+        from huggingface_hub import HfApi, RepoFolder
+    except Exception as exc:
+        print(f"check_hf_week_duplicate: TEMPFAIL cannot load huggingface_hub: {exc}", file=sys.stderr)
+        sys.exit(75)
+
+    label = os.path.basename(os.path.abspath(sys.argv[1]))
+    token = os.environ.get("HF_TOKEN")
+    if not token:
+        print("check_hf_week_duplicate: TEMPFAIL HF_TOKEN is unavailable", file=sys.stderr)
+        sys.exit(75)
+
+    try:
+        api = HfApi(token=token)
+        refs = api.list_repo_refs("tinglydev/cyber-xianjin", repo_type="dataset")
+        # Scan every branch, rather than only week-named refs: published
+        # task/week* trees can also be inherited or accidentally shipped on
+        # main/batch branches, and all of them are duplicates for Batch 4.
+        revisions = sorted({branch.name for branch in refs.branches})
+        matches, scanned_paths = [], 0
+        for revision in revisions:
+            for entry in api.list_repo_tree("tinglydev/cyber-xianjin", path_in_repo="task",
+                                            revision=revision, repo_type="dataset"):
+                if not isinstance(entry, RepoFolder) or not entry.path.startswith("task/week"):
+                    continue
+                scanned_paths += 1
+                for child in api.list_repo_tree("tinglydev/cyber-xianjin", path_in_repo=entry.path,
+                                                revision=revision, repo_type="dataset"):
+                    if isinstance(child, RepoFolder) and child.path.rsplit("/", 1)[-1] == label:
+                        matches.append(f"{revision}:{child.path}")
+    except Exception as exc:
+        print(f"check_hf_week_duplicate: TEMPFAIL HF listing failed: {exc}", file=sys.stderr)
+        sys.exit(75)
+
+    if matches:
+        print(f"check_hf_week_duplicate: FAIL {label} already published at {', '.join(matches)}", file=sys.stderr)
+        sys.exit(1)
+    print(f"check_hf_week_duplicate: ok {label} -- scanned {len(revisions)} week branch(es), {scanned_paths} task path(s)")
+    PY
+
+# Per-case pre-check 2: require the published task policy before checking image
+# pullability or spending resources on audit/admission. This is validation only:
+# it never normalizes or writes back the source task.toml.
+check_task_toml_policy:
+  env: [PATH, HOME]
+  script: |
+    set -euo pipefail
+    python3 - "$CASE_DIR/task.toml" "$CASE_LABEL" <<'PY'
+    import math, sys, tomllib
+
+    path, label = sys.argv[1:]
+    try:
+        with open(path, "rb") as f:
+            doc = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"check_task_toml_policy: FAIL {label} -- cannot parse task.toml: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    failures = []
+    def table(name):
+        value = doc.get(name)
+        if not isinstance(value, dict):
+            failures.append(f"[{name}] missing or not a table")
+            return {}
+        return value
+    def exact(section, key, expected):
+        actual = section.get(key)
+        if actual != expected or type(actual) is not type(expected):
+            failures.append(f"{key} must be {expected!r}, got {actual!r}")
+
+    verifier = table("verifier")
+    exact(verifier, "user", "root")
+    exact(verifier, "network_mode", "no-network")
+
+    agent = table("agent")
+    timeout = agent.get("timeout_sec")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout != 3600:
+        failures.append(f"agent.timeout_sec must be numeric 3600.0, got {timeout!r}")
+    exact(agent, "user", "agent")
+    exact(agent, "network_mode", "allowlist")
+    if agent.get("allowed_hosts") != [] or not isinstance(agent.get("allowed_hosts"), list):
+        failures.append(f"agent.allowed_hosts must be [], got {agent.get('allowed_hosts')!r}")
+
+    environment = table("environment")
+    image = environment.get("docker_image")
+    if not isinstance(image, str) or not image.strip() or not image.startswith("cyborgzero/"):
+        failures.append(f"environment.docker_image must be a nonempty cyborgzero/... string, got {image!r}")
+    exact(environment, "network_mode", "public")
+
+    if failures:
+        print(f"check_task_toml_policy: FAIL {label}", file=sys.stderr)
+        for failure in failures:
+            print(f"  - {failure}", file=sys.stderr)
+        sys.exit(1)
+    print(f"check_task_toml_policy: ok {label}")
+    PY
+
+# Per-case pre-check 3: task.toml must carry a docker_image field, and the
+# case must have a top-level environment/ directory.
+# A missing or empty image is a packaging defect that blocks promotion before
+# wasting oracle/nop harbor runs. A missing environment/ is a packaging defect
+# too: Harbor's Task.is_valid_dir() requires task.toml *and* environment/ to
+# recognize `harbor run --path <dir>` as a single task; without it Harbor
+# silently falls through to dataset-mode, scans the dir, finds zero tasks, and
+# admission dies with "ValueError: Either datasets or tasks must be provided."
+# (first seen on dnsmasq-5b99eae-commit-a90f09db-t4, whose Dockerfile/seed/
+# tarballs sat at the case root instead of under environment/).
+check_toml_image:
+  env: [PATH, HOME]
+  script: |
+    set -euo pipefail
+    toml="$CASE_DIR/task.toml"
+    [ -f "$toml" ] || { echo "check_toml_image: FAIL -- task.toml not found" >&2; exit 1; }
+    if ! grep -qE '^\s*docker_image\s*=' "$toml"; then
+      echo "check_toml_image: FAIL $CASE_LABEL -- no docker_image field" >&2; exit 1
+    fi
+    val=$(grep -E '^\s*docker_image\s*=' "$toml" | head -1 | sed 's/.*=\s*//' | tr -d '"'"'"' ')
+    [ -n "$val" ] || { echo "check_toml_image: FAIL $CASE_LABEL -- docker_image is empty" >&2; exit 1; }
+    # Pullability, not just presence (2026-09-01: tarantool-2dbe1dc passed the
+    # field check with an image tag that existed nowhere -- every trial then
+    # died in 9s on "manifest unknown"). Local store OR registry must resolve
+    # it. Digest-pinned refs skip the registry probe: the pin IS the proof.
+    case "$val" in
+      *@sha256:*) : ;;
+      *)
+        if ! docker image inspect "$val" >/dev/null 2>&1 && \
+           ! docker manifest inspect "$val" >/dev/null 2>&1; then
+          echo "check_toml_image: FAIL $CASE_LABEL -- image $val neither in local store nor on registry" >&2
+          exit 1
+        fi
+        ;;
+    esac
+    if [ ! -d "$CASE_DIR/environment" ]; then
+      echo "check_toml_image: FAIL $CASE_LABEL -- no environment/ directory (harbor run --path" \
+        "requires task.toml + environment/ to treat this dir as a single task, otherwise it" \
+        "falls through to dataset-mode and admission fails with 'Either datasets or tasks" \
+        "must be provided')" >&2
+      exit 1
+    fi
+    # [metadata] status is pipeline-internal lifecycle state (accepted/keeper/
+    # draft-pending-oracle-validation/...), not task content -- strip it and
+    # write back to the source case dir so it never reaches HF (2026-08-28).
+    # Section-aware: only a status= line inside [metadata] is removed.
+    if grep -qE '^\s*status\s*=' "$toml"; then
+      awk '
+        /^[ \t]*\[/ { inmeta = ($0 ~ /^[ \t]*\[metadata\][ \t]*$/) }
+        inmeta && /^[ \t]*status[ \t]*=/ { next }
+        { print }
+      ' "$toml" > "$toml.stripped"
+      mv "$toml.stripped" "$toml"
+      echo "check_toml_image: stripped [metadata] status from $CASE_LABEL task.toml (written back)"
+    fi
+    echo "check_toml_image: ok $CASE_LABEL -- $val"
+
+# (fix_toml_image / fix_quality_audit command definitions removed 2026-08-27:
+# the week2 pipeline no longer wires autofix steps -- a failing check drops
+# the case for a human fix instead of attempting an in-pipeline repair.
+# The adapter scripts stay in adapters/ for manual use.)
+
+# Per-case pre-check 2: no Chinese text in the task content. The benchmark is
+# English-only; CJK characters in instruction/README/tests/solution/toml are a
+# production-side leak (comments, descriptions) that must not reach HF.
+# Scans text files only (NUL byte in the first 8KB = binary, skipped), and
+# skips the same dirs materialize never ships (.factory/trials/jobs/...).
+# FAIL lists up to 10 offending files with the first matching line each.
+check_no_chinese:
+  env: [PATH, HOME]
+  script: |
+    set -euo pipefail
+    python3 - "$CASE_DIR" "$CASE_LABEL" <<'PY'
+    import os, re, sys
+    case_dir, label = sys.argv[1], sys.argv[2]
+    SKIP_DIRS = {".factory", "trials", "jobs", ".triage", ".casefactory", "reject"}
+    # CJK ideographs (incl. ext-A, compat) + CJK punctuation + fullwidth forms
+    CJK = re.compile(r"[㐀-䶿一-鿿豈-﫿　-〿＀-￠]")
+    hits = []
+    for root, dirs, files in os.walk(case_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fn in sorted(files):
+            p = os.path.join(root, fn)
+            try:
+                data = open(p, "rb").read()
+            except OSError:
+                continue
+            if b"\x00" in data[:8192]:
+                continue  # binary
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if CJK.search(line):
+                    hits.append((os.path.relpath(p, case_dir), i, line.strip()[:80]))
+                    break  # first hit per file is enough to flag it
+    if hits:
+        print(f"check_no_chinese: FAIL {label} -- Chinese text in {len(hits)} file(s):", file=sys.stderr)
+        for rel, ln, ex in hits[:10]:
+            print(f"  {rel}:{ln}: {ex}", file=sys.stderr)
+        sys.exit(1)
+    print(f"check_no_chinese: ok {label}")
+    PY
+
+# Per-case pre-check 3: cyber-gate acc-quality-audit (11-point verifier-trust-boundary).
+# Invokes the acc-quality-audit skill via `claude -p` (subagent reads case files
+# statically and checks S1-S11: candidate code isolation, privilege drop,
+# self-report, mutable oracle, fd forgery, PoC compile bypass, etc.).
+# DO NOT PROMOTE (critical/high/direct_removal FAIL) blocks admission.
+# PROMOTE-WITH-WARNINGS (medium only) passes but is recorded.
+# Report is saved to $RUN_DIR/quality/<case-label>.txt.
+#
+# CYBER_GATE_ROOT  path to the cyber-gate source tree (default: /home/foo/project/cyber-gate).
+check_quality:
+  uses: adapters/acc-quality-audit.sh
+  # Must exceed the adapter's own attempt envelope: 5400s wall cap per
+  # attempt (raised 2026-09-03 for kamailio-class audits that are productive
+  # past 40m) + 90s gateway preflight + distillation. When this was 50m the
+  # runner SIGKILLed the adapter mid-audit at exactly 50:00 and the
+  # signal-kill was cached as a rejection against the case's content hash
+  # (kamailio-05b2da1, 2026-09-04 01:11:31) -- an infra failure masquerading
+  # as a verdict, same failure class the 50m value was meant to prevent.
+  timeout: 100m
+  # Which endpoint the audit subagent talks to is a submission setting, not
+  # ambient state: without llm_spec the adapter falls through to whatever
+  # ANTHROPIC_* the environment happens to carry (the interactive claude
+  # gateway), whose 500s/truncations were being archived as audit reports.
+  # Same spec name/shape as tc-batch1's quality-audit-llm.
+  llm_spec: quality-audit-llm
+  env: [PATH, HOME, CYBER_GATE_ROOT]
+
+# (fix_quality_audit definition removed 2026-08-27 alongside fix_toml_image;
+# see note above.)
+
+# Admission oracle/nop trials use the real Harbor adapter.
+# check_traj_layout is deliberately ABSENT (2026-09-02): it verifies a
+# pre-existing jobs/ tree, which batch4 cases do not carry (only
+# spidermonkey-commit-7f081dc has one). Transcript integrity is enforced per
+# trial by check_no_api_error_traj over exactly what would ship instead.
+harbor:
+  uses: adapters/harbor.sh
+  env: [DOCKER_HOST, PATH, HOME]
+
+# Live kimi-k3 rollout: harbor run with the agent-under-test config pinned by
+# the command's env (agent-kimi3.yaml + PYTHONPATH so harbor imports the
+# maintained agent module, not the stale site-packages copy). Used via the
+# builtin rollout action: `- uses: rollout / with: {using: kimi3_rollout}`.
+kimi3_rollout:
+  uses: adapters/kimi3-rollout.sh
+  env: [PATH, HOME, DOCKER_HOST, ROLLOUT_MAN_HARBOR_ADAPTER,
+        KIMI3_HARBOR_CONFIG, KIMI3_HARBOR_CWD]
+
+# Mock adapter kept for reference/debug only -- NOT wired into per_trial.
+# Batch3 cases arrive with no jobs/ tree; the mock (which replays jobs/) has
+# nothing to replay. per_trial uses the live kimi3_rollout instead.
+forge_flow_fuzz_mock:
+  uses: adapters/forge-flow-fuzz-mock.sh
+  env: [PATH, HOME, DOCKER_HOST, ROLLOUT_MAN_HARBOR_ADAPTER]
+
+# Hard gate: no CJK text in any file this trial is about to ship. Two-tier
+# (2026-08-31): a cheap codepoint scan first, then a deterministic gb2312
+# check (>=2 common-Chinese chars = real Chinese, blocked model-free,
+# 2026-09-01) with fasttext lid.176 adjudicating only single/rare-codepoint
+# runs -- a raw disassembly dump whose bytes decode to CJK glyphs passes,
+# real Chinese still blocks. Ported from commands.yaml because this
+# experiment carries its command defs inline (no --commands). Without it,
+# watch --full shipped short-run Chinese (spidermonkey-81ef425 "几十") to HF.
+# TRAJ_DIR comes from the step's with:.
+check_no_chinese_traj:
+  uses: adapters/check-no-chinese-traj.sh
+  env: [PATH, HOME]
+
+# Hard gate: no API-failure shapes in the trajectory's stream-json
+# transcripts (2026-08-31). A trial whose claude CLI retried through
+# 429s/overloads can still "succeed" and then ship a poisoned/truncated
+# transcript; this parses the transcripts and fails on api-error events or a
+# claude-code.txt with no result event. Ship-side backstop. TRAJ_DIR comes
+# from the step's with:.
+check_no_api_error_traj:
+  uses: adapters/check-no-api-error-traj.sh
+  env: [PATH, HOME]
+
+materialize_week2:
+  uses: adapters/materialize-forge-week2.sh
+  env: [PATH, HOME]
+
+# Per-trial materializer: builds this trial's slice of the two HF trees
+# inside its own OUT_DIR/materialized/{cases,trajectories}.
+materialize_week2_trial:
+  uses: adapters/materialize-forge-week2-trial.sh
+  env: [PATH, HOME, RUN_DIR]
+
+record_progress:
+  uses: adapters/record-forge-progress.sh
+  # PROGRESS_FILE unset: the adapter falls back to ./Progress.md in rollout-man's
+  # working directory (the repo root), so the ledger still lands somewhere sane.
+  env: [PATH, HOME, PROGRESS_FILE]
+
+ship_week2_atomic:
+  uses: adapters/ship-hf-week2-atomic.sh
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH]
+
+ship_week2_cases:
+  uses: adapters/ship-hf-week2-cases.sh
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
+        ROLLOUT_MAN_SHIP_HF_ADAPTER]
+
+ship_week2_trajectories:
+  uses: adapters/ship-hf-week2-trajectories.sh
+  env: [HF_TOKEN, HF_HOME, HF_REVISION, HF_PRIVATE, HOME, PATH,
+        ROLLOUT_MAN_SHIP_HF_ADAPTER]
+
+# Bug localization per accepted case (2026-08-31). kimi-k3 per user
+# direction -- deliberately NOT the quality-audit spec: this is a different
+# task (structured localization vs 11-point audit) and k3 completed it fine
+# in the 2026-08-31 allegro5 smoke (correct function/lines/fix-commit/CWE).
+buglocate_kimi:
+  uses: adapters/buglocation.sh
+  # Two 20m subagent attempts + 90s preflight, same envelope as check_quality.
+  timeout: 45m
+  llm_spec: buglocation-llm
+  env: [PATH, HOME, LLM_BASE_URL, LLM_MODEL, LLM_API_KEY]
+---
+# The audit/fix subagents' endpoint (check_quality, fix_quality_audit).
+# Same spec tc-batch1 declares: the local tingly gateway fronting kimi-k3.
+# 2026-08-30: model moved kimi-k3 -> kimi-k2.7-code. kimi-k3 deterministically
+# stalled ~15 bytes into the dnsmasq-982faf4 audit (3 watch attempts + 1
+# manual run, all timeout-killed at the 20m cap; gateway otherwise healthy,
+# every other case audited fine). k2.7-code completed the same audit in one
+# pass (PROMOTE-WITH-WARNINGS, 11/11 static CLEAN).
+kind: LLMSpec
+name: quality-audit-llm
+provider: anthropic
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k2.7-code
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+# Bug localization endpoint (2026-08-31). kimi-k3 per user direction; the
+# 2026-08-31 allegro5 smoke completed cleanly in one pass.
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch4-watch
+
+case_defaults:
+  source: local
+
+# Watch discovers every direct child task directory in tc_batch4; do not list cases here.
+matrix:
+  # forge-flow-fuzz is the name kimi3-rollout.sh pins its agent config to
+  # (single source of truth with the factory's gen trials); the agent that
+  # actually runs is ClaudeCodeThirdParty -> kimi-k3 via the tingly proxy.
+  agents:
+    - name: forge-flow-fuzz
+  # 1 live kimi-k3 trajectory per case. Additional passes (if wanted later)
+  # raise this; admission itself is unaffected (it runs its own oracle/nop).
+  trials: 1
+
+# 18 cases x 1 live trial. Admission (oracle+nop) runs two harbor trials per
+# case, parallelised across cases; the live rollout is the long pole (agent
+# timeout up to 3600s). 12 concurrent is the wave-4-proven budget on this
+# host (2026-09-02); max_attempts 2 absorbs one proxy hiccup per command.
+concurrency: 12
+max_attempts: 2
+
+pipeline:
+  # Campaign-wide destination settings, declared once: every step's command
+  # inherits these as env vars (a step's own with: can override). week4 is
+  # the HF branch this batch publishes to (created 2026-09-02 from main);
+  # task/week4 is the cases tree's repo path.
+  with:
+    hf_revision: week4
+    hf_task_path: task/week4
+
+  per_case_concurrency: 4
+  per_case:
+    # 0. Reject a published duplicate before any local or remote expensive work.
+    - uses: check_hf_week_duplicate
+      on_failure: skip
+    # 1. Enforce the Batch 4 verifier/agent/environment publication policy.
+    - uses: check_task_toml_policy
+      on_failure: skip
+    # 2. Reject an oversized case (packaging mistake) before container work.
+    - uses: check_case_size
+      on_failure: skip
+    # 3. task.toml must have a pullable docker image and environment directory.
+    #    (Autofix removed 2026-08-27: fix_toml_image's build+push+backfill is
+    #    better run by hand than by a loop that also re-gates on adapter churn.)
+    - uses: check_toml_image
+      on_failure: skip
+    # 1b. no Chinese text in task content -- cheap, catches production-side
+    #    leaks before spending 10min on the quality audit.
+    - uses: check_no_chinese
+      on_failure: skip
+    # 2. acc-quality-audit (11-point verifier-trust-boundary AI review via claude -p).
+    #    Autofix removed 2026-08-27: fix_quality_audit's repair quality was poor
+    #    (half-applied patches, empty-report "fixes", category ping-pong). A
+    #    failing audit now drops the case for a human fix instead of attempting
+    #    an in-pipeline repair.
+    - uses: check_quality
+      on_failure: skip
+    # 3. admission -- oracle must score 1.0, nop must score 0.0.
+    #    on_failure: skip so one case's rejection (or a harbor ENV_FAILED --
+    #    e.g. a packaging defect check_toml_image didn't catch) drops just
+    #    that case instead of cancel()-ing the whole per_case run (see
+    #    internal/run/run.go perCase: a step that returns a plain error, not
+    #    ErrSkipCase, aborts every case still queued behind the semaphore).
+    - uses: admission
+      on_failure: skip
+      with: {oracle_min_reward: 1.0, nop_max_reward: 0.0, trials: 1}
+    # 4. (check_traj_layout deliberately absent -- see its command def above;
+    #    batch4 cases carry no pre-existing jobs/ tree to check.)
+    # 5. bug localization (2026-08-31) -- RUN_DIR/buglocation/<case>.json in
+    #    the corpus-standard solution/bug_location.json shape. Never writes
+    #    into the case dir (solution/ is inside the watch content hash).
+    #    kimi-k3, per user direction; uses the case's own admission
+    #    trajectory as evidence. on_failure: skip -- a localization failure
+    #    must not re-gate or block admission of a good case.
+    - uses: buglocation
+      with: {using: buglocate_kimi}
+      on_failure: skip
+
+  per_trial:
+    # Live kimi-k3 rollout -- batch4 cases arrive with no jobs/ tree to
+    # replay (the week2 mock's premise), so the first trajectory each case
+    # ships is the one this pipeline generates.
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter: for rollout collection every completed attempt is
+    # useful data -- even a 1.0 is a good trajectory. Only require_measured
+    # stays, so an infra-killed (unscored) trial never ships.
+    - uses: guard
+      name: measured-only
+      with: {require_measured: true}
+      on_violation: drop
+
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # This trial's slice of the two trees, inside its own OUT_DIR. Rejected
+    # trials never wrote OUT_DIR/case, so the step exits 0 and there is
+    # nothing to ship.
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship (2026-09-01). skip =
+    # this trial's ship step is skipped; the CJK-bearing trajectory stays in
+    # OUT_DIR for manual triage. Without this, watch --full shipped short-run
+    # Chinese to HF (spidermonkey-81ef425 "几十").
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree: a trial that fought through
+    # 429s/overloads "succeeds" with a poisoned/truncated transcript -- skip
+    # its ship.
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # Single atomic HF commit: task/week4 case tree + trajectory in one push,
+    # scoped to the shared materialized/ parent of this trial's two trees.
+    # Branch (week4) and repo path (task/week4) come from pipeline.with.
+    - uses: ship
+      with:
+        using: ship_week2_atomic
+        path: "{{steps.materialize_week2_trial.outputs.materialized_dir}}"
+        dest: tinglydev/cyber-xianjin
+
+  per_experiment:
+    - uses: record_progress
