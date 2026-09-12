@@ -628,7 +628,21 @@ func (r *Runner) probe(ctx context.Context, c *casesrc.Case, kind rexec.AgentKin
 			Case: c, Agent: string(kind), Kind: kind, Index: i}
 		res := r.once(ctx, t)
 		if !res.OK() {
-			// res.Message already carries the code.
+			// A probe that could not run is not a verdict, and the error's
+			// class decides what the gate may do with it. Env/Infra codes
+			// (image build, container start, docker daemon down) keep their
+			// typed fail.Error so RunList's tempfail bypass can refuse to
+			// record a rejection the case never earned -- otherwise
+			// on_failure: skip caches ENV_FAILED as "not admitted" on
+			// unchanged bytes and the case is parked forever (tarantool
+			// 2026-09-12: the host Docker daemon was down; the rejection
+			// persisted and only a content bump revived it). Verifier and
+			// agent codes ARE the case's own verdict -- VERIFIER_ERROR means
+			// the verifier is broken and agent failures mean the probe ran
+			// and failed -- so those stay plain errors.
+			if cat := res.Code.Category(); cat == fail.Env || cat == fail.Infra {
+				return nil, fail.New(res.Code, res.Message)
+			}
 			return nil, fmt.Errorf("%s", res.Message)
 		}
 		got = append(got, *res.Reward)

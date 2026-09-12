@@ -10,6 +10,7 @@ import (
 
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
 	"github.com/andreasfoo/rollout-man/internal/config"
+	"github.com/andreasfoo/rollout-man/internal/fail"
 )
 
 func TestGuardStrictMax(t *testing.T) {
@@ -157,7 +158,7 @@ func TestPipelineWithIsBaseLayer(t *testing.T) {
 		os.Remove(envfile)
 		c := &Ctx{Scope: PerTrial, RunDir: dir, BaseWith: base,
 			Trial: &Trial{ID: "t-1"},
-			Cmds: cmdrun.New(cmds, nil), Log: func(string, ...any) {}}
+			Cmds:  cmdrun.New(cmds, nil), Log: func(string, ...any) {}}
 		a := config.Action{Uses: "ship", With: map[string]any{
 			"using": "capturing", "dest": "tinglydev/cyber-xianjin",
 		}}
@@ -173,7 +174,7 @@ func TestPipelineWithIsBaseLayer(t *testing.T) {
 		os.Remove(envfile)
 		c := &Ctx{Scope: PerTrial, RunDir: dir, BaseWith: base,
 			Trial: &Trial{ID: "t-1"},
-			Cmds: cmdrun.New(cmds, nil), Log: func(string, ...any) {}}
+			Cmds:  cmdrun.New(cmds, nil), Log: func(string, ...any) {}}
 		a := config.Action{Uses: "ship", With: map[string]any{
 			"using": "capturing", "hf_revision": "week4",
 		}}
@@ -212,4 +213,39 @@ func envMap(t *testing.T, p string) map[string]string {
 		}
 	}
 	return m
+}
+
+type envFailingAction struct{}
+
+func (envFailingAction) Name() string                 { return "env-failing-test" }
+func (envFailingAction) Scopes() []Scope              { return []Scope{PerCase} }
+func (envFailingAction) Validate(config.Action) error { return nil }
+func (envFailingAction) Run(context.Context, *Ctx, config.Action) error {
+	return fail.New(fail.EnvFailed, "harbor run exited 1 and produced no trial directory")
+}
+
+// TestRunListEnvFailureIsNotAVerdict: a step failing with an Env/Infra
+// fail.Error (a probe that could not run -- docker daemon down, image build
+// failure) must bypass on_failure: skip instead of being recorded as a
+// rejection. The tarantool 2026-09-12 incident: ENV_FAILED from a dead
+// Docker daemon was cached as "not admitted" on unchanged bytes and the case
+// was parked until a content bump.
+func TestRunListEnvFailureIsNotAVerdict(t *testing.T) {
+	register(envFailingAction{})
+	c := &Ctx{Scope: PerCase}
+	err := RunList(context.Background(), c, []config.Action{
+		{Uses: "env-failing-test", OnFailure: "skip"},
+	}, nil)
+	if errors.Is(err, ErrSkipCase) {
+		t.Fatal("an environment failure was converted to ErrSkipCase (cached as a rejection)")
+	}
+	if err == nil {
+		t.Fatal("an environment failure must still be a hard error, just not a verdict")
+	}
+	if !strings.Contains(err.Error(), "ENV_FAILED") {
+		t.Fatalf("err=%v, want the fail code preserved", err)
+	}
+	if _, noted := c.Notes["skipped_by"]; noted {
+		t.Fatal("an environment failure recorded skipped_by (a verdict note)")
+	}
 }

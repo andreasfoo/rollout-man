@@ -26,6 +26,7 @@ import (
 
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
 	"github.com/andreasfoo/rollout-man/internal/config"
+	"github.com/andreasfoo/rollout-man/internal/fail"
 )
 
 type Scope string
@@ -176,10 +177,23 @@ var ErrSkipCase = errors.New("case skipped")
 // "rejected" poisoned three cases before this protocol existed.)
 const ExitTempfail = 75 // EX_TEMPFAIL
 
-// isTempfail reports whether err wraps a command exit with code ExitTempfail.
+// isTempfail reports whether err wraps a command exit with code ExitTempfail,
+// or carries a fail.Error whose category is the environment failing rather
+// than the unit being checked (a probe that could not run: ENV_FAILED image
+// builds, INFRA machinery). Same contract as ExitTempfail: not a verdict, so
+// on_failure must not be allowed to record one.
 func isTempfail(err error) bool {
 	var exitErr *exec.ExitError
-	return errors.As(err, &exitErr) && exitErr.ExitCode() == ExitTempfail
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == ExitTempfail {
+		return true
+	}
+	var ferr *fail.Error
+	if errors.As(err, &ferr) {
+		if cat := ferr.Code.Category(); cat == fail.Env || cat == fail.Infra {
+			return true
+		}
+	}
+	return false
 }
 
 func register(a Action) { registry[a.Name()] = a }
