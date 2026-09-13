@@ -1,0 +1,134 @@
+# kimi-k3 trajectory top-up for week4 (2026-09-13, user-approved).
+#
+# Brings every week4 case short of 4 trajectories on HF up to the bar:
+# 27 cases at 1 traj + freetype-9ae5eaf at 2 = 83 trials (uniform 3 per
+# case; freetype lands at 5, matching how week3 cases landed unevenly).
+# The 7 moved-from-week2 cases (clickhouse-2165cc1, dnsdist-4becceb,
+# squid x2, spidermonkey x2, tarantool-bc0daf9) already sit at >=4 and
+# are excluded. Counts verified 2026-09-13 via ls-tree of
+# trajectory/<case>/jobs on origin/week4.
+#
+# Why a campaign and not the watch: tc-batch4-watch.yaml runs
+# trials: 1 per case by design ("Additional passes (if wanted later)
+# raise this") -- the watch is the admission path, top-ups are separate
+# campaigns (week3 precedent: topup4/topup5-short).
+#
+# HARD PRECONDITION -- each case's task tree is already on HF week4:
+# verified 2026-09-13 via ls-tree before writing this file; ships are
+# trajectory-only (materialize_week2_trial + ship_week2_trajectories
+# write only under trajectory/<case>/). New-path ships only; nothing
+# existing is overwritten.
+#
+# Destination: hf_revision week4, hf_task_path task/week4 -- mirrors
+# tc-batch4-watch.yaml pipeline.with exactly.
+#
+# Agent wiring: adapters/kimi3-rollout.sh runs ClaudeCodeBinThirdParty
+# via harbor (native claude binary, zero egress, LLM proxy allowlisted,
+# CLAUDE_CODE_PROMPT_VIA_STDIN=1, thinklimit-shim on the proxy rewrites
+# runaway thinking to budget_tokens). Same as every topup since 2026-09-03.
+#
+# Preconditions (env):
+#   HF_TOKEN=...   (ship)
+#   PROGRESS_FILE  optional (record_progress)
+# Run:
+#   ./rollout-man run experiments/tc-batch4-kimi3-topup.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts.
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch4-kimi3-topup
+
+case_defaults:
+  source: local
+
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/389ds-c5b4f8b-commit-d05b790-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/cyrus-8add938-commit-c9425f9-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/freetype-9ae5eaf-commit-dec8e7b-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/ghostscript-39335e2-commit-cc3a9c2-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/haproxy-7f4ffad-commit-0fda8d2-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/imagemagick-26b7e6dc-commit-326451a-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/imagemagick-e31343f-commit-1061db7-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/libredwg-8c818a83-commit-f171d16c-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/openssh-3b23566a-commit-bad0e016-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/openssh-73ab9ba-commit-abf3144-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/openssl-d395153-commit-5efde2a-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/openssl-d8ea426-commit-6cdcfd7-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/openssl-ff542b6-commit-73f3bd8-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/pipewire-931505a-commit-42d5109-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/qemu-f893c46-commit-90aacd5-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/quickjs-210ecb2-commit-c5d8083-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/quickjs-6d9bfbd-commit-d0c2272-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/quickjs-a07a918-commit-7955cfd-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/quickjs-ae7fc2b-commit-daab4ad-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/samba-7dab9ed-commit-ff2de50-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/spidermonkey-02439f7-bug-1683614-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/spidermonkey-30e8e6b-commit-8f33c4f-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/spidermonkey-7f93b6d-bug-2029793-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/spidermonkey-b0c003f-bug-1832825-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/spidermonkey-d63b07e-bug-1904011-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/spidermonkey-de91275-bug-2010940-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/tarantool-64ba291f-commit-4205553a-bin-t4
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/yara-d5ae8ef-commit-7b7c796-bin-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 3
+
+# 28 cases x 3 trials = 84 harbor runs (freetype lands at 5; the matrix has
+# no per-case count -- week3 topup5-short precedent). Up to 3600s agent
+# timeout each + verifier + docker overhead. concurrency 3: the batch4 watch
+# is live and its trials take priority; spidermonkey builds are heavy.
+# max_attempts 2 absorbs proxy-hiccup HOST_ERRORs at the command layer
+# (x3/topup10 precedent).
+concurrency: 3
+max_attempts: 2
+
+pipeline:
+  with:
+    hf_revision: week4
+    hf_task_path: task/week4
+
+  # No per_case steps: admitted cases with solution/bug_location.json
+  # already written. Re-running admission gates would re-burn audit budget
+  # against unchanged bytes.
+  per_case_concurrency: 3
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter (2026-08-31 policy): every completed rollout ships.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    # Trajectory-only materialization + sanitization + leak gate.
+    - uses: materialize_week2_trial
+
+    # CJK gate over exactly what this trial would ship; skip = this trial
+    # cannot ship, the trajectory stays in OUT_DIR for manual triage.
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    # API-failure backstop over the same tree.
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
+        dest: tinglydev/cyber-xianjin
+        # hf_revision/hf_task_path come from pipeline.with above.
+
+  per_experiment:
+    - uses: record_progress
