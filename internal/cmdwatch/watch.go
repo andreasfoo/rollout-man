@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/andreasfoo/rollout-man/internal/casedef"
 	"github.com/andreasfoo/rollout-man/internal/casesrc"
 	"github.com/andreasfoo/rollout-man/internal/cmdrun"
 	"github.com/andreasfoo/rollout-man/internal/config"
@@ -668,7 +669,12 @@ func topup(ctx context.Context, r *run.Runner, dir string, st *state,
 		if st.Cases[name] != hash {
 			continue
 		}
-		c := &casesrc.Case{Label: name, Dir: caseDir, SHA256: hash}
+		cfg, err := casedef.Load(caseDir)
+		if err != nil {
+			logf("watch: case %s: reroll skipped: parse task.toml: %v", name, err)
+			continue
+		}
+		c := &casesrc.Case{Label: name, Dir: caseDir, SHA256: hash, Config: cfg}
 		seq := r.RecordedTopups(name) + 1
 		enq[name] = seq
 		logf("watch: case %s: %d/%d trajectories on %s -> reroll %d", name, counts[name], target, rev, seq)
