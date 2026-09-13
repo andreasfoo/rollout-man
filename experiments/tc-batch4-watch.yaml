@@ -416,9 +416,17 @@ matrix:
   # actually runs is ClaudeCodeThirdParty -> kimi-k3 via the tingly proxy.
   agents:
     - name: forge-flow-fuzz
-  # 1 live kimi-k3 trajectory per case. Additional passes (if wanted later)
-  # raise this; admission itself is unaffected (it runs its own oracle/nop).
+  # 1 live kimi-k3 trajectory per case: admission's own ship. Rerolls past
+  # it are the watch's traj_target maintenance loop below, NOT this number
+  # (raising it breaks RunOneTrial's one-trial-per-agent matrix invariant).
   trials: 1
+
+# The maintenance target: every admitted case is topped up to 4 trajectories
+# on HF week4 -- the admission trial plus 3 rerolls ("3 rerolls, plus the one
+# from the acc repos" -- user, 2026-09-13). One reroll per case at a time,
+# re-checked every 5 minutes; cases whose ships keep failing stop being
+# re-offered after target+3 attempts. 0 (unset) disables the loop.
+traj_target: 4
 
 # 18 cases x 1 live trial. Admission (oracle+nop) runs two harbor trials per
 # case, parallelised across cases; the live rollout is the long pole (agent
