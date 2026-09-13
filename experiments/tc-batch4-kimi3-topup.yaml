@@ -84,11 +84,13 @@ matrix:
 
 # 28 cases x 3 trials = 84 harbor runs (freetype lands at 5; the matrix has
 # no per-case count -- week3 topup5-short precedent). Up to 3600s agent
-# timeout each + verifier + docker overhead. concurrency 3: the batch4 watch
-# is live and its trials take priority; spidermonkey builds are heavy.
-# max_attempts 2 absorbs proxy-hiccup HOST_ERRORs at the command layer
-# (x3/topup10 precedent).
-concurrency: 3
+# timeout each + verifier + docker overhead. concurrency 6 (raised from 3 at
+# 35/84, 2026-09-14): the batch4 watch is idle with no arrivals, the host is
+# at half load, and tc-batch4-watch.yaml documents 12 concurrent kimi-k3
+# rollouts as the proven budget on this host -- 6 keeps clear headroom
+# should arrivals resume. max_attempts 2 absorbs proxy-hiccup HOST_ERRORs at
+# the command layer (x3/topup10 precedent).
+concurrency: 6
 max_attempts: 2
 
 pipeline:
