@@ -810,11 +810,10 @@ func (r *Runner) RunOneTrial(ctx context.Context, c *casesrc.Case) (Result, erro
 // RunTopupTrial runs one extra rollout of an already-gated, already-shipped
 // case through the same per_trial pipeline RunOneTrial uses -- watch's
 // trajectory maintenance calls it to bring a case's shipped-trajectory count
-// up to the experiment's traj_target. The seq distinguishes rerolls from the
-// admission trial and from each other: the matrix's one-trial ID stays
-// <case>-<agent>-1, so a topup uses <case>-<agent>-topup<seq>, and a rerun of
-// the same seq refuses the same way ("already recorded") rather than shipping
-// a duplicate.
+// up to the experiment's traj_target. The ID <case>-<agent>-topup<seq>
+// distinguishes rerolls from the admission trial (<case>-<agent>-1) and from
+// each other, and a rerun of the same seq refuses the same way ("already
+// recorded") rather than shipping a duplicate.
 func (r *Runner) RunTopupTrial(ctx context.Context, c *casesrc.Case, seq int) (Result, error) {
 	ex := &r.File.Experiment
 	if len(ex.Matrix.Agents) > 1 {
@@ -830,7 +829,7 @@ func (r *Runner) RunTopupTrial(ctx context.Context, c *casesrc.Case, seq int) (R
 		kind = rexec.Nop
 	}
 	t := &trial{
-		ID: fmt.Sprintf("%s-topup%d", trialID(c, a.Name, a.LLMSpec, seq), seq), Case: c,
+		ID: slug(c.Label) + "-" + slug(a.Name) + fmt.Sprintf("-topup%d", seq), Case: c,
 		Agent: a.Name, Kind: kind, LLMSpec: a.LLMSpec, Index: seq,
 	}
 	r.loadDoneOnce()
