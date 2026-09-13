@@ -499,6 +499,15 @@ type Experiment struct {
 	Concurrency  int       `yaml:"concurrency"`
 	Pipeline     Pipeline  `yaml:"pipeline"`
 	MaxAttempts  int       `yaml:"max_attempts"`
+
+	// TrajTarget is the per-case trajectory floor a watch tops up toward
+	// (default 0 = off). It counts jobs under trajectory/<case>/jobs on the
+	// HF revision named by pipeline.with.hf_revision, so the count includes
+	// trajectories that predate this watch (moved-in week2 cases, factory
+	// gens). Admission itself is unaffected: watch still runs the matrix's
+	// one trial per arrival, then rerolls until the HF count reaches the
+	// floor -- "3 rerolls plus the one from the acc repo" is TrajTarget 4.
+	TrajTarget int `yaml:"traj_target"`
 }
 
 // Near is the directory the submission was loaded from. Paths inside it are

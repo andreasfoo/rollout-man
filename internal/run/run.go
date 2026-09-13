@@ -807,6 +807,62 @@ func (r *Runner) RunOneTrial(ctx context.Context, c *casesrc.Case) (Result, erro
 	return res, nil
 }
 
+// RunTopupTrial runs one extra rollout of an already-gated, already-shipped
+// case through the same per_trial pipeline RunOneTrial uses -- watch's
+// trajectory maintenance calls it to bring a case's shipped-trajectory count
+// up to the experiment's traj_target. The seq distinguishes rerolls from the
+// admission trial and from each other: the matrix's one-trial ID stays
+// <case>-<agent>-1, so a topup uses <case>-<agent>-topup<seq>, and a rerun of
+// the same seq refuses the same way ("already recorded") rather than shipping
+// a duplicate.
+func (r *Runner) RunTopupTrial(ctx context.Context, c *casesrc.Case, seq int) (Result, error) {
+	ex := &r.File.Experiment
+	if len(ex.Matrix.Agents) > 1 {
+		return Result{}, fmt.Errorf("RunTopupTrial needs a matrix with exactly one agent, %s declares %d",
+			ex.Name, len(ex.Matrix.Agents))
+	}
+	a := ex.Matrix.Agents[0]
+	kind := rexec.LLM
+	switch a.Name {
+	case "oracle":
+		kind = rexec.Oracle
+	case "nop":
+		kind = rexec.Nop
+	}
+	t := &trial{
+		ID: fmt.Sprintf("%s-topup%d", trialID(c, a.Name, a.LLMSpec, seq), seq), Case: c,
+		Agent: a.Name, Kind: kind, LLMSpec: a.LLMSpec, Index: seq,
+	}
+	r.loadDoneOnce()
+	if r.done[t.ID] {
+		return Result{}, fmt.Errorf("RunTopupTrial: trial %s is already recorded in %s", t.ID, r.resultsPath())
+	}
+	r.step(t.ID, t.Case.Label, r.executorName())
+	res := r.attempts(ctx, t)
+	r.execTrial(ctx, t, &res)
+	r.reportTrial(t, res)
+	return res, nil
+}
+
+// RecordedTopups counts this run's already-recorded topup trials for a case
+// label. Watch's maintenance pass needs it to tell "a reroll is in flight"
+// (enqueued but not yet recorded) from "all enqueued rerolls have landed" --
+// without it, a reroll that takes an hour would be joined by a new one every
+// pass, overshooting the target before the first ship lands.
+func (r *Runner) RecordedTopups(label string) int {
+	r.loadDoneOnce()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prefix := slug(label) + "-"
+	n := 0
+	for id := range r.done {
+		if strings.HasPrefix(id, prefix) && strings.Contains(id, "-topup") {
+			n++
+		}
+	}
+	return n
+}
+
 // loadDoneOnce loads results.jsonl the first time it is asked about. Run()
 // calls loadDone before any trial starts; RunOneTrial -- reached through
 // watch, outside Run's lifecycle -- needs the same "already recorded" answer
@@ -1129,6 +1185,13 @@ func (r *Runner) append(res Result) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.results = append(r.results, res)
+	if r.done == nil {
+		// A bare Runner that has never loaded results.jsonl (tests, a
+		// ship-only resume) appends without loadDone -- the map must not be
+		// nil when the append marks the row done.
+		r.done = map[string]bool{}
+	}
+	r.done[res.TrialID] = true
 	f, err := os.OpenFile(r.resultsPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return

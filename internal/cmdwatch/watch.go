@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -274,6 +275,14 @@ func Cmd(args []string, d Deps) int {
 	t := time.NewTicker(*interval)
 	defer t.Stop()
 	finished := false
+	// Top-up pacing: a reroll runs for the better part of an hour, so
+	// re-checking HF every scan interval (15s of git fetch + ls-tree per
+	// case) buys nothing. 5 minutes is responsive enough for a count that
+	// only moves when a trial finishes. enq is the in-memory enqueue count
+	// that pairs with RecordedTopups (see topup).
+	trajTick := time.NewTicker(5 * time.Minute)
+	defer trajTick.Stop()
+	enq := map[string]int{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -297,6 +306,15 @@ func Cmd(args []string, d Deps) int {
 				} else {
 					finished = true
 				}
+			}
+		case <-trajTick.C:
+			// Trajectory maintenance: admission ships one trajectory per
+			// case (the "one from the acc repo"); this pass brings every
+			// admitted case up to traj_target on the HF revision the
+			// pipeline ships to. Skipped entirely without --full or when
+			// traj_target is unset -- it is an opt-in of the submission.
+			if *full && r.File.Experiment.TrajTarget > 0 {
+				topup(ctx, r, absDir, st, d.Logf, sem, &wg, enq)
 			}
 		}
 	}
@@ -532,4 +550,157 @@ func poll(ctx context.Context, r *run.Runner, dir string, st *state, statePath s
 		}
 	}
 	return false
+}
+
+// hfcaseMirror is where the ship-side mirror of tinglydev/cyber-xianjin
+// lives. A constant, like the adapters' HFCASE default: one machine, one
+// mirror.
+const hfcaseMirror = "/home/foo/project/hfcase"
+
+// hfTrajCounts fetches the hfcase mirror and counts jobs under
+// trajectory/<case>/jobs for every name in want, on the revision the pipeline
+// ships to. The mirror is the same source of truth the ship adapters and
+// manual audits read; counting origin/<rev> after a fetch avoids depending
+// on whatever branch the checkout happens to hold. Returns nil counts (and a
+// false ok) on any git failure -- the caller skips this pass rather than
+// acting on a wrong number.
+func hfTrajCounts(rev string, want []string) (map[string]int, bool) {
+	return hfTrajCountsIn(hfcaseMirror, rev, want)
+}
+
+func hfTrajCountsIn(mirror, rev string, want []string) (map[string]int, bool) {
+	// fetch.negotiationAlgorithm=noop works around the HF git server's
+	// flaky negotiation (the adapters' standing fix); -q keeps a fetch of a
+	// large history from spamming the watch log.
+	if err := exec.Command("git", "-c", "fetch.negotiationAlgorithm=noop", "-C",
+		mirror, "fetch", "-q", "origin", rev).Run(); err != nil {
+		return nil, false
+	}
+	counts := map[string]int{}
+	for _, name := range want {
+		// -r, and count distinct job stamps: ls-tree without -r (or counting
+		// raw lines) collapses every file under jobs/<stamp>/ into "the
+		// subtree exists" and undercounts a case at 1. Same positional
+		// counting the preflight adapters do.
+		out, err := exec.Command("git", "-C", mirror, "ls-tree", "-r", "--name-only",
+			"origin/"+rev, "trajectory/"+name+"/jobs/").Output()
+		if err != nil {
+			return nil, false
+		}
+		stamps := map[string]bool{}
+		for _, line := range strings.Split(string(out), "\n") {
+			p := strings.Split(strings.TrimSpace(line), "/")
+			if len(p) >= 4 && p[2] == "jobs" && p[3] != "" {
+				stamps[p[3]] = true
+			}
+		}
+		counts[name] = len(stamps)
+	}
+	return counts, true
+}
+
+// topup is the trajectory-maintenance pass: for every case the watch state
+// knows is admitted (its dir still present), compare the shipped trajectory
+// count on HF against traj_target and run rerolls for the shortfall. A
+// reroll is one RunTopupTrial through the full per_trial pipeline -- same
+// gates, same ship step -- so a reroll that fails a gate simply does not
+// raise the HF count and the next pass tries again.
+//
+// Bookkeeping is two counters that must agree on what counts as "already
+// tried": enq counts rerolls this process has enqueued; RecordedTopups
+// counts reroll rows in results.jsonl (which survives restarts). A case is
+// eligible only when they are equal -- either a reroll is in flight (enq
+// ahead of recorded) or all enqueued rerolls have landed. The enq counter
+// doubles as the retry bound: at most 3 rerolls ever run past the target, so
+// a case whose ships keep failing stops offering itself (a 0-reward ship
+// still counts toward the HF total; a never-shipping one does not, and is a
+// human's problem, not a loop's).
+func topup(ctx context.Context, r *run.Runner, dir string, st *state,
+	logf func(string, ...any), sem chan struct{}, wg *sync.WaitGroup,
+	enq map[string]int) {
+	rev, _ := r.File.Experiment.Pipeline.With["hf_revision"].(string)
+	if rev == "" {
+		return // nothing to count against; the submission names its branch
+	}
+	names := make([]string, 0, len(st.Cases))
+	for name := range st.Cases {
+		if _, err := os.Stat(filepath.Join(dir, name, "task.toml")); err == nil {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	sort.Strings(names)
+	counts, ok := hfTrajCounts(rev, names)
+	if !ok {
+		logf("watch: topup: could not read trajectory counts from hfcase origin/%s; skipping this pass", rev)
+		return
+	}
+	target := r.File.Experiment.TrajTarget
+	for _, name := range names {
+		if target-counts[name] <= 0 {
+			continue
+		}
+		// The retry bound: at most 3 rerolls ever enqueued past the target.
+		// A reroll that ships raises the HF count and ends the shortfall; a
+		// reroll that fails a gate does not, and 3 of those in a row is a
+		// human's problem, not a loop's.
+		if enq[name] >= target+3 {
+			continue
+		}
+		// One reroll per case at a time: while a topup is in flight (its
+		// results.jsonl row not yet written) the enqueued count exceeds the
+		// recorded count, and the pass leaves that case alone. This also
+		// keeps the poll loop's per-case gates from racing a reroll.
+		if enq[name] > r.RecordedTopups(name) {
+			continue
+		}
+		caseDir := filepath.Join(dir, name)
+		hash, err := casesrc.HashDir(caseDir)
+		if err != nil {
+			continue
+		}
+		// The case bytes must match what was admitted: a repaired case is
+		// about to be re-gated by the ordinary poll path, and rolling a
+		// trial against bytes the state does not know would ship a
+		// trajectory for a definition nobody judged.
+		if st.Cases[name] != hash {
+			continue
+		}
+		c := &casesrc.Case{Label: name, Dir: caseDir, SHA256: hash}
+		seq := r.RecordedTopups(name) + 1
+		enq[name] = seq
+		logf("watch: case %s: %d/%d trajectories on %s -> reroll %d", name, counts[name], target, rev, seq)
+		wg.Add(1)
+		inflight.mu.Lock()
+		inflight.n++
+		inflight.mu.Unlock()
+		go func(c *casesrc.Case, name string, seq int) {
+			// The slot is taken here, not in topup, for the same reason the
+			// admission trial takes it in its goroutine: a full set of
+			// in-flight rerolls must queue behind, not freeze, the scan.
+			sem <- struct{}{}
+			defer func() {
+				<-sem
+				inflight.mu.Lock()
+				inflight.n--
+				inflight.mu.Unlock()
+				wg.Done()
+			}()
+			res, err := r.RunTopupTrial(ctx, c, seq)
+			switch {
+			case err != nil && strings.Contains(err.Error(), "already recorded"):
+				logf("watch: case %s: reroll %d already recorded, not repeated", name, seq)
+			case err != nil:
+				logf("watch: case %s: reroll failed: %v", name, err)
+			case res.OK() && res.Dropped:
+				logf("watch: case %s: reroll %d done, reward=%.3f (dropped)", name, seq, *res.Reward)
+			case res.OK():
+				logf("watch: case %s: reroll %d done, reward=%.3f", name, seq, *res.Reward)
+			default:
+				logf("watch: case %s: reroll %d done, %s %s", name, seq, res.Code, firstLineOf(res.Message))
+			}
+		}(c, name, seq)
+	}
 }
