@@ -52,6 +52,11 @@ check_case_size:
 # Per-case pre-check 1: reject a case name already published under any week*
 # branch and task/week* path. This runs before every local/Docker/LLM operation
 # so a dataset duplicate never consumes an audit, admission, or rollout slot.
+# Cross-variant twins count as duplicates too (2026-09-14): a -bin-t4 case
+# whose base (name minus the -bin-t4 suffix) is already published in ANY
+# variant (-t4, -bin-t4) under any week* is the same upstream bug shipped
+# twice -- mariadb-e2088ce slipped through exact-name matching this way
+# (src -t4 on week3/main, bin-t4 re-admitted to week4).
 # HF lookup failures exit 75 rather than becoming a cached rejection.
 check_hf_week_duplicate:
   env: [PATH, HOME, HF_TOKEN, HF_HOME]
@@ -71,6 +76,19 @@ check_hf_week_duplicate:
         print("check_hf_week_duplicate: TEMPFAIL HF_TOKEN is unavailable", file=sys.stderr)
         sys.exit(75)
 
+    # Variant families sharing a base name: "<base>-t4", "<base>-bin-t4".
+    # A published sibling in ANY variant makes the case a duplicate, so
+    # match both suffixed forms (never the bare base -- published task
+    # dirs always carry a variant suffix).
+    def family(name):
+        if name.endswith("-bin-t4"):
+            return name[: -len("-bin-t4")]
+        if name.endswith("-t4"):
+            return name[: -len("-t4")]
+        return name
+    base = family(label)
+    want = {label, f"{base}-t4", f"{base}-bin-t4"}
+
     try:
         api = HfApi(token=token)
         refs = api.list_repo_refs("tinglydev/cyber-xianjin", repo_type="dataset")
@@ -87,14 +105,15 @@ check_hf_week_duplicate:
                 scanned_paths += 1
                 for child in api.list_repo_tree("tinglydev/cyber-xianjin", path_in_repo=entry.path,
                                                 revision=revision, repo_type="dataset"):
-                    if isinstance(child, RepoFolder) and child.path.rsplit("/", 1)[-1] == label:
+                    child_name = child.path.rsplit("/", 1)[-1] if isinstance(child, RepoFolder) else ""
+                    if child_name in want:
                         matches.append(f"{revision}:{child.path}")
     except Exception as exc:
         print(f"check_hf_week_duplicate: TEMPFAIL HF listing failed: {exc}", file=sys.stderr)
         sys.exit(75)
 
     if matches:
-        print(f"check_hf_week_duplicate: FAIL {label} already published at {', '.join(matches)}", file=sys.stderr)
+        print(f"check_hf_week_duplicate: FAIL {label} already published at {', '.join(matches)} (variant twin match)", file=sys.stderr)
         sys.exit(1)
     print(f"check_hf_week_duplicate: ok {label} -- scanned {len(revisions)} week branch(es), {scanned_paths} task path(s)")
     PY
