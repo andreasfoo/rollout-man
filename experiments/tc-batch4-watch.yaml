@@ -107,6 +107,14 @@ check_hf_week_duplicate:
                                                 revision=revision, repo_type="dataset"):
                     child_name = child.path.rsplit("/", 1)[-1] if isinstance(child, RepoFolder) else ""
                     if child_name in want:
+                        # Exclude the case's OWN slot on the ship-target branch:
+                        # a re-gate of an already-admitted case must not match its
+                        # own published dir (self-match would permanently reject every
+                        # re-gate). Self-name on a DIFFERENT branch (main, week3) is a
+                        # genuine cross-week duplicate and still FAILs; cross-variant
+                        # sibling matches always FAIL.
+                        if child_name == label and revision == "week4":
+                            continue
                         matches.append(f"{revision}:{child.path}")
     except Exception as exc:
         print(f"check_hf_week_duplicate: TEMPFAIL HF listing failed: {exc}", file=sys.stderr)
