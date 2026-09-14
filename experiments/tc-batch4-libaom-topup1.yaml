@@ -1,0 +1,82 @@
+# libaom-cc9e46cb one-shot top-up (2026-09-14, user-approved).
+#
+# The traj_target loop exhausted its 7-attempt budget (target+3) with
+# libaom at 3/4 stamps on HF week4: 3 measured full-duration trials
+# (reward 0.000, shipped -- they are the 3 stamps), 4 attempts lost to
+# LLM-proxy HOST_ERRORs (claude CLI exit 1). Per the loop's design a
+# case short after target+3 is a human decision; the user chose one
+# manual reroll before the week4 -> main release PR.
+#
+# This is a one-off exception to "no manual batch4 campaigns" -- the
+# loop is hard-stopped for this case, so this run cannot collide with
+# or double-count watch rerolls (RecordedTopups is watch-scoped; stamp
+# counting is HF-mirror-scoped and will simply see 4/4 when this ships).
+#
+# Pipeline identical to the watch's reroll path and to the 2026-09-13
+# topup campaign: rollout -> redact -> materialize -> CJK/API gates ->
+# ship trajectory-only to tinglydev/cyber-xianjin week4.
+#
+# Preconditions (env): HF_TOKEN (ship), ANTHROPIC_AUTH_TOKEN (LLMSpec).
+# Run:
+#   ./rollout-man run experiments/tc-batch4-libaom-topup1.yaml --commands experiments/commands.yaml
+---
+kind: LLMSpec
+name: buglocation-llm
+provider: anthropic
+# kimi-k3 per user direction (2026-08-31) -- same model as the rollouts.
+base_url: http://localhost:12584/tingly/anthropic
+model: kimi-k3
+api_key_env: ANTHROPIC_AUTH_TOKEN
+---
+kind: Experiment
+name: tc-batch4-libaom-topup1
+
+case_defaults:
+  source: local
+
+cases:
+  - path: /home/foo/project/cyber-action-data-202605-accepted/tc_batch4/libaom-cc9e46cb-bug-6491968-bin-t4
+
+matrix:
+  agents:
+    - name: forge-flow-fuzz
+  trials: 1
+
+# Single trial; max_attempts 2 absorbs proxy-hiccup HOST_ERRORs at the
+# command layer (4 of the watch's 7 attempts died this way).
+concurrency: 1
+max_attempts: 2
+
+pipeline:
+  with:
+    hf_revision: week4
+    hf_task_path: task/week4
+
+  per_case_concurrency: 1
+
+  per_trial:
+    - uses: rollout
+      with: {using: kimi3_rollout}
+
+    # No reward filter (2026-08-31 policy): every completed rollout ships.
+    - uses: redact
+      with: {keys: required, ips: {traj: true, logs: true}}
+
+    - uses: materialize_week2_trial
+
+    - uses: check_no_chinese_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: check_no_api_error_traj
+      with: {traj_dir: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"}
+      on_failure: skip
+
+    - uses: ship
+      with:
+        using: ship_week2_trajectories
+        path: "{{steps.materialize_week2_trial.outputs.trajectories_dir}}"
+        dest: tinglydev/cyber-xianjin
+
+  per_experiment:
+    - uses: record_progress
