@@ -1,2 +1,3 @@
 Task	date	k3 rollout pass	k3 rollout fail
+zvbi-c70f834-commit-1323d60-t4	2026-09-15	3	1
 # pass = kimi3 rollout trials with no exception (AGENT_TIMEOUT allowed) whose reward file (out/reward.txt or verifier reward) is > 0.6; fail = same-class trials with reward < 0.6. Infra exceptions (ENV_FAILED/HOST_ERROR/AGENT_FAILED/VERIFIER_ERROR) excluded. Rewards read from trial files, not results.jsonl. Rows are added as cases land in tc_batch5 via the factory finalize loop and reach 4 trajectory stamps on HF week5 (admission trial + watch traj_target rerolls). tc_batch5 started EMPTY (owner decision 2026-09-15, acc f790677ea reverted all batch5/-dir seeding); 18 batch5-lineage service cases already published on HF task/week1 are out of scope for this sheet.
