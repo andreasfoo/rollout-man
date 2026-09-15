@@ -46,10 +46,16 @@ type Deps struct {
 // keyed map can.
 type state struct {
 	Cases map[string]string `json:"cases"` // dir name -> last-seen content hash
+	// Admitted records the gate verdict per case name (2026-09-15): Cases
+	// alone cannot tell "admitted" from "rejected" (both record a hash), and
+	// the traj_target loop fired live rerolls on a REJECTED fresh arrival
+	// (libredwg-18fd542, tc_batch5) one second after its gate failure --
+	// a measured reroll would have shipped an unadmitted, unpinned case.
+	Admitted map[string]bool `json:"admitted,omitempty"`
 }
 
 func loadState(path string) *state {
-	s := &state{Cases: map[string]string{}}
+	s := &state{Cases: map[string]string{}, Admitted: map[string]bool{}}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return s
@@ -57,6 +63,12 @@ func loadState(path string) *state {
 	_ = json.Unmarshal(b, s)
 	if s.Cases == nil {
 		s.Cases = map[string]string{}
+	}
+	if s.Admitted == nil {
+		// State files written before this field existed: every recorded
+		// case predates the guard, so treat none as admitted -- a case that
+		// genuinely passed re-earns the flag on its next gate verdict.
+		s.Admitted = map[string]bool{}
 	}
 	return s
 }
@@ -500,6 +512,7 @@ func poll(ctx context.Context, r *run.Runner, dir string, st *state, statePath s
 		// would make the very next poll see a phantom "changed" case and
 		// re-gate a verdict it just reached.
 		st.Cases[res.job.name] = res.c.SHA256
+		st.Admitted[res.job.name] = res.admitted
 		dirty = true
 		// Save immediately, not at pass end: one gate can take minutes,
 		// and a crash mid-pass would otherwise forget every verdict from
@@ -601,7 +614,7 @@ func hfTrajCountsIn(mirror, rev string, want []string) (map[string]int, bool) {
 }
 
 // topup is the trajectory-maintenance pass: for every case the watch state
-// knows is admitted (its dir still present), compare the shipped trajectory
+// knows is ADMITTED (st.Admitted; its dir still present, bytes unchanged), compare the shipped trajectory
 // count on HF against traj_target and run rerolls for the shortfall. A
 // reroll is one RunTopupTrial through the full per_trial pipeline -- same
 // gates, same ship step -- so a reroll that fails a gate simply does not
@@ -640,6 +653,14 @@ func topup(ctx context.Context, r *run.Runner, dir string, st *state,
 	}
 	target := r.File.Experiment.TrajTarget
 	for _, name := range names {
+		// Trajectory maintenance is for ADMITTED cases only (2026-09-15):
+		// Cases records a hash for rejected cases too, and without this
+		// guard the loop fired a live reroll on a fresh arrival one second
+		// after its gate rejection -- a measured reroll would have shipped
+		// an unadmitted case to HF.
+		if !st.Admitted[name] {
+			continue
+		}
 		if target-counts[name] <= 0 {
 			continue
 		}
