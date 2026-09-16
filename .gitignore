@@ -4,3 +4,4 @@ test/smoke/fail-cases/*/tests/.attempted
 .cache/
 __pycache__/
 /Progress.md
+week*.tsv
